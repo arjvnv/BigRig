@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bigrig"
+version = "0.6.0"
+description = "Run large Mixture-of-Experts models on an Apple Silicon Mac that does not have room for them, and know what it cost"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [{name = "BigRig"}]
+keywords = ["mlx", "apple-silicon", "mixture-of-experts", "llm", "inference"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: MacOS :: MacOS X",
+]
+# MLX is Apple Silicon only, so it cannot be an unconditional requirement -- `pip install
+# bigrig` must not fail on a Linux box that only wants the quality meter. But making it an
+# opt-in extra meant `pip install bigrig` followed by `bigrig doctor` -- the first command in
+# our own help -- ended in `ModuleNotFoundError: No module named 'mlx'`. An environment marker
+# gets both: on the machines the engine runs on, one install is enough.
+# FLOORS ARE VERSIONS THIS HAS ACTUALLY BEEN RUN AGAINST, not the oldest that might work.
+# `numpy>=1.24` is load-bearing rather than cosmetic: below 1.16.3 `np.load` defaulted to
+# allow_pickle=True, which would make reading a cached trace an arbitrary-code path.
+# `huggingface_hub` does the filename sanitising for `snapshot_download(local_dir=...)`, where
+# the names come from a remote repo, so an ancient one is a real exposure and not just a bug risk.
+dependencies = [
+  "numpy>=1.24",
+  "huggingface_hub>=0.30",
+  "mlx>=0.29; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "mlx-lm>=0.28; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+
+[project.optional-dependencies]
+# Kept so `pip install 'bigrig[engine]'` keeps working for anyone who followed older docs.
+engine = ["mlx>=0.29", "mlx-lm>=0.28", "huggingface_hub>=0.30"]
+dev = ["pytest"]
+
+[project.scripts]
+bigrig = "bigrig_engine.cli:main"
+# `rig` is the same command. Six characters is a lot to type for something used dozens of times
+# a day, and the short form is what anyone ends up using.
+rig = "bigrig_engine.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/arjvnv/bigrig"
+Source = "https://github.com/arjvnv/bigrig"
+Issues = "https://github.com/arjvnv/bigrig/issues"
+
+[tool.setuptools]
+# Explicit, so tests/ and the research scripts in src/ never end up in a wheel.
+packages = ["bigrig_layer", "bigrig_engine", "bigrig_engine.policies"]
+
+[tool.setuptools.package-data]
+bigrig_layer = ["README.md"]
+bigrig_engine = ["webui.html"]

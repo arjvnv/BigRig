@@ -1,0 +1,1657 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BigRig</title>
+<style>
+/* PALETTE. Instrument panel, not dashboard: cool graphite grounds, warm paper ink, a brass
+   accent for what the engine is doing and a steel secondary for what the machine is doing.
+   "Good" is moss, deliberately NOT the accent -- a green accent made every healthy reading look
+   like branding. Dark is the first theme because this is a thing people leave open beside an
+   editor at night; light is the same instrument in daylight, not an inversion. */
+:root{
+  --bg:#141518; --rail:#18191d; --panel:#1c1d22; --sunk:#22242a; --line:#2b2d34;
+  --ink:#e4e3de; --dim:#9c9b94; --faint:#83827b;
+  --accent:#c9a961; --accent2:#7fa3b8; --ok:#8fb58a; --warn:#d99a4e; --warnbg:#2a2418;
+  --bad:#c96b5b; --grid:#20222a; --on-accent:#17150f;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif;
+}
+@media (prefers-color-scheme:light){:root:not([data-theme=dark]){
+  --bg:#f3f2ee; --rail:#ebeae5; --panel:#fbfaf7; --sunk:#eeede8; --line:#dcdad3;
+  --ink:#1e1e21; --dim:#65645f; --faint:#6c6b65;
+  --accent:#7d6224; --accent2:#4d7088; --ok:#476f42; --warn:#8f5e17; --warnbg:#f7eedc;
+  --bad:#a8452f; --grid:#e6e5df; --on-accent:#fbfaf7;
+}}
+:root[data-theme=light]{
+  --bg:#f3f2ee; --rail:#ebeae5; --panel:#fbfaf7; --sunk:#eeede8; --line:#dcdad3;
+  --ink:#1e1e21; --dim:#65645f; --faint:#6c6b65;
+  --accent:#7d6224; --accent2:#4d7088; --ok:#476f42; --warn:#8f5e17; --warnbg:#f7eedc;
+  --bad:#a8452f; --grid:#e6e5df; --on-accent:#fbfaf7;
+}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--ink);font:15px/1.55 var(--sans);display:flex;
+     overflow:hidden;-webkit-font-smoothing:antialiased}
+
+/* ── left rail ─────────────────────────────────────────────────────────── */
+.rail{width:232px;flex:none;background:var(--rail);border-right:1px solid var(--line);
+      display:flex;flex-direction:column;padding:1.15rem .7rem .7rem;gap:1.15rem}
+.brand{font:600 15.5px var(--sans);letter-spacing:-.25px;padding:0 .5rem;
+       display:flex;align-items:center;gap:.55rem}
+.brand i{width:10px;height:10px;border-radius:3px;background:var(--accent);display:block;
+         box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 18%,transparent)}
+.rail nav{display:flex;flex-direction:column;gap:.1rem}
+.rail nav a{position:relative;display:flex;align-items:center;gap:.65rem;
+            padding:.5rem .55rem .5rem .7rem;border-radius:8px;color:var(--dim);
+            font:500 13.5px var(--sans);cursor:pointer;user-select:none;
+            transition:color .12s,background .12s}
+.rail nav a:hover{color:var(--ink);background:var(--sunk)}
+.rail nav a.on{color:var(--ink);background:var(--sunk);font-weight:600}
+/* the active page is marked, not merely tinted */
+.rail nav a.on:before{content:"";position:absolute;left:0;top:50%;transform:translateY(-50%);
+                      width:3px;height:15px;border-radius:0 2px 2px 0;background:var(--accent)}
+.rail nav a svg{width:15px;height:15px;flex:none;stroke:currentColor;fill:none;stroke-width:1.7}
+.rail .grow{flex:1;min-height:.5rem}
+
+/* the model, named where it is always visible rather than only on one page */
+.micro{font:600 10px var(--sans);letter-spacing:.11em;text-transform:uppercase;
+       color:var(--faint);padding:0 .55rem .45rem}
+.who-model{padding:0 .55rem}
+.who-model b{display:block;font:600 13px var(--sans);letter-spacing:-.1px;line-height:1.35;
+             word-break:break-word;margin-bottom:.35rem}
+.who-model .st{display:flex;align-items:center;gap:.4rem;font:11.5px var(--sans);color:var(--dim)}
+.who-model .st i{width:6px;height:6px;border-radius:50%;background:var(--ok);flex:none}
+.who-model .st.warn i{background:var(--warn)}
+.who-model .st.warn{color:var(--warn)}
+
+.meters{border:1px solid var(--line);border-radius:10px;padding:.7rem .75rem;
+        background:var(--panel);display:flex;flex-direction:column;gap:.7rem}
+.meter .lbl{display:flex;justify-content:space-between;align-items:baseline;gap:.5rem;
+            font:11.5px var(--sans);color:var(--dim);margin-bottom:.32rem}
+.meter .lbl b{font:11.5px var(--mono);color:var(--ink);font-weight:400;white-space:nowrap;
+              font-variant-numeric:tabular-nums}
+.track{height:6px;border-radius:3px;background:var(--sunk);overflow:hidden;display:flex}
+.track i{display:block;height:100%;background:var(--accent);transition:width .35s}
+.track i.alt{background:var(--accent2)}
+.track i.warn{background:var(--warn)}
+/* nothing measured yet must not read as a full bar of good news */
+.track.idle i{background:var(--line)}
+.rail .foot{display:flex;align-items:center;justify-content:space-between;gap:.5rem;
+            padding:.15rem .35rem 0;font:11px var(--mono);color:var(--faint)}
+.rail .foot span{display:flex;align-items:center;gap:.4rem;overflow:hidden;
+                 text-overflow:ellipsis;white-space:nowrap}
+.rail .foot span i{width:5px;height:5px;border-radius:50%;background:var(--ok);flex:none}
+.rail .foot span i.down{background:var(--bad)}
+.rail .foot button{background:none;border:0;color:var(--faint);cursor:pointer;font-size:14px;
+                   padding:.15rem .35rem;border-radius:6px;line-height:1}
+.rail .foot button:hover{color:var(--ink);background:var(--sunk)}
+
+/* ── main ──────────────────────────────────────────────────────────────── */
+main{flex:1;min-width:0;display:flex;flex-direction:column}
+.view{flex:1;min-height:0;overflow-y:auto}
+#v-chat{display:flex;flex-direction:column;overflow:hidden}
+[hidden]{display:none!important}
+.pad{max-width:70rem;margin:0 auto;padding:1.9rem 2rem 3rem}
+h1.page{font:500 26px var(--sans);letter-spacing:-.5px;margin:0 0 .3rem}
+.sub{font:13px var(--sans);color:var(--dim);margin:0 0 1.5rem}
+h2.sec{font:600 13px var(--sans);margin:2rem 0 .8rem;color:var(--ink);
+       display:flex;align-items:center;gap:.55rem}
+h2.sec:first-child{margin-top:0}
+.tag{font:10.5px var(--mono);padding:.12rem .4rem;border-radius:4px;background:var(--sunk);
+     color:var(--dim);border:1px solid var(--line)}
+.tag.good{color:var(--ok);border-color:var(--ok)}
+.tag.warn{color:var(--warn);border-color:var(--warn);background:var(--warnbg)}
+
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(215px,1fr));gap:.85rem}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:11px;padding:1rem 1.05rem}
+.card.hi{border-left:3px solid var(--accent)}
+.card h3{font:500 11.5px var(--sans);color:var(--dim);margin:0 0 .5rem}
+.big{font:500 30px var(--mono);letter-spacing:-.6px;line-height:1.05;
+     font-variant-numeric:tabular-nums}
+.big.acc{color:var(--accent)}
+.big small{font:13px var(--sans);color:var(--dim);font-weight:400;letter-spacing:0}
+.note{font:11.5px var(--sans);color:var(--faint);margin-top:.4rem;line-height:1.45}
+.note.warn{color:var(--warn)}
+
+/* model row */
+.modelrow{background:var(--panel);border:1px solid var(--line);border-radius:11px;
+          padding:1rem 1.15rem;display:flex;align-items:center;gap:1.4rem;flex-wrap:wrap}
+.modelrow .id{flex:1;min-width:190px}
+.modelrow .id b{font:600 15px var(--sans);display:block;letter-spacing:-.2px}
+.modelrow .id span{font:11.5px var(--mono);color:var(--dim)}
+.kpi{text-align:right;min-width:74px}
+.kpi .k{font:10px var(--sans);color:var(--faint);text-transform:uppercase;letter-spacing:.09em}
+.kpi .v{font:600 19px var(--sans);font-variant-numeric:tabular-nums;line-height:1.2}
+.pill{font:11.5px var(--sans);padding:.28rem .65rem;border-radius:999px;border:1px solid var(--line);
+      background:var(--sunk);color:var(--dim);white-space:nowrap;display:inline-flex;
+      align-items:center;gap:.4rem}
+.pill i{width:6px;height:6px;border-radius:50%;background:var(--ok);display:block}
+.pill.good{border-color:var(--ok);color:var(--ok)}
+.pill.warn{border-color:var(--warn);color:var(--warn);background:var(--warnbg)}
+.pill.dim{opacity:.55}
+.card h3 .pill{margin-left:.5rem;vertical-align:middle;text-transform:none;letter-spacing:0}
+
+/* presets + sliders */
+.presets{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:.7rem;
+         margin-bottom:1.5rem}
+.preset{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:.8rem .9rem;
+        cursor:pointer;text-align:left;color:inherit;font:inherit}
+.preset:hover{border-color:var(--accent)}
+.preset.on{border-color:var(--accent);background:var(--sunk)}
+.preset b{display:block;font:600 13.5px var(--sans);margin-bottom:.2rem}
+.preset span{font:11.5px var(--sans);color:var(--dim);line-height:1.45}
+.slider{margin-bottom:1.5rem}
+.slider .top{display:flex;align-items:baseline;justify-content:space-between;gap:1rem;
+             margin-bottom:.15rem}
+.slider .top b{font:600 13.5px var(--sans)}
+.slider .top .val{font:13px var(--mono);font-variant-numeric:tabular-nums;display:flex;
+                  align-items:center;gap:.5rem}
+.slider .top .val em{font-style:normal;font:11.5px var(--mono);color:var(--accent);
+                     border:1px solid var(--line);border-radius:5px;padding:.1rem .4rem;
+                     background:var(--sunk)}
+.slider .why{font:11.5px var(--sans);color:var(--faint);margin-bottom:.6rem}
+.slider input[type=range]{width:100%;accent-color:var(--accent);height:4px}
+.ends{display:flex;justify-content:space-between;font:10.5px var(--mono);color:var(--faint);
+      margin-top:.25rem}
+.apply{display:flex;align-items:center;gap:.8rem}
+button.go{font:600 13.5px var(--sans);color:var(--on-accent);background:var(--accent);border:0;
+          border-radius:8px;padding:.55rem 1.1rem;cursor:pointer}
+button.go:hover:not(:disabled){filter:brightness(1.08)}
+button.go:disabled{opacity:.45;cursor:default}
+button.ghost{font:13.5px var(--sans);color:var(--dim);background:var(--sunk);
+             border:1px solid var(--line);border-radius:8px;padding:.55rem 1rem;cursor:pointer}
+button.ghost:hover{color:var(--ink)}
+
+/* rows */
+.rows{background:var(--panel);border:1px solid var(--line);border-radius:11px;overflow:hidden}
+.row{display:flex;justify-content:space-between;align-items:baseline;gap:1rem;
+     padding:.6rem .95rem;font-size:13.5px;border-bottom:1px solid var(--grid)}
+.row:last-child{border-bottom:0}
+.row .k{color:var(--dim)}
+.row .v{font:13px var(--mono);font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap}
+.row .v.na{color:var(--faint)}
+
+/* chat */
+.log{flex:1;overflow-y:auto;padding:1.8rem 1.4rem 0}
+.thread{max-width:46rem;margin:0 auto;display:flex;flex-direction:column;gap:1.7rem}
+.msg{display:flex;gap:.8rem}
+.who{flex:none;width:3.4rem;font:600 10px var(--sans);color:var(--faint);padding-top:.3rem;
+     text-transform:uppercase;letter-spacing:.1em}
+.txt{white-space:pre-wrap;word-break:break-word;min-width:0;flex:1}
+.msg.bot .txt{border-left:2px solid var(--line);padding-left:.85rem}
+.msg.bot.flagged .txt{border-left-color:var(--warn)}
+.meta{font:11.5px var(--sans);color:var(--faint);margin-top:.6rem}
+.meta.warn{color:var(--warn)}
+.wait{font:12px var(--sans);color:var(--faint);padding:.15rem 0}
+.wait:after{content:"";animation:dots 1.2s steps(4,end) infinite}
+@keyframes dots{0%{content:""}25%{content:"."}50%{content:".."}75%{content:"..."}}
+.cont{margin-top:.5rem;font:12px var(--sans);background:var(--sunk);color:var(--ink);
+      border:1px solid var(--line);border-radius:7px;padding:.35rem .7rem;cursor:pointer}
+.cont:hover{border-color:var(--accent)}
+details.think{margin:0 0 .55rem;border:1px solid var(--line);border-radius:6px;background:var(--sunk)}
+details.think summary{cursor:pointer;font:11px var(--mono);color:var(--faint);padding:.28rem .5rem;
+                      list-style:none}
+details.think summary::-webkit-details-marker{display:none}
+details.think summary:before{content:"▸ "} details.think[open] summary:before{content:"▾ "}
+details.think .inner{white-space:pre-wrap;font-size:13px;color:var(--dim);padding:.4rem .55rem .5rem;
+                     border-top:1px solid var(--line)}
+.blank{color:var(--dim);text-align:center;padding:3.2rem 1rem;line-height:1.8}
+.blank kbd{font:11px var(--mono);border:1px solid var(--line);border-radius:4px;padding:.08rem .3rem;
+           background:var(--panel)}
+footer{border-top:1px solid var(--line);background:var(--panel);padding:.9rem 1.4rem 1rem;flex:none}
+.ctl{max-width:46rem;margin:0 auto .6rem;display:flex;gap:1.4rem;align-items:center;
+     font:12px var(--sans);color:var(--dim);flex-wrap:wrap}
+.ctl label{display:flex;align-items:center;gap:.35rem;cursor:pointer}
+.ctl select{font:12px var(--sans);background:var(--sunk);color:var(--ink);border:1px solid var(--line);
+            border-radius:6px;padding:.2rem .4rem}
+.ctl input[type=checkbox]{accent-color:var(--accent)}
+.ctl b.mono{font:11.5px var(--mono);color:var(--ink);font-variant-numeric:tabular-nums;margin-left:.3rem}
+.sys{max-width:46rem;margin:0 auto .7rem}
+.sys textarea{width:100%;min-height:3.2rem;max-height:9rem;font:13px/1.5 var(--sans)}
+.sys-note{font:11.5px var(--sans);color:var(--faint);margin-top:.35rem;display:flex;gap:.5rem;
+          align-items:center;flex-wrap:wrap}
+button.ghost.sm{font:11.5px var(--sans);padding:.2rem .55rem;border-radius:6px}
+#c-cost{color:var(--faint)}
+form{max-width:46rem;margin:0 auto;display:flex;gap:.6rem;align-items:flex-end}
+textarea{flex:1;resize:none;font:15px/1.5 var(--sans);color:var(--ink);background:var(--sunk);
+         border:1px solid var(--line);border-radius:10px;padding:.65rem .8rem;max-height:8rem;
+         min-height:2.75rem}
+textarea:focus{outline:2px solid var(--accent);outline-offset:-1px}
+button#send{font:600 14px var(--sans);color:var(--on-accent);background:var(--accent);border:0;
+            border-radius:10px;padding:.72rem 1.25rem;cursor:pointer}
+button#send.stop{background:var(--warn)}
+button#send:disabled{opacity:.4;cursor:default}
+
+/* charts + table */
+.chart{margin-top:.9rem}
+svg{display:block;width:100%;overflow:visible}
+table{width:100%;border-collapse:collapse;font:12.5px var(--mono)}
+th{text-align:left;color:var(--faint);font-weight:500;padding:.5rem .7rem;
+   border-bottom:1px solid var(--line)}
+td{padding:.45rem .7rem;border-bottom:1px solid var(--grid);color:var(--dim)}
+td.n{text-align:right;color:var(--ink);font-variant-numeric:tabular-nums}
+tr.flag td{color:var(--warn)}
+.empty{color:var(--faint);font:12px var(--mono);padding:1.6rem 0;text-align:center}
+
+/* where the memory goes -- the one picture that explains the product */
+.budget{background:var(--panel);border:1px solid var(--line);border-radius:11px;padding:1.1rem 1.15rem}
+.budget .head{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:.75rem}
+.budget .head b{font:600 14px var(--sans)}
+.budget .head span{font:12px var(--mono);color:var(--dim);font-variant-numeric:tabular-nums}
+.seg{display:flex;height:26px;border-radius:6px;overflow:hidden;background:var(--sunk);
+     border:1px solid var(--line)}
+.seg i{display:block;height:100%;transition:width .4s ease;position:relative}
+.seg i.experts{background:var(--accent)}
+.seg i.other  {background:var(--accent2)}
+.seg i.step   {background:var(--dim);opacity:.45}
+.seg i.kv     {background:var(--warn)}
+.key{display:flex;flex-wrap:wrap;gap:.15rem 1.3rem;margin-top:.7rem}
+.key div{display:flex;align-items:center;gap:.45rem;font:11.5px var(--sans);color:var(--dim)}
+.key i{width:9px;height:9px;border-radius:2px;flex:none}
+.key b{font:11.5px var(--mono);color:var(--ink);font-weight:400;font-variant-numeric:tabular-nums}
+.key .free i{background:var(--sunk);border:1px solid var(--line)}
+
+/* how much of the model is in memory vs still on disk */
+.split{margin-top:1.1rem;padding-top:1rem;border-top:1px solid var(--grid)}
+.split .bar{display:flex;height:8px;border-radius:4px;overflow:hidden;background:var(--sunk);
+            border:1px solid var(--line);margin-top:.5rem}
+.split .bar i{display:block;height:100%;background:var(--accent);transition:width .4s}
+.split p{margin:0;font:12.5px var(--sans);color:var(--dim);line-height:1.5}
+.split p b{color:var(--ink);font-weight:600;font-variant-numeric:tabular-nums}
+
+/* sparkline strip inside a stat card */
+.card .spark{margin-top:.55rem;height:26px}
+.card .spark svg{height:26px}
+
+/* the claim that matters, stated once and plainly */
+.claim{display:flex;align-items:center;gap:.6rem;font:12.5px var(--sans);color:var(--ok);
+       background:var(--sunk);border:1px solid var(--ok);border-radius:8px;
+       padding:.5rem .8rem;margin-bottom:1.4rem}
+.claim.warn{color:var(--warn);border-color:var(--warn);background:var(--warnbg)}
+.claim svg{width:15px;height:15px;flex:none;stroke:currentColor;fill:none;stroke-width:2}
+
+/* the trade, shown on the slider rather than left to be inferred */
+.trade{display:flex;gap:.5rem;margin-top:.6rem;flex-wrap:wrap}
+.trade span{font:11.5px var(--sans);color:var(--dim);background:var(--sunk);
+            border:1px solid var(--line);border-radius:6px;padding:.25rem .55rem}
+.trade span b{color:var(--ink);font-weight:600;font-variant-numeric:tabular-nums}
+.trade span.up b{color:var(--ok)} .trade span.down b{color:var(--warn)}
+
+
+/* ── remembered prompts, and the live activity log ──────────────────────── */
+/* Both are new surfaces, and both deliberately reuse .card / .sec spacing so the console reads
+   as one page rather than as a page with a widget bolted on. */
+.pc{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:1rem 1.1rem;
+    display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:1rem 1.4rem;
+    align-items:end}
+.pc .m{min-width:0}
+.pc .m .k{font:600 10px var(--sans);letter-spacing:.11em;text-transform:uppercase;
+          color:var(--faint);margin-bottom:.2rem}
+.pc .m .v{font:600 20px var(--mono);letter-spacing:-.4px;line-height:1.1}
+.pc .m .v.acc{color:var(--accent)}
+.pc .m .s{font:11.5px var(--sans);color:var(--dim);margin-top:.15rem}
+.pc .act{display:flex;gap:.5rem;align-items:center;justify-content:flex-end;flex-wrap:wrap}
+.pc .fill{grid-column:1/-1;height:5px;border-radius:3px;background:var(--sunk);overflow:hidden}
+.pc .fill i{display:block;height:100%;background:var(--accent);border-radius:3px;
+            transition:width .35s ease}
+
+/* The console log. Monospaced because it is a record of events, not prose, and a fixed column
+   for the clock keeps the messages aligned enough to scan down. */
+.feed{background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+.feed .hd{display:flex;align-items:center;gap:.6rem;padding:.6rem .9rem;
+          border-bottom:1px solid var(--line);background:var(--sunk)}
+.feed .hd b{font:600 12.5px var(--sans)}
+.feed .hd .grow{flex:1}
+.feed .hd .cnt{font:11px var(--mono);color:var(--faint)}
+.feed .body{max-height:330px;overflow-y:auto;padding:.35rem 0;scroll-behavior:smooth}
+.feed .row{display:flex;gap:.7rem;padding:.3rem .9rem;font:12px var(--mono);
+           align-items:baseline;border-left:2px solid transparent}
+.feed .row:hover{background:var(--sunk)}
+.feed .row .t{color:var(--faint);flex:none;width:4.6em;text-align:right;
+              font-variant-numeric:tabular-nums}
+.feed .row .k{flex:none;width:5.2em;font:600 10px var(--sans);letter-spacing:.08em;
+              text-transform:uppercase;color:var(--dim);padding-top:.1em}
+.feed .row .x{color:var(--ink);min-width:0;word-break:break-word}
+/* Colour carries the same information as the label, so the eye finds the one line that matters
+   without reading every kind. */
+.feed .row.memory,.feed .row.pressure{border-left-color:var(--warn)}
+.feed .row.memory .k,.feed .row.pressure .k{color:var(--warn)}
+.feed .row.error{border-left-color:var(--bad);background:color-mix(in srgb,var(--bad) 7%,transparent)}
+.feed .row.error .k{color:var(--bad)}
+.feed .row.cache .k,.feed .row.warm .k{color:var(--accent2)}
+.feed .row.start{border-left-color:var(--accent)}
+.feed .row.start .k{color:var(--accent)}
+.feed .empty{padding:1.4rem .9rem;color:var(--faint);font:12.5px var(--sans);text-align:center}
+.feed.paused .hd{background:var(--warnbg)}
+
+/* ── the Code page ───────────────────────────────────────────────────────── */
+/* Reuses .card and .sec spacing so it reads as the same product, not a bolted-on panel. */
+.verdict{display:flex;align-items:center;gap:.7rem;background:var(--panel);
+         border:1px solid var(--line);border-radius:12px;padding:.9rem 1.1rem}
+.verdict i{width:9px;height:9px;border-radius:50%;background:var(--ok);flex:none}
+.verdict.no i{background:var(--bad)}
+.verdict b{font:600 13.5px var(--sans)}
+.verdict span{font:12.5px var(--sans);color:var(--dim)}
+.agent{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+       padding:1rem 1.1rem;margin-bottom:.7rem}
+.agent .hd{display:flex;align-items:baseline;gap:.6rem;margin-bottom:.5rem}
+.agent .hd b{font:600 13.5px var(--sans)}
+.agent .hd em{font:11.5px var(--sans);color:var(--faint);font-style:normal}
+.agent p{margin:0 0 .6rem;font:12.5px/1.5 var(--sans);color:var(--dim)}
+.cmd{display:flex;align-items:center;gap:.5rem;background:var(--sunk);
+     border:1px solid var(--line);border-radius:8px;padding:.5rem .7rem}
+.cmd code{flex:1;font:12px var(--mono);color:var(--ink);overflow-x:auto;white-space:nowrap}
+.cmd button{flex:none;font:11px var(--sans);padding:.25rem .55rem;border-radius:6px;
+            border:1px solid var(--line);background:var(--panel);color:var(--dim);cursor:pointer}
+.cmd button:hover{color:var(--ink);border-color:var(--dim)}
+.cmd button.done{color:var(--ok);border-color:var(--ok)}
+.eps{display:grid;grid-template-columns:auto 1fr;gap:.45rem 1rem;font:12px var(--mono);
+     background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:1rem 1.1rem}
+.eps .k{color:var(--dim)}
+.eps .v{color:var(--ink);word-break:break-all}
+</style>
+
+<aside class="rail">
+  <div class="brand"><i></i> BigRig</div>
+  <nav>
+    <a id="n-console" class="on"><svg viewBox="0 0 24 24"><path d="M3 12h4l3 8 4-16 3 8h4"/></svg>Console</a>
+    <a id="n-chat"><svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>Chat</a>
+    <a id="n-code"><svg viewBox="0 0 24 24"><path d="M8 6l-6 6 6 6M16 6l6 6-6 6"/></svg>Code</a>
+    <a id="n-stats"><svg viewBox="0 0 24 24"><path d="M3 3v18h18M7 15l4-4 3 3 5-6"/></svg>Analytics</a>
+  </nav>
+  <div>
+    <div class="micro">Model</div>
+    <div class="who-model">
+      <b id="m-model">—</b>
+      <div class="st" id="m-state"><i></i><span id="m-state-t">—</span></div>
+    </div>
+  </div>
+  <div class="grow"></div>
+  <div class="meters">
+    <div class="meter">
+      <div class="lbl"><span>Memory</span><b id="m-mem">—</b></div>
+      <div class="track"><i id="m-bar-w" style="width:0"></i><i id="m-bar-k" class="alt" style="width:0"></i></div>
+    </div>
+    <div class="meter">
+      <div class="lbl"><span>Experts held</span><b id="m-res">—</b></div>
+      <div class="track"><i id="m-bar-r" style="width:0"></i></div>
+    </div>
+    <div class="meter">
+      <div class="lbl" title="Flags output that looks unusual FOR THIS MODEL -- repetition it was not asked for, or confidence unlike its own normal. It is an anomaly detector, not a fact checker: it cannot tell whether an answer is true, and a confidently-stated falsehood looks perfectly healthy to it. It also has no copy of the uncompressed model to compare against, so it cannot attribute anything it sees to BigRig."><span>Anomalies</span><b id="m-q">—</b></div>
+      <div class="track idle" id="m-track-q"><i id="m-bar-q" style="width:100%"></i></div>
+    </div>
+  </div>
+  <div class="foot"><span><i id="m-live"></i><span id="m-host">127.0.0.1:8080</span></span>
+    <button id="theme" title="Light or dark">◐</button></div>
+</aside>
+
+<main>
+<!-- ─────────── console ─────────── -->
+<div class="view" id="v-console"><div class="pad">
+  <h1 class="page">Console</h1>
+  <p class="sub" id="c-sub">—</p>
+
+  <div class="claim" id="c-claim"><svg viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></svg>
+    <span id="c-claim-t">—</span></div>
+
+  <div class="cards">
+    <div class="card hi"><h3>Speed <span class="pill" id="c-tier" hidden>—</span></h3>
+      <div class="big acc" id="c-tps">—</div>
+      <div class="note" id="c-tps-note">no replies yet</div>
+      <div class="note" id="c-tier-note"></div>
+      <div class="spark" id="c-spark-tps"></div></div>
+    <div class="card"><h3>Tokens generated</h3>
+      <div class="big" id="c-tok">—</div>
+      <div class="note" id="c-tok-note"></div></div>
+    <div class="card" title="Flags output that looks unusual FOR THIS MODEL -- repetition it was not asked for, or confidence unlike its own normal. It is an anomaly detector, not a fact checker: it cannot tell whether an answer is true, and a confidently-stated falsehood looks perfectly healthy to it. It also has no copy of the uncompressed model to compare against, so it cannot attribute anything it sees to BigRig."><h3>Anomalies</h3>
+      <div class="big" id="c-q">—</div>
+      <div class="note" id="c-q-note"></div></div>
+    <div class="card"><h3>Read from disk</h3>
+      <div class="big" id="c-disk">—</div>
+      <div class="note" id="c-disk-note"></div>
+      <div class="spark" id="c-spark-miss"></div></div>
+  </div>
+
+  <h2 class="sec">Where the memory goes</h2>
+  <div class="budget">
+    <div class="head"><b id="b-title">—</b><span id="b-total">—</span></div>
+    <div class="seg">
+      <i class="experts" id="b-experts" style="width:0"></i>
+      <i class="other"   id="b-other"   style="width:0"></i>
+      <i class="step"    id="b-step"    style="width:0"></i>
+      <i class="kv"      id="b-kv"      style="width:0"></i>
+    </div>
+    <div class="key">
+      <div><i style="background:var(--accent)"></i>experts in memory <b id="k-experts">—</b></div>
+      <div><i style="background:var(--accent2)"></i>rest of the model <b id="k-other">—</b></div>
+      <div><i style="background:var(--dim);opacity:.45"></i>room for one step <b id="k-step">—</b></div>
+      <div><i style="background:var(--warn)"></i>this conversation <b id="k-kv">—</b></div>
+      <div class="free"><i></i>unused <b id="k-free">—</b></div>
+    </div>
+    <div class="split" id="b-split">
+      <p id="b-split-t">—</p>
+      <div class="bar"><i id="b-split-bar" style="width:0"></i></div>
+    </div>
+  </div>
+
+  <h2 class="sec">Model</h2>
+  <div class="modelrow">
+    <div class="id"><b id="r-name">—</b><span id="r-serving">—</span></div>
+    <span class="pill good" id="r-state"><i></i><span id="r-uptime">—</span></span>
+    <span class="pill" id="r-alt">unmodified</span>
+    <div class="kpi"><div class="k">tokens/s</div><div class="v" id="r-tps">—</div></div>
+    <div class="kpi"><div class="k">requests</div><div class="v" id="r-req">—</div></div>
+    <div class="kpi"><div class="k">ttft</div><div class="v" id="r-ttft">—</div></div>
+    <button class="go" id="r-chat">Chat</button>
+  </div>
+  <div id="r-note"></div>
+
+  <h2 class="sec">Cache configuration <span class="tag" id="cfg-state">synced</span></h2>
+  <p class="sub" id="cfg-sub">Changing these reloads the model. Nothing else is affected.</p>
+  <div class="presets" id="presets"></div>
+
+  <div class="slider">
+    <div class="top"><b>Experts kept in memory</b>
+      <span class="val"><span id="s-exp-n">—</span><em id="s-exp-gb">—</em></span></div>
+    <div class="why" id="s-exp-why">More resident means fewer reads from disk and more speed, and
+      more memory. The rest are streamed.</div>
+    <input type="range" id="s-exp" min="1" max="128" value="40">
+    <div class="ends"><span id="s-exp-lo">1</span><span id="s-exp-hi">128</span></div>
+    <div class="trade" id="s-exp-trade"></div>
+  </div>
+
+  <div class="slider">
+    <div class="top"><b>Longest reply</b>
+      <span class="val"><span id="s-kv-n">—</span><em id="s-kv-gb">—</em></span></div>
+    <div class="why" id="s-kv-why">How much room to leave for one answer. Every token of a reply
+      costs KV cache.</div>
+    <input type="range" id="s-kv" min="256" max="32768" step="256" value="1024">
+    <div class="ends"><span>256</span><span id="s-kv-hi">—</span></div>
+  </div>
+
+  <div class="slider">
+    <div class="top"><b>Memory for remembered prompts</b>
+      <span class="val"><span id="s-pc-n">—</span><em id="s-pc-tok">—</em></span></div>
+    <div class="why" id="s-pc-why">Set aside so a follow-up question does not read the whole
+      conversation again. It comes out of the same budget as the experts.</div>
+    <input type="range" id="s-pc" min="0" max="200" step="5" value="50">
+    <div class="ends"><span>off</span><span id="s-pc-hi">—</span></div>
+  </div>
+
+  <div class="apply">
+    <button class="go" id="cfg-apply" disabled>Apply</button>
+    <button class="ghost" id="cfg-reset">Reset</button>
+    <span class="note" id="cfg-msg"></span>
+  </div>
+
+  <h2 class="sec">Remembered prompts</h2>
+  <p class="sub">The model keeps what it has already read, so a follow-up question does not read
+    the whole conversation again. Measured on a document plus two questions: 11.2s to the first
+    word, then 1.1s and 0.8s.</p>
+  <div class="pc">
+    <div class="m"><div class="k">Tokens not re-read</div>
+      <div class="v acc" id="pc-reused">—</div>
+      <div class="s" id="pc-reused-s">nothing reused yet</div></div>
+    <div class="m"><div class="k">Reused</div>
+      <div class="v" id="pc-hits">—</div>
+      <div class="s" id="pc-hits-s"></div></div>
+    <div class="m"><div class="k">Memory held</div>
+      <div class="v" id="pc-bytes">—</div>
+      <div class="s" id="pc-bytes-s"></div></div>
+    <div class="act">
+      <button class="ghost" id="pc-clear">Forget them</button></div>
+    <div class="fill"><i id="pc-fill" style="width:0"></i></div>
+  </div>
+  <div id="pc-msg" class="note" style="margin-top:.5rem"></div>
+
+  <h2 class="sec">Activity</h2>
+  <p class="sub">What the engine has been doing. It reconfigures itself while it runs -- handing
+    memory back, forgetting prompts, rebuilding the pool -- and each of those changes how fast the
+    next reply arrives.</p>
+  <div class="feed" id="feed">
+    <div class="hd"><b>Live</b><span class="grow"></span>
+      <span class="cnt" id="feed-cnt"></span>
+      <button class="ghost" id="feed-pause" title="Stop scrolling so a line can be read">Pause</button>
+    </div>
+    <div class="body" id="feed-body"><div class="empty">waiting for the engine to do something</div></div>
+  </div>
+
+  <h2 class="sec">This machine</h2>
+  <div class="rows" id="machine"></div>
+</div></div>
+
+<!-- ─────────── chat ─────────── -->
+<div class="view" id="v-chat" hidden>
+  <div class="log"><div class="thread" id="thread">
+    <div class="blank" id="blank">Ask it something.<br>
+      <kbd>Enter</kbd> sends · <kbd>Shift</kbd>+<kbd>Enter</kbd> for a new line</div>
+  </div></div>
+  <footer>
+    <div class="ctl">
+      <label id="l-think" style="display:none"
+             title="The model thinks in the open before answering. Better on hard questions, but the reasoning is drawn from the same reply limit as the answer.">
+        <input type="checkbox" id="c-think"> think first</label>
+      <label title="Guesses the next few words from text already in the conversation and checks the guess in one pass. Large gain when the answer repeats something already written -- quoting a document, continuing a list -- and a small loss when it does not, so it is off unless asked for.">
+        <input type="checkbox" id="c-ahead"> guess ahead</label>
+      <label>reply limit <select id="c-max"></select></label>
+      <label title="How adventurous the wording is. 0 always picks the likeliest next word -- precise, repetitive. 1 is the model's natural voice. Above 1 it takes chances. Changes the reply, not the model.">
+        creativity <input type="range" id="c-temp" min="0" max="1.5" step="0.05" value="0.7"
+        style="width:5.5rem;vertical-align:middle;accent-color:var(--accent)"><b id="c-temp-v" class="mono">0.70</b></label>
+      <label title="Standing instructions the model reads before every message in this conversation: a role, a tone, a language, rules. Kept in this browser only."><input type="checkbox" id="c-sys-on"> instructions</label>
+      <button type="button" class="ghost sm" id="c-new" title="Clear this conversation and start again. Your instructions and creativity setting stay.">new conversation</button>
+      <span style="flex:1"></span><span id="c-cost"></span>
+    </div>
+    <div class="sys" id="sys" hidden>
+      <textarea id="c-sys" rows="2" placeholder="e.g. You are a terse senior engineer. Answer in code first, prose second. Never apologise."></textarea>
+      <div class="sys-note">Read before every message you send from now on. To apply a change to a whole conversation, start a new one.</div>
+    </div>
+    <form id="f">
+      <textarea id="q" rows="1" placeholder="Message the model…" autofocus></textarea>
+      <button id="send" type="submit">Send</button>
+    </form>
+  </footer>
+</div>
+
+<!-- ─────────── analytics ─────────── -->
+<!-- ─────────── code ─────────── -->
+<div class="view" id="v-code" hidden><div class="pad">
+  <h1 class="page">Code</h1>
+  <p class="sub">Point a coding agent at this model. It runs on this Mac; nothing you type or
+    any file it reads leaves the machine.</p>
+
+  <div class="verdict" id="tool-verdict">
+    <i></i><b id="tool-verdict-b">—</b><span id="tool-verdict-s"></span>
+  </div>
+
+  <h2 class="sec">Connect an agent</h2>
+  <div id="agents"></div>
+
+  <h2 class="sec">Or point anything else at these</h2>
+  <div class="eps">
+    <span class="k">OpenAI</span><span class="v" id="ep-openai">—</span>
+    <span class="k">Anthropic</span><span class="v" id="ep-anthropic">—</span>
+    <span class="k">Responses</span><span class="v" id="ep-responses">—</span>
+    <span class="k">API key</span><span class="v">any value — this server does not check one</span>
+  </div>
+
+  <h2 class="sec">Tool calls</h2>
+  <p class="sub" id="tool-note">Every tool an agent asks this model to call shows up here.</p>
+  <div class="feed" id="tfeed">
+    <div class="hd"><b>Live</b><span class="grow"></span>
+      <span class="cnt" id="tfeed-cnt"></span></div>
+    <div class="body" id="tfeed-body">
+      <div class="empty">no tool calls yet — connect an agent and give it something to do</div>
+    </div>
+  </div>
+</div></div>
+
+<div class="view" id="v-stats" hidden><div class="pad">
+  <h1 class="page">Analytics</h1>
+  <p class="sub">Measured over every reply this server has produced.</p>
+  <div class="cards">
+    <div class="card"><h3>Median speed</h3><div class="big" id="s-tps">—</div>
+      <div class="note" id="s-tps-sub">no replies yet</div>
+      <div class="chart" id="ch-tps"></div></div>
+    <div class="card"><h3>Time to first token</h3><div class="big" id="s-ttft">—</div>
+      <div class="note" id="s-ttft-sub"></div>
+      <div class="chart" id="ch-ttft"></div></div>
+    <div class="card" title="Flags output that looks unusual FOR THIS MODEL -- repetition it was not asked for, or confidence unlike its own normal. It is an anomaly detector, not a fact checker: it cannot tell whether an answer is true, and a confidently-stated falsehood looks perfectly healthy to it. It also has no copy of the uncompressed model to compare against, so it cannot attribute anything it sees to BigRig."><h3>Anomalies</h3><div class="big" id="s-q">—</div>
+      <div class="note" id="s-q-sub"></div>
+      <div class="chart" id="ch-q"></div></div>
+    <div class="card"><h3>Reply length</h3><div class="big" id="s-len">—</div>
+      <div class="note" id="s-len-sub"></div>
+      <div class="chart" id="ch-len"></div></div>
+  </div>
+
+  <h2 class="sec">Where the memory goes</h2>
+  <div class="card"><div id="ch-mem"></div><div class="note" id="s-mem"></div></div>
+
+  <div id="sec-cache" style="display:none">
+    <h2 class="sec">Expert cache</h2>
+    <div class="card"><div class="big" id="s-miss">—</div><div class="note" id="s-miss-sub"></div>
+      <div class="chart" id="ch-miss"></div></div>
+  </div>
+
+  <h2 class="sec">This server</h2>
+  <div class="cards">
+    <div class="card"><h3>Uptime</h3><div class="big" id="s-up">—</div>
+      <div class="note">since <span id="s-started">—</span></div></div>
+    <div class="card"><h3>Requests served</h3><div class="big" id="s-req">—</div>
+      <div class="note"><span id="s-queue">—</span> waiting right now</div></div>
+    <div class="card"><h3>Model load time</h3><div class="big" id="s-load">—</div>
+      <div class="note" id="s-load-sub"></div></div>
+    <div class="card"><h3>Tokens flagged</h3><div class="big" id="s-flag">—</div>
+      <div class="note" id="s-flag-sub"></div></div>
+  </div>
+
+  <h2 class="sec">Every reply</h2>
+  <div class="card" style="padding:.3rem .4rem"><div id="tbl"></div></div>
+</div></div>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const $$ = s => [...document.querySelectorAll(s)];
+const thread = $("#thread"), qEl = $("#q"), sendEl = $("#send");
+const history = [];
+let busy = false, health = {}, lastCut = false;
+// A running request, so it can be stopped. `stopped` separates "the user pressed stop" from
+// "the connection broke" -- they look identical to fetch() and must not read the same to a user.
+let ctrl = null, reqId = null, stopped = false;
+const NA = "—";
+const set = (id,v,na)=>{const e=$(id); if(!e) return; e.textContent = v==null?NA:v;
+                        e.classList.toggle("na", v==null||!!na);};
+const fmtS = s => s==null?null:(s<90?`${Math.round(s)}s`:s<5400?`${Math.round(s/60)}m`:`${(s/3600).toFixed(1)}h`);
+const gb = b => b==null?null:(b/1e9).toFixed(2)+" GB";
+
+/* ── tiny chart helpers. Inline SVG, no library, nothing fetched from anywhere. ── */
+function svgEl(w,h){ return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" height="${h}">`; }
+function line(el, vals, {h=46, color="var(--accent)", fmt=v=>v}={}){
+  if(!vals.length){ el.innerHTML = '<div class="empty">no data yet</div>'; return; }
+  const w=260, max=Math.max(...vals,1e-9), min=Math.min(...vals,0);
+  const span = (max-min)||1;
+  const x = i => vals.length<2?w/2:i/(vals.length-1)*w;
+  const y = v => h-4-((v-min)/span)*(h-10);
+  const pts = vals.map((v,i)=>`${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(" ");
+  const area = `${x(0).toFixed(1)},${h} ${pts} ${x(vals.length-1).toFixed(1)},${h}`;
+  el.innerHTML = svgEl(w,h)
+    + `<polygon points="${area}" fill="${color}" opacity=".10"/>`
+    + `<polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.6"
+        stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/>`
+    + `<circle cx="${x(vals.length-1).toFixed(1)}" cy="${y(vals[vals.length-1]).toFixed(1)}"
+        r="2.4" fill="${color}"/></svg>`;
+}
+function bars(el, vals, flags, {h=46}={}){
+  if(!vals.length){ el.innerHTML = '<div class="empty">no data yet</div>'; return; }
+  const w=260, max=Math.max(...vals,1e-9), n=vals.length;
+  const bw=Math.max(1.2, w/n*0.72), gap=w/n;
+  el.innerHTML = svgEl(w,h) + vals.map((v,i)=>{
+    const bh=Math.max(1,(v/max)*(h-6));
+    return `<rect x="${(i*gap).toFixed(1)}" y="${(h-bh).toFixed(1)}" width="${bw.toFixed(1)}"
+             height="${bh.toFixed(1)}" rx="1"
+             fill="${flags&&flags[i]?'var(--warn)':'var(--accent)'}" opacity=".85"/>`;
+  }).join("") + "</svg>";
+}
+function stack(el, parts){
+  const total = parts.reduce((a,p)=>a+p.v,0)||1, w=600, h=34;
+  let x=0;
+  const segs = parts.map(p=>{
+    const pw = p.v/total*w, r = `<rect x="${x.toFixed(1)}" y="0" width="${Math.max(0,pw-1).toFixed(1)}"
+      height="${h}" rx="3" fill="${p.c}" opacity=".9"><title>${p.label}: ${gb(p.v)}</title></rect>`;
+    x+=pw; return r;
+  }).join("");
+  el.innerHTML = svgEl(w,h)+segs+"</svg>"
+    + '<div style="display:flex;gap:1rem;flex-wrap:wrap;margin-top:.5rem">'
+    + parts.map(p=>`<span style="font:11px var(--mono);color:var(--dim)">
+        <span style="display:inline-block;width:8px;height:8px;border-radius:2px;
+        background:${p.c};margin-right:.3rem"></span>${p.label} ${gb(p.v)}</span>`).join("")
+    + "</div>";
+}
+
+
+/* ── remembered prompts, and the live activity feed ─────────────────────────────────────── */
+/* THE FEED IS A FEED, NOT A SNAPSHOT.
+   `feedSeq` is the highest event number already on the page, and every poll asks only for what
+   came after it. Re-rendering the whole list every two seconds would fight the user's scroll
+   position and throw away their selection, which on a log is the one interaction that matters. */
+let feedSeq = 0, feedPaused = false, feedCount = 0;
+const KIND_LABEL = {start:"ready", reload:"rebuilt", memory:"memory", pressure:"pressure",
+                    cache:"prompts", warm:"cache", reply:"reply", error:"error"};
+
+async function pollFeed(){
+  if(feedPaused) return;
+  let d;
+  try{ d = await (await fetch(`/v1/events?since=${feedSeq}`)).json(); }
+  catch(e){ return; }                      /* a missed poll is caught by the next one */
+  if(!d || !d.events || !d.events.length){ return; }
+  const body = $("#feed-body");
+  if(!feedCount) body.innerHTML = "";
+  /* Stick to the bottom only if the user is already there. Yanking the view back down while
+     someone is reading an older line is the classic log-viewer annoyance. */
+  const atBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 40;
+  for(const e of d.events){
+    const row = document.createElement("div");
+    row.className = "row " + (e.kind||"");
+    const t = document.createElement("span"); t.className="t";
+    t.textContent = e.at < 90 ? `${e.at.toFixed(1)}s`
+                  : e.at < 5400 ? `${Math.round(e.at/60)}m` : `${(e.at/3600).toFixed(1)}h`;
+    const k = document.createElement("span"); k.className="k";
+    k.textContent = KIND_LABEL[e.kind] || e.kind || "";
+    const x = document.createElement("span"); x.className="x";
+    /* textContent, never innerHTML: these strings carry model names and error text straight
+       from the engine, and one of them containing a tag would otherwise be markup. */
+    x.textContent = e.text || "";
+    row.append(t,k,x); body.append(row);
+    feedCount++;
+  }
+  feedSeq = d.seq || feedSeq;
+  /* Bounded on the page as well as on the server, or a console left open all day grows a DOM
+     node per event until the tab is the slowest thing on the machine. */
+  while(body.childElementCount > 300) body.removeChild(body.firstElementChild);
+  $("#feed-cnt").textContent = feedCount ? `${feedCount} event${feedCount===1?"":"s"}` : "";
+  if(atBottom) body.scrollTop = body.scrollHeight;
+}
+
+function paintPromptCache(h){
+  const reused = h.prompt_tokens_reused || 0, hits = h.prompt_cache_hits || 0;
+  const misses = h.prompt_cache_misses || 0, bytes = h.prompt_cache_bytes || 0;
+  const limit = (h.prompt_cache_gb || 0) * 1e9;
+  set("#pc-reused", reused ? reused.toLocaleString() : "0", !reused);
+  /* Deliberately NOT converted into "seconds saved". That number would need a rate for reading
+     a token, and the only rate on hand is a median time to first token across replies whose
+     prompts were all different lengths -- dividing one by the other would be arithmetic with no
+     meaning behind it. The token count is what was actually measured, so it is what is shown. */
+  $("#pc-reused-s").textContent = !reused ? "nothing reused yet"
+      : `across ${hits} follow-up${hits===1?"":"s"}`;
+  set("#pc-hits", hits+misses ? `${hits}/${hits+misses}` : "—", !(hits+misses));
+  $("#pc-hits-s").textContent = hits+misses ? `${hits} of ${hits+misses} replies started from
+      something already read`.replace(/\s+/g," ") : "";
+  set("#pc-bytes", limit ? gb(bytes) : "off", !limit);
+  $("#pc-bytes-s").textContent = limit ? `of ${(h.prompt_cache_gb).toFixed(2)} GB set aside`
+                                       : "turned off for this session";
+  $("#pc-fill").style.width = limit ? Math.min(100, bytes/limit*100)+"%" : "0";
+  $("#pc-clear").disabled = !bytes;
+}
+
+$("#pc-clear").addEventListener("click", async ()=>{
+  const b=$("#pc-clear"), msg=$("#pc-msg");
+  b.disabled=true; msg.textContent="forgetting…";
+  try{
+    const r = await fetch("/v1/config", {method:"POST",
+      headers:{"Content-Type":"application/json"}, body:JSON.stringify({clear_prompt_cache:true})});
+    const d = await r.json();
+    if(!r.ok) throw new Error((d.error&&d.error.message)||"could not clear");
+    msg.textContent = `forgot ${gb(d.freed_bytes||0)}. The next question will be read in full.`;
+    refresh(); pollFeed();
+  }catch(e){ msg.textContent = e.message; b.disabled=false; }
+});
+
+$("#feed-pause").addEventListener("click", ()=>{
+  feedPaused = !feedPaused;
+  $("#feed-pause").textContent = feedPaused ? "Resume" : "Pause";
+  $("#feed").classList.toggle("paused", feedPaused);
+  if(!feedPaused) pollFeed();
+});
+
+
+/* ── the Code page ──────────────────────────────────────────────────────────────────────── */
+/* WHY THIS PAGE EXISTS AT ALL.
+   Everything on it was already true and none of it was findable. The endpoints were printed once
+   at startup and scrolled away; `bigrig launch` was a line in --help; and whether the loaded
+   model can call tools at all -- the thing that decides if an agent works -- was visible nowhere.
+   An agent pointed at a model with no tool-call format does not fail loudly. It answers the
+   question instead of doing the work, which reads as a bad model rather than a wrong setup. */
+const AGENTS = [
+  {id:"claude", name:"Claude Code", api:"Anthropic Messages",
+   note:"Sets the variables for that one process. Nothing on disk is touched and closing it "
+        + "puts everything back.",
+   cmd:m=>`bigrig launch ${m}`},
+  {id:"codex", name:"Codex CLI", api:"OpenAI Responses",
+   note:"Needs a config file rather than variables, so it gets a throwaway one that is deleted "
+        + "when it exits. Your own ~/.codex is never opened.",
+   cmd:m=>`bigrig launch --agent codex ${m}`},
+  {id:"opencode", name:"opencode", api:"OpenAI Chat Completions",
+   note:"Pointed at this server through the environment, for that process only.",
+   cmd:m=>`bigrig launch --agent opencode ${m}`},
+];
+
+function paintCode(h){
+  const ok = h.supports_tools !== false;
+  const v = $("#tool-verdict");
+  v.className = "verdict" + (ok ? "" : " no");
+  $("#tool-verdict-b").textContent = ok
+    ? `${h.model || "this model"} can call tools`
+    : `${h.model || "this model"} cannot call tools`;
+  $("#tool-verdict-s").textContent = ok
+    ? "an agent connected here can read files and run commands"
+    : "its chat template defines no tool-call format, so an agent will get answers instead of "
+      + "actions. Serve a model that does.";
+  const host = location.host || "127.0.0.1:8080";
+  $("#ep-openai").textContent    = `http://${host}/v1/chat/completions`;
+  $("#ep-anthropic").textContent = `http://${host}/v1/messages`;
+  $("#ep-responses").textContent = `http://${host}/v1/responses`;
+
+  const box = $("#agents");
+  if(box.dataset.model === (h.model || "")) return;   // only rebuild when the model changes
+  box.dataset.model = h.model || "";
+  box.innerHTML = "";
+  for(const a of AGENTS){
+    const el = document.createElement("div");
+    el.className = "agent";
+    const hd = document.createElement("div"); hd.className = "hd";
+    const b = document.createElement("b"); b.textContent = a.name;
+    const em = document.createElement("em"); em.textContent = a.api;
+    hd.append(b, em);
+    const p = document.createElement("p"); p.textContent = a.note;
+    const cmd = document.createElement("div"); cmd.className = "cmd";
+    const code = document.createElement("code");
+    // textContent, not innerHTML: the model name comes from the server and a name containing a
+    // tag would otherwise become markup on a page telling people what to run.
+    code.textContent = a.cmd(h.model || "MODEL");
+    const btn = document.createElement("button"); btn.textContent = "copy";
+    btn.onclick = async () => {
+      try { await navigator.clipboard.writeText(code.textContent); }
+      catch(e){ return; }                      // no clipboard permission; say nothing false
+      btn.textContent = "copied"; btn.classList.add("done");
+      setTimeout(()=>{ btn.textContent="copy"; btn.classList.remove("done"); }, 1400);
+    };
+    cmd.append(code, btn);
+    el.append(hd, p, cmd);
+    box.append(el);
+  }
+}
+
+/* Tool calls, pulled off the same event feed the console uses. A separate seq, because the two
+   pages poll independently and one must not consume the other's events. */
+let tseq = 0, tcount = 0;
+async function pollTools(){
+  if($("#v-code").hidden) return;              // nobody is looking; do not poll
+  let d;
+  try{ d = await (await fetch(`/v1/events?since=${tseq}`)).json(); }catch(e){ return; }
+  if(!d || !d.events) return;
+  const body = $("#tfeed-body");
+  const rows = d.events.filter(e => e.kind === "reply" || e.kind === "error");
+  tseq = d.seq || tseq;
+  if(!rows.length) return;
+  if(!tcount) body.innerHTML = "";
+  const atBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 40;
+  for(const e of rows){
+    const row = document.createElement("div"); row.className = "row " + e.kind;
+    const t = document.createElement("span"); t.className="t";
+    t.textContent = e.at < 90 ? `${e.at.toFixed(1)}s` : `${Math.round(e.at/60)}m`;
+    const k = document.createElement("span"); k.className="k"; k.textContent = e.kind;
+    const x = document.createElement("span"); x.className="x"; x.textContent = e.text || "";
+    row.append(t,k,x); body.append(row); tcount++;
+  }
+  while(body.childElementCount > 200) body.removeChild(body.firstElementChild);
+  $("#tfeed-cnt").textContent = tcount ? `${tcount}` : "";
+  if(atBottom) body.scrollTop = body.scrollHeight;
+}
+
+/* ── views ── */
+const VIEWS = ["console","chat","code","stats"];
+function show(v){
+  VIEWS.forEach(k=>{
+    $("#v-"+k).hidden = k!==v;
+    $("#n-"+k).classList.toggle("on", k===v);
+  });
+  if(v==="stats") loadStats();
+  if(v==="console") consoleCharts();
+  if(v==="chat") qEl.focus();
+  if(v==="code") pollTools();
+}
+VIEWS.forEach(k=>{ $("#n-"+k).onclick = ()=>show(k); });
+$("#r-chat").onclick = ()=>show("chat");
+$("#m-host").textContent = location.host || "127.0.0.1:8080";
+
+/* ── theme ── */
+const themeBtn=$("#theme");
+themeBtn.onclick=()=>{
+  const cur=document.documentElement.getAttribute("data-theme");
+  const next = cur==="dark" ? "light" : cur==="light" ? "" : "dark";
+  if(next) document.documentElement.setAttribute("data-theme",next);
+  else document.documentElement.removeAttribute("data-theme");
+  try{ next?localStorage.setItem("tg-theme",next):localStorage.removeItem("tg-theme"); }catch(e){}
+};
+/* ── how the model is used: creativity and standing instructions ─────────────
+   Both already exist on the server (temperature; a system message the chat template reads).
+   The page hardcoded 0.7 and had no way to give instructions at all, so a person could not
+   change how the model behaved without leaving the page. Kept per browser, like the theme. */
+function currentTemp(){ return parseFloat($("#c-temp").value||"0.7"); }
+function withInstructions(msgs){
+  const on=$("#c-sys-on").checked, txt=($("#c-sys").value||"").trim();
+  return (on && txt) ? [{role:"system",content:txt}, ...msgs] : msgs;
+}
+function paintTemp(){ $("#c-temp-v").textContent=currentTemp().toFixed(2); }
+$("#c-temp").oninput=()=>{ paintTemp(); try{ localStorage.setItem("tg-temp",$("#c-temp").value);}catch(e){} };
+$("#c-sys-on").onchange=()=>{ $("#sys").hidden=!$("#c-sys-on").checked;
+  try{ localStorage.setItem("tg-sys-on",$("#c-sys-on").checked?"1":"0"); }catch(e){} };
+$("#c-sys").oninput=()=>{ try{ localStorage.setItem("tg-sys",$("#c-sys").value);}catch(e){} };
+$("#c-new").onclick=()=>{ if(busy) return; history.length=0;
+  $$("#thread .msg").forEach(m=>m.remove()); $("#blank").hidden=false; $("#q").focus(); };
+try{
+  const t=localStorage.getItem("tg-temp"); if(t!=null){ $("#c-temp").value=t; }
+  const so=localStorage.getItem("tg-sys-on"); if(so==="1"){ $("#c-sys-on").checked=true; $("#sys").hidden=false; }
+  const sv=localStorage.getItem("tg-sys"); if(sv!=null){ $("#c-sys").value=sv; }
+}catch(e){}
+paintTemp();
+
+try{ const t=localStorage.getItem("tg-theme");
+     if(t) document.documentElement.setAttribute("data-theme",t); }catch(e){}
+
+/* ── the reply-limit selector, built from what the MODEL allows ── */
+function buildLimits(){
+  // Built from what the server will actually accept -- the smaller of the model's context
+  // window and what the memory budget leaves for KV cache -- so the menu can never offer a
+  // length the request would then be rejected for.
+  const sel=$("#c-max"), cap=health.max_completion_tokens||0;
+  if(sel.dataset.built || !cap) return;
+  const opts=[256,512,1024,2048,4096,8192,16384,32768,65536].filter(v=>v<cap);
+  opts.push(cap);
+  const def = opts.includes(1024) ? 1024 : opts[opts.length-1];
+  sel.innerHTML = opts.map(v=>`<option value="${v}"${v===def?" selected":""}>${
+    v>=1024?(v/1024).toFixed(v%1024?1:0)+"k":v} tokens</option>`).join("");
+  sel.dataset.built="1"; cost();
+}
+function cost(){
+  const n=parseInt($("#c-max").value||"0",10);
+  const kv=health.kv_bytes_per_token||0;
+  const tps=health.median_tok_s||null;
+  const bits=[];
+  if(kv) bits.push(`${(n*kv/1e9).toFixed(2)} GB of KV cache if it runs to the limit`);
+  if(tps) bits.push(`~${fmtS(n/tps)} at ${tps} tok/s`);
+  $("#c-cost").textContent = bits.join(" · ");
+}
+$("#c-max").onchange = cost;
+
+/* ── cache configuration ────────────────────────────────────────────────────
+   The two sliders are the only settings that change how the model is served, so they are the
+   only ones shown. Both are priced in GB against the SAME budget the planner uses, and both are
+   clamped to what actually fits -- a slider that can be dragged to a configuration the server
+   would refuse is a slider that lies. */
+const PRESETS = [
+  {id:"fast",  name:"Fastest",     why:"Hold as many experts as the budget allows. Fewest disk reads, shortest replies."},
+  {id:"bal",   name:"Balanced",    why:"Room for a long answer and most experts resident. The default."},
+  {id:"long",  name:"Long replies",why:"Reserve memory for a long answer. Fewer experts resident, so slower."},
+];
+let cfgLive = null;             // what the server is serving right now
+let cfgWant = null;             // what the sliders say
+let cfgBusy = false;
+
+function slotsThatFit(kvTokens){
+  // budget - things that are resident whatever happens - one step's working set - the memory set
+  // aside for remembered prompts - this reply's KV cache = what is left for expert slots.
+  //
+  // EVERY TERM THE SERVER RESERVES MUST APPEAR HERE. The reserve gained `prompt_cache_gb` when
+  // the engine started remembering prompts, and for a while this did not know about it -- so the
+  // slider offered five more experts a layer than the planner would accept, which is precisely
+  // the lying control the comment above was written to prevent.
+  const h=health;
+  // The WANTED reserve, not the live one. While the third slider is being dragged the page is
+  // previewing a configuration that does not exist yet, and pricing it against the reserve the
+  // server currently has would show the user a ceiling for the setting they are leaving.
+  const pc = (cfgWant && cfgWant.pcache != null) ? cfgWant.pcache : (h.prompt_cache_gb||0);
+  const spare = (h.budget_gb||0) - (h.non_expert_gb||0) - (h.working_memory_gb||0) - pc
+              - (h.draft_gb||0) - kvTokens*(h.kv_bytes_per_token||0)/1e9;
+  const per = h.gb_per_slot||0;
+  if(per<=0) return h.n_experts||0;
+  return Math.max(1, Math.min(h.n_experts||0, Math.floor(spare/per)));
+}
+function kvTokensThatFit(slots){
+  const h=health;                        // same terms as slotsThatFit, and for the same reason
+  const pc = (cfgWant && cfgWant.pcache != null) ? cfgWant.pcache : (h.prompt_cache_gb||0);
+  const spare = (h.budget_gb||0) - (h.non_expert_gb||0) - (h.working_memory_gb||0) - pc
+              - (h.draft_gb||0) - slots*(h.gb_per_slot||0);
+  const kv = h.kv_bytes_per_token||0;
+  if(kv<=0) return h.context_length||0;
+  return Math.max(0, Math.min(h.context_length||0, Math.floor(spare*1e9/kv)));
+}
+function presetTarget(id){
+  const h=health, E=h.n_experts||0;
+  if(id==="fast"){ const w={capacity:slotsThatFit(512), kv:512};
+                   w.kv=Math.min(w.kv, kvTokensThatFit(w.capacity)); return w; }
+  if(id==="long"){ const kv=kvTokensThatFit(Math.max(1,Math.round(E*0.25)));
+                   const w={capacity:slotsThatFit(kv), kv};
+                   w.kv=Math.min(w.kv, kvTokensThatFit(w.capacity)); return w; }
+  const w={capacity:slotsThatFit(1024), kv:1024};
+  w.kv=Math.min(w.kv, kvTokensThatFit(w.capacity));
+  return w;
+}
+function applyPreset(id){
+  // A preset is a point on the speed-against-length trade and says nothing about remembering
+  // prompts, so it carries the current setting through rather than silently resetting it.
+  const keep = cfgWant ? cfgWant.pcache : (health.prompt_cache_gb||0);
+  cfgWant = {...presetTarget(id), pcache: keep};
+  drawCfg();
+}
+function presetOf(w){
+  if(!w) return null;
+  for(const p of PRESETS){
+    const t=presetTarget(p.id);
+    if(t.capacity===w.capacity && t.kv===w.kv) return p.id;
+  }
+  return null;
+}
+function drawCfg(){
+  if(!cfgWant || !health.n_experts) return;
+  const h=health, E=h.n_experts;
+  const exp=$("#s-exp"), kv=$("#s-kv");
+  // The slider stops where the budget stops. A control that can be dragged to a setting the
+  // server would refuse is a control that lies, so the range is the range that fits.
+  const maxSlots = slotsThatFit(cfgWant.kv);
+  cfgWant.capacity = Math.min(cfgWant.capacity, maxSlots);
+  exp.min=1; exp.max=maxSlots; exp.value=cfgWant.capacity;
+  $("#s-exp-lo").textContent="1";
+  $("#s-exp-hi").textContent = maxSlots>=E ? E+" (all)" : `${maxSlots} of ${E} (all that fits)`;
+  $("#s-exp-n").textContent=`${cfgWant.capacity} of ${E} per layer`;
+  $("#s-exp-gb").textContent=(cfgWant.capacity*(h.gb_per_slot||0)).toFixed(2)+" GB";
+  $("#s-exp-why").textContent = cfgWant.capacity>=E
+    ? "Every expert is in memory. Nothing is read from disk while the model runs."
+    : `${Math.round(cfgWant.capacity/E*100)}% resident. The other `
+      + `${E-cfgWant.capacity} per layer are read from disk when the router picks them.`
+      + (cfgWant.capacity>=maxSlots && maxSlots<E
+           ? `  That is as many as fit: ${E-maxSlots} more would not leave room in `
+             + `${h.budget_gb} GB for a ${cfgWant.kv.toLocaleString()}-token reply.` : "");
+
+  const maxKV = kvTokensThatFit(cfgWant.capacity);
+  kv.min=256; kv.max=Math.max(256, maxKV); kv.step=256;
+  kv.value=Math.min(cfgWant.kv, Math.max(256,maxKV));
+  $("#s-kv-hi").textContent=maxKV.toLocaleString()+(maxKV>=(h.context_length||0)?" (context)":" (fits)");
+  $("#s-kv-n").textContent=cfgWant.kv.toLocaleString()+" tokens";
+  $("#s-kv-gb").textContent=(cfgWant.kv*(h.kv_bytes_per_token||0)/1e9).toFixed(2)+" GB";
+
+  const pcEl=$("#s-pc"), pcMax=Math.max(0, Math.min(4,
+      (h.budget_gb||0) - (h.non_expert_gb||0) - (h.working_memory_gb||0)
+      - cfgWant.capacity*(h.gb_per_slot||0) - cfgWant.kv*(h.kv_bytes_per_token||0)/1e9));
+  cfgWant.pcache = Math.min(cfgWant.pcache, Math.round(pcMax*20)/20);
+  pcEl.min=0; pcEl.max=Math.max(0, Math.round(pcMax*100/5)*5); pcEl.step=5;
+  pcEl.value=Math.round(cfgWant.pcache*100);
+  $("#s-pc-hi").textContent = pcMax>0 ? pcMax.toFixed(2)+" GB (all that fits)" : "no room";
+  $("#s-pc-n").textContent = cfgWant.pcache>0 ? cfgWant.pcache.toFixed(2)+" GB" : "off";
+  const pcTok = (h.kv_bytes_per_token||0) ? cfgWant.pcache*1e9/h.kv_bytes_per_token : 0;
+  $("#s-pc-tok").textContent = cfgWant.pcache>0
+    ? `~${Math.round(pcTok).toLocaleString()} tokens` : "re-read every time";
+  $("#s-pc-why").textContent = cfgWant.pcache>0
+    ? `About ${Math.round(pcTok).toLocaleString()} tokens of conversation kept, so a follow-up `
+      + `question reads only what is new. It comes out of the same budget as the experts.`
+    : "Every question re-reads the whole conversation from the first token.";
+
+  // BOTH SIDES OF THE TRADE, NAMED. Moving this slider does two things at once and only one of
+  // them was visible. Neither number is predicted: the GB is arithmetic and the reply ceiling is
+  // what the server will actually accept at that setting.
+  const tr=$("#s-exp-trade"), live=cfgLive?cfgLive.capacity:cfgWant.capacity;
+  const dGB=(cfgWant.capacity-live)*(h.gb_per_slot||0);
+  const nowKV=Math.min(cfgWant.kv, kvTokensThatFit(cfgWant.capacity));
+  const liveKV=Math.min(cfgWant.kv, kvTokensThatFit(live));
+  const more = cfgWant.capacity>live;
+  tr.innerHTML = cfgWant.capacity===live ? "" :
+      `<span class="${more?"down":"up"}">memory <b>${dGB>0?"+":""}${dGB.toFixed(2)} GB</b></span>`
+    + `<span class="${more?"up":"down"}"><b>${more?"Fewer":"More"}</b> reads from disk, so `
+      + `<b>${more?"faster":"slower"}</b></span>`
+    + (nowKV!==liveKV
+        ? `<span class="${nowKV<liveKV?"down":"up"}">longest reply <b>`
+          + `${liveKV.toLocaleString()} &rarr; ${nowKV.toLocaleString()}</b> tokens</span>` : "");
+
+  const dirty = !cfgLive || cfgWant.capacity!==cfgLive.capacity;
+  $("#cfg-apply").disabled = cfgBusy || !dirty;
+  $("#cfg-state").textContent = cfgBusy ? "reloading" : dirty ? "not applied" : "synced";
+  $("#cfg-state").className = "tag"+(cfgBusy?" warn":dirty?" warn":" good");
+  const act=presetOf(cfgWant);
+  $$("#presets .preset").forEach(b=>b.classList.toggle("on", b.dataset.id===act));
+  buildLimitsFromKV();
+}
+function buildLimitsFromKV(){
+  // The chat page's reply-limit menu must agree with the slider: the slider IS the reply length
+  // the memory was reserved for.
+  const sel=$("#c-max");
+  if(!cfgWant) return;
+  const want=cfgWant.kv, cap=Math.min(health.max_completion_tokens||want, want);
+  const opts=[...new Set([256,512,1024,2048,4096,8192,16384,32768]
+    .filter(v=>v<cap).concat([cap]))].sort((a,b)=>a-b);
+  const keep=parseInt(sel.value||"0",10);
+  sel.innerHTML=opts.map(v=>`<option value="${v}"${v===(opts.includes(keep)?keep:cap)?" selected":""}>${
+    v>=1024?(v/1024).toFixed(v%1024?1:0)+"k":v} tokens</option>`).join("");
+  sel.dataset.built="1"; cost();
+}
+$("#s-exp").oninput = e=>{ cfgWant.capacity=parseInt(e.target.value,10);
+  cfgWant.kv=Math.min(cfgWant.kv, Math.max(256,kvTokensThatFit(cfgWant.capacity))); drawCfg(); };
+$("#s-kv").oninput = e=>{ cfgWant.kv=parseInt(e.target.value,10); drawCfg(); };
+$("#s-pc").oninput = e=>{ cfgWant.pcache=parseInt(e.target.value,10)/100;
+  cfgWant.capacity=Math.min(cfgWant.capacity, slotsThatFit(cfgWant.kv));
+  cfgWant.kv=Math.min(cfgWant.kv, Math.max(256,kvTokensThatFit(cfgWant.capacity))); drawCfg(); };
+$("#cfg-reset").onclick = ()=>{ if(cfgLive){ cfgWant={...cfgLive}; drawCfg();
+                                             $("#cfg-msg").textContent=""; } };
+$("#cfg-apply").onclick = async ()=>{
+  if(cfgBusy || !cfgWant) return;
+  cfgBusy=true; drawCfg();
+  $("#cfg-msg").textContent="Reloading the model. This takes about as long as the first start.";
+  try{
+    const r = await fetch("/v1/config", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({capacity: cfgWant.capacity, prompt_cache_gb: cfgWant.pcache})});
+    const j = await r.json();
+    if(!r.ok) throw new Error((j.error&&j.error.message)||"the server refused the change");
+    $("#cfg-msg").textContent="Applied.";
+  }catch(e){
+    $("#cfg-msg").textContent="Not applied: "+e.message;
+    if(cfgLive) cfgWant={...cfgLive};
+  }
+  cfgBusy=false; await refresh(); drawCfg();
+};
+
+/* The two console sparklines share /stats with the analytics page. Drawn only when there is
+   something to draw -- an empty chart is a worse answer than no chart. */
+async function consoleCharts(){
+  let d; try{ d = await (await fetch("/stats")).json(); }catch(e){ return; }
+  const hist = d.history || [];
+  const tps = hist.map(r=>r.tok_s).filter(v=>v>0);
+  const miss = hist.map(r=>r.miss_rate).filter(v=>v!=null);
+  if(tps.length>1) line($("#c-spark-tps"), tps, {h:26});
+  else $("#c-spark-tps").innerHTML="";
+  if(miss.length>1) line($("#c-spark-miss"), miss.map(v=>v*100), {h:26, color:"var(--warn)"});
+  else $("#c-spark-miss").innerHTML="";
+}
+
+/* ── console + rail ── */
+function rows(el, items){
+  el.innerHTML = items.map(([k,v,na])=>`<div class="row"><span class="k">${k}</span>
+    <span class="v${v==null||na?" na":""}">${v==null?NA:v}</span></div>`).join("");
+}
+async function refresh(){
+  try{ health = await (await fetch("/health")).json(); }
+  catch(e){ set("#r-name","server unreachable");
+            $("#m-live").className="down";
+            $("#m-state-t").textContent="not responding";
+            $("#m-state").className="st warn"; return; }
+  const h=health, streaming = h.mode==="stream";
+
+  /* rail: the model is named where it is visible from every page */
+  $("#m-model").textContent = h.model || "—";
+  const ms = $("#m-state"), mt = $("#m-state-t");
+  if(h.weights_altered){ ms.className="st warn"; mt.textContent="compressed to fit"; }
+  else if(streaming){ ms.className="st"; mt.textContent=`exact · ${h.capacity} of ${h.n_experts} held`; }
+  else { ms.className="st"; mt.textContent="exact · fully in memory"; }
+  $("#m-live").className = "";
+
+  /* rail meters */
+  const used=history.reduce((a,m)=>a+Math.ceil((m.content||"").length/4),0);
+  const kvNowGb=(h.kv_bytes_per_token||0)*used/1e9;
+  const B=h.budget_gb||0;
+  if(B){
+    $("#m-bar-w").style.width=Math.min(100,(h.footprint_gb||0)/B*100)+"%";
+    $("#m-bar-k").style.width=Math.min(100-((h.footprint_gb||0)/B*100), kvNowGb/B*100)+"%";
+    $("#m-mem").textContent=`${((h.footprint_gb||0)+kvNowGb).toFixed(1)} / ${B} GB`;
+  }
+  if(streaming && h.n_experts){
+    $("#m-bar-r").style.width=(h.capacity/h.n_experts*100)+"%";
+    $("#m-res").textContent=`${h.capacity} / ${h.n_experts}`;
+  } else { $("#m-bar-r").style.width="100%"; $("#m-res").textContent="all"; }
+
+  paintPromptCache(h);
+  paintCode(h);
+
+  /* console cards */
+  $("#c-sub").textContent = h.serving ? h.serving.replace(/^running /,"Running ") : "";
+  set("#c-tps", h.median_tok_s!=null?h.median_tok_s.toFixed(1):null);
+  $("#c-tps-note").textContent = h.median_tok_s!=null
+    ? `median tokens per second over ${h.requests_served||0} `
+      + `request${h.requests_served===1?"":"s"}`
+    : "no replies yet";
+  /* THE VERDICT, IN THE DOCTOR'S WORDS. `doctor` says FAST/GOOD/USABLE/SLOW before a download;
+     the console showed a number and left the person to judge it. Same four words here, and the
+     basis with them -- a plan's expectation and a measured median are not the same kind of fact,
+     so the pill is muted until something has actually been measured. */
+  const tier=$("#c-tier");
+  if(h.speed_tier){
+    tier.hidden=false; tier.textContent=h.speed_tier;
+    const measured=/^measured/.test(h.speed_basis||"");
+    tier.className="pill "+(h.speed_tier==="FAST"||h.speed_tier==="GOOD"?"good":h.speed_tier==="USABLE"?"":"warn")
+      +(measured?"":" dim");
+    tier.title=h.speed_basis||"";
+    $("#c-tier-note").textContent = (h.speed_why||"") + (measured?"":" (expected; nothing measured yet)");
+  } else { tier.hidden=true; $("#c-tier-note").textContent=""; }
+  set("#c-tok", h.total_tokens?h.total_tokens.toLocaleString():null);
+  $("#c-tok-note").textContent = h.total_tokens
+    ? `${h.flagged_tokens} looked unusual for this model` : "nothing generated yet";
+  /* A lone flagged token is noise: the meter judges against the model's own normal at z=2.5,
+     so about one healthy token in a hundred trips it. Damage looks like a RUN of flags or a real
+     share. Below 2% with no run of three, the card says clean and counts the strays honestly. */
+  const share=h.flagged_share||0, runs=h.flag_runs||0, noisy=(share<0.02 && runs===0);
+  set("#c-q", h.total_tokens?((share>0&&!noisy)?`${(share*100).toFixed(1)}%`:"clean"):null);
+  $("#c-q").className = "big"+(h.total_tokens&&share>0&&!noisy?"":" acc");
+  $("#c-q-note").textContent = h.monitor===false ? "anomaly detection is off"
+    : h.total_tokens ? ((share>0&&!noisy) ? `of tokens looked degraded${runs?` (${runs} run${runs===1?"":"s"} of 3+)`:""}`
+                        : (h.flagged_tokens ? `${h.flagged_tokens} token${h.flagged_tokens===1?"":"s"} looked unusual, within noise` : "no degradation detected"))
+    : "watching every token for drift";
+  set("#c-disk", streaming&&h.fetch_gb!=null?h.fetch_gb.toFixed(2)+" GB":null, !streaming);
+  $("#c-disk-note").textContent = !streaming ? "the whole model is in memory"
+    : `${((h.miss_rate||0)*100).toFixed(1)}% of expert lookups missed the cache`;
+
+  /* model row */
+  $("#r-name").textContent = h.model||NA;
+  $("#r-serving").textContent = (h.serving||"").replace(/^running /,"");
+  const st=$("#r-state"); st.className="pill "+(h.weights_altered?"warn":"good");
+  const alt=$("#r-alt");
+  alt.textContent = h.weights_altered ? "weights CHANGED to fit" : "unmodified";
+  alt.className = "pill"+(h.weights_altered?" warn":"");
+  $("#r-uptime").textContent = h.uptime_s!=null?fmtS(h.uptime_s)+" up":"up";
+  set("#r-tps", h.median_tok_s!=null?h.median_tok_s.toFixed(1):null);
+  set("#r-req", h.requests_served!=null?String(h.requests_served):null);
+  set("#r-ttft", h.median_ttft!=null?h.median_ttft.toFixed(1)+"s":null);
+  const note=$("#r-note"); note.innerHTML="";
+  const WARN_NO_TEMPLATE = "This model ships no chat template, so it was not built for conversation. Replies are cut at a turn boundary to stop it writing both sides.";
+  const WARN_ALTERED = "These weights were compressed to fit in memory. Answers will differ from the model you downloaded.";
+  if(h.chat_template===false) note.innerHTML='<div class="note warn">'+WARN_NO_TEMPLATE+'</div>';
+  else if(h.weights_altered) note.innerHTML='<div class="note warn">'+WARN_ALTERED+'</div>';
+  /* Two things a person can act on, said where the model is named. Both are facts the server
+     reports, never inferred here: whether the experts take the copy path, and what raising the
+     ceiling did on a measured run. textContent, never innerHTML, for anything from the server. */
+  if(streaming && h.packed===false){
+    const d=document.createElement("div"); d.className="note warn";
+    d.textContent=`Experts are copied in from the model's own files on every miss, the slower path. Run: bigrig prepare ${h.model||""}`;
+    note.appendChild(d);
+  }
+  if(streaming && h.speed_hint){
+    const d=document.createElement("div"); d.className="note";
+    d.textContent=h.speed_hint.replace(/\n/g," ");
+    note.appendChild(d);
+  }
+  /* The model's own next-token head, when one is loaded: what it guessed and how often the
+     model agreed. Reported because a head that is wrong for the model is indistinguishable
+     from a mechanism that does not pay, and they need opposite fixes. */
+  if(h.mtp){
+    const d=document.createElement("div"); d.className="note";
+    const n=h.mtp_drafted||0;
+    d.textContent = n
+      ? `Guessing one token ahead with ${h.mtp} (${h.mtp_bits?h.mtp_bits+"-bit":"bf16"}, ${h.mtp_gb} GB): ${((h.mtp_acceptance||0)*100).toFixed(0)}% of ${n.toLocaleString()} guesses were right.`
+      : `Guessing one token ahead with ${h.mtp}; no guesses yet.`;
+    note.appendChild(d);
+  }
+  // Whether the expert count is a fact or a guess. A setting a person can change should say
+  // where its current value came from; built with textContent because it is server text.
+  if(streaming && h.capacity_source){
+    const d=document.createElement("div"); d.className="note";
+    d.textContent = (h.tuned ? "Expert count measured on this Mac on first run." :
+                     "Expert count is an estimate. The first run at this budget measures it.");
+    note.appendChild(d);
+  }
+
+  /* cache config -- only meaningful when experts are actually being streamed */
+  const showCfg = streaming && h.n_experts;
+  $$("#v-console .slider, #v-console .presets, #v-console .apply").forEach(
+    e=>{ e.style.display = showCfg?"":"none"; });
+  $("#cfg-sub").textContent = showCfg
+    ? ("Changing the expert cache reloads the model. Nothing else about it changes."
+       + (h.tuned ? " The current count was measured on this Mac." : ""))
+    : "This model fits in memory whole, so there is no cache to tune.";
+  if(showCfg){
+    // `planned_from` IS THE SETTING; `capacity` IS A CONSEQUENCE OF IT.
+    //     When whole layers are in play they are different numbers -- a budget of 12 becomes one
+    //     layer holding all 128 experts plus 9 slots everywhere else, and 9 is what `capacity`
+    //     reports. Seeding the slider from `capacity` meant dragging it to 12 and pressing Apply
+    //     made it snap back to 9, which reads exactly like a server that refused the change. The
+    //     slider now shows the number the user set, and the panel below still shows what it
+    //     bought. Falls back to `capacity` for a server old enough not to report the budget.
+    const live={capacity:h.planned_from||h.capacity,
+                kv:Math.min(h.max_completion_tokens||1024, cfgWant?cfgWant.kv:1024),
+                pcache:h.prompt_cache_gb||0};
+    // Re-seeded when EITHER of the two things the server owns has moved. Watching capacity alone
+    // meant a prompt-cache change applied from another tab, or by this page's own Apply, left the
+    // slider showing the old figure until something unrelated forced a reload.
+    if(!cfgLive || cfgLive.capacity!==live.capacity || cfgLive.pcache!==live.pcache){
+      cfgLive=live; if(!cfgBusy) cfgWant={...live};
+    }
+    if($("#presets").children.length===0){
+      $("#presets").innerHTML = PRESETS.map(p=>`<button class="preset" data-id="${p.id}">
+        <b>${p.name}</b><span>${p.why}</span></button>`).join("");
+      $$("#presets .preset").forEach(b=>b.onclick=()=>applyPreset(b.dataset.id));
+    }
+    drawCfg();
+  }
+
+  /* the claim, stated once and plainly, because it is the whole product */
+  const claim=$("#c-claim"), ct=$("#c-claim-t");
+  if(h.weights_altered){
+    claim.className="claim warn";
+    ct.textContent="These weights were COMPRESSED to fit. Answers will differ from the model you "
+      + "downloaded.";
+  } else if(streaming){
+    claim.className="claim";
+    ct.textContent=`The model's own weights, untouched: decode is bit-identical to a resident run, `
+      + `prompt processing to the last bit of a float or one off it. ${h.model_gb} GB of experts, `
+      + `${h.resident_gb} GB held in memory, the rest read from disk as they are needed.`;
+  } else {
+    claim.className="claim";
+    ct.textContent="The model's own weights, untouched and entirely in memory.";
+  }
+
+  /* WHERE THE MEMORY GOES -- one picture, drawn to scale against the ceiling.
+     Everything here is a number the server reports, never an estimate: what the pool holds,
+     what is resident whatever happens, what one forward pass needs, and what this conversation
+     has cost so far. Whatever is left over is drawn as unused rather than hidden. */
+  if(B){
+    const exp = streaming ? (h.resident_gb||0) : Math.max(0,(h.footprint_gb||0)-(h.non_expert_gb||0));
+    const oth = h.non_expert_gb||0, stp = h.working_memory_gb||0;
+    const used = exp+oth+stp+kvNowGb;
+    const pc = v => Math.max(0, Math.min(100, v/B*100)).toFixed(2)+"%";
+    $("#b-experts").style.width=pc(exp); $("#b-other").style.width=pc(oth);
+    $("#b-step").style.width=pc(stp);    $("#b-kv").style.width=pc(kvNowGb);
+    $("#b-title").textContent=`${used.toFixed(2)} GB of ${B} GB in use`;
+    $("#b-total").textContent=`ceiling ${B} GB`;
+    const g = v => v>=0.005 ? v.toFixed(2)+" GB" : "—";
+    $("#k-experts").textContent=g(exp); $("#k-other").textContent=g(oth);
+    $("#k-step").textContent=g(stp);    $("#k-kv").textContent=g(kvNowGb);
+    $("#k-free").textContent=g(Math.max(0, B-used));
+  }
+  const sp=$("#b-split");
+  if(streaming && h.model_gb){
+    sp.style.display="";
+    const held=(h.resident_gb||0)/h.model_gb;
+    $("#b-split-bar").style.width=(held*100).toFixed(1)+"%";
+    $("#b-split-t").innerHTML=`This model has <b>${h.model_gb} GB</b> of experts and this machine `
+      + `has room for <b>${h.resident_gb} GB</b> of them. The other `
+      + `<b>${(h.model_gb-(h.resident_gb||0)).toFixed(2)} GB</b> stay on disk and are read when `
+      + `the router picks them &mdash; which is why it runs at all.`;
+  } else { sp.style.display="none"; }
+
+  /* machine */
+  rows($("#machine"), [
+    ["Memory budget", `${h.budget_gb} GB`],
+    ["Resident weights", `${h.footprint_gb} GB`],
+    ["Held whatever happens", h.non_expert_gb!=null?`${h.non_expert_gb} GB`:null],
+    ["One step needs", h.working_memory_gb!=null?`${h.working_memory_gb} GB`:null],
+    ["Model on disk", h.model_gb!=null?`${h.model_gb} GB of experts`:"fits in memory"],
+    ["Context window", h.context_length?h.context_length.toLocaleString()+" tokens":null],
+    // NAMED, BECAUSE IT CHANGES WHAT THE MODEL SAYS. Compressing the conversation cache is what
+    // makes the whole context window reachable -- 40,960 tokens instead of 18,514 -- and it is a
+    // compression, so replies past the threshold differ from uncompressed ones. A setting that
+    // does that must never be something a user has to read the source to discover.
+    ["Conversation cache", h.kv_bits
+      ? `${h.kv_bits}-bit past ${(h.kv_quant_start||0).toLocaleString()} tokens `
+        + `(exact below that; compressing is what reaches the full window)`
+      : "uncompressed (exact, but the window may not be reachable)"],
+    ["Longest reply", h.max_completion_tokens
+      ? `${h.max_completion_tokens.toLocaleString()} tokens (${
+          h.token_limit_reason==="memory"?"limited by memory":"the model's own limit"})` : null],
+    ["Why that limit", !h.max_completion_tokens ? null
+      : h.token_limit_reason==="memory"
+        ? `Capped by memory, not by the model: a ${h.budget_gb} GB budget less `
+          + `${h.footprint_gb} GB of resident weights leaves room for this much KV cache.`
+        : "The model's own context window is what limits this."],
+    ["KV cache per token", h.kv_bytes_per_token?`${(h.kv_bytes_per_token/1024).toFixed(1)} KB`:null],
+    ["Model load time", h.load_seconds!=null?`${h.load_seconds}s`:null],
+    ["Reloads", String(h.reloads||0)],
+  ]);
+  $("#l-think").style.display = h.can_toggle_thinking?"":"none";
+  buildLimits();
+}
+
+function quality(share,seen){
+  const bar=$("#m-bar-q"), lbl=$("#m-q"), tr=$("#m-track-q");
+  // NOTHING MEASURED IS NOT GOOD NEWS. A full green bar beside an em dash reads as "quality:
+  // perfect" when what it means is "no output has been checked yet".
+  if(!seen){ bar.style.width="100%"; bar.className=""; tr.className="track idle";
+             lbl.textContent="—"; return; }
+  tr.className="track";
+  bar.style.width=Math.max(2,(1-share)*100)+"%";
+  const bad=share>0;
+  bar.className=bad?"warn":"";
+  // "clean" claimed more than the meter can know. It has no reference copy of the
+  // uncompressed model and cannot check a fact, so the honest reading of zero flags is that
+  // nothing looked unusual -- not that the output was verified.
+  lbl.textContent=bad?`${Math.round(share*100)}% unusual`:"nothing unusual";
+}
+
+/* The server sends thinking and answer apart. Put them back into the one shape `render` knows:
+   open while the model is still thinking, closed once the answer has started. */
+const withThink=(r,o)=> r ? "<think>"+r+(o?"</think>":"")+o : o;
+
+function render(el,text){
+  const o=text.indexOf("<think>");
+  if(o<0){ el.textContent=text; return; }
+  const c=text.indexOf("</think>");
+  const before=text.slice(0,o), inner=c<0?text.slice(o+7):text.slice(o+7,c);
+  const after=c<0?"":text.slice(c+8);
+  el.textContent="";
+  if(before.trim()) el.appendChild(document.createTextNode(before));
+  const d=document.createElement("details"); d.className="think";
+  const s=document.createElement("summary");
+  s.textContent=c<0?"thinking…":`reasoning (${inner.trim().split(/\s+/).length} words)`;
+  const b=document.createElement("div"); b.className="inner"; b.textContent=inner.trim();
+  d.appendChild(s); d.appendChild(b); el.appendChild(d);
+  if(after) el.appendChild(document.createTextNode(after.replace(/^\n+/,"")));
+}
+const add=(who,cls)=>{ const _b=$("#blank"); if(_b) _b.hidden=true;   // hidden, not removed: a new conversation brings it back
+  const m=document.createElement("div"); m.className="msg "+cls;
+  m.innerHTML=`<div class="who">${who}</div><div class="txt"></div>`;
+  thread.appendChild(m); return m; };
+const scroll=()=>{const p=thread.parentElement;p.scrollTop=p.scrollHeight;};
+
+async function ask(text, cont=false){
+  busy=true; stopped=false;
+  ctrl=new AbortController();
+  reqId=(crypto.randomUUID?crypto.randomUUID():String(Math.random()).slice(2))+"";
+  sendEl.textContent="Stop"; sendEl.classList.add("stop"); sendEl.disabled=false;
+  let bot, body;
+  if(cont){
+    bot=thread.lastElementChild; body=bot.querySelector(".txt");
+    bot.querySelector(".cont")?.remove();
+  } else {
+    add("you","me").querySelector(".txt").textContent=text;
+    history.push({role:"user",content:text});
+    bot=add("model","bot"); body=bot.querySelector(".txt");
+  }
+  let base=cont?history[history.length-1].content:"";
+  let out=base, flagged=0, seen=0, tps=null, t0=performance.now(), ttft=null, finish=null;
+  let reason="";                       // the model's thinking, kept apart as the server now sends it
+  quality(0,0); scroll();
+  // A MODEL THIS SLOW MUST SAY WHAT IT IS DOING, OR IT LOOKS BROKEN.
+  //   Reading the prompt is not instant when 97% of the model is on disk: "hi" becomes 68 tokens
+  //   once the chat template is applied, and those took ~40s on gpt-oss. With an empty bubble
+  //   and a dash in every field, that is indistinguishable from a hang -- which is exactly how
+  //   it was reported.
+  let pre=null;
+  const wait=document.createElement("div");
+  wait.className="wait";
+  body.appendChild(wait);
+  const tick=setInterval(()=>{
+    if(!wait.isConnected) return;
+    const s=((performance.now()-t0)/1000).toFixed(0);
+    wait.textContent = pre
+      ? `reading your message — ${pre[0]} of ${pre[1]} tokens · ${s}s`
+      : `working · ${s}s`;
+  },200);
+  const doneWaiting=()=>{ clearInterval(tick); wait.remove(); };
+  try{
+    const r=await fetch("/v1/chat/completions",{method:"POST",
+      headers:{"content-type":"application/json"},
+      signal:ctrl.signal,
+      body:JSON.stringify({messages:withInstructions(history),temperature:currentTemp(),stream:true,
+        max_tokens:parseInt($("#c-max").value,10), think:$("#c-think").checked,
+        lookahead:$("#c-ahead").checked,
+        continue_last:cont, bigrig_id:reqId})});
+    if(!r.ok){ body.textContent="Error "+r.status+": "+(await r.text()).slice(0,300); throw 0; }
+    const rd=r.body.getReader(), dec=new TextDecoder(); let buf="";
+    for(;;){
+      const {done,value}=await rd.read(); if(done) break;
+      buf+=dec.decode(value,{stream:true});
+      const lines=buf.split("\n"); buf=lines.pop();
+      for(const ln of lines){
+        if(!ln.startsWith("data: ")) continue;
+        const raw=ln.slice(6).trim(); if(raw==="[DONE]") continue;
+        let j; try{ j=JSON.parse(raw); }catch{ continue; }
+        if(j.choices?.[0]?.finish_reason) finish=j.choices[0].finish_reason;
+        /* THE THINKING ARRIVES IN ITS OWN FIELD NOW, so the API can hand a coding agent the
+           answer alone. The page still wants to show it, folded away, so it is put back into the
+           <think>…</think> shape `render` already knows -- open while the model is still
+           thinking, closed the moment the answer starts. Without this the page would sit blank
+           for the whole of a long reasoning pass and look hung. */
+        const rc=j.choices?.[0]?.delta?.reasoning_content;
+        if(rc){ if(ttft===null){ttft=(performance.now()-t0)/1000; set("#r-ttft",ttft.toFixed(2)+"s");}
+                doneWaiting();
+                reason+=rc; render(body,withThink(reason,out)); scroll(); }
+        const d=j.choices?.[0]?.delta?.content;
+        if(d){ if(ttft===null){ttft=(performance.now()-t0)/1000; set("#r-ttft",ttft.toFixed(2)+"s");}
+               doneWaiting();
+               out+=d; render(body,withThink(reason,out)); scroll(); }
+        const t=j.bigrig;
+        if(t&&t.prefill_total){ pre=[t.prefill_done,t.prefill_total]; scroll(); }
+        if(t){ if(t.tok_s>0&&t.tok_s<=2000){tps=t.tok_s; set("#c-tps",tps.toFixed(1)); set("#r-tps",tps.toFixed(1));}
+               if("degraded" in t){seen++; if(t.degraded)flagged++; quality(flagged/seen,seen);}
+               if(t.degraded_tokens!==undefined) flagged=t.degraded_tokens; }
+      }
+    }
+  }catch(e){
+    // An abort is not a failure, and must not be reported as one.
+    if(!stopped && out===base) body.textContent="Could not reach the model. Is the server running?";
+  }finally{
+    // However this ended -- text, stop, or a dropped connection -- the waiting line goes away.
+    // Leaving a spinner running after the request is over is its own kind of lie.
+    doneWaiting();
+  }
+  const secs=(performance.now()-t0)/1000;
+  // Stopped before it said anything: there is no reply to keep, and an empty assistant turn in
+  // the history would be sent with every later message for the model to make sense of.
+  if(stopped && !out.trim()){
+    if(!cont){ history.pop(); bot.remove(); }
+    busy=false; ctrl=null; reqId=null;
+    sendEl.textContent="Send"; sendEl.classList.remove("stop"); sendEl.disabled=false;
+    qEl.focus(); scroll(); refresh();
+    return;
+  }
+  // Whatever it produced before the stop stays in the conversation. That is the whole point of
+  // stopping rather than reloading: the next question still has the context of this answer.
+  // The conversation keeps the ANSWER, not the thinking: feeding a model its own scratchpad
+  // back on the next turn is not what the template expects and wastes the context window.
+  if(cont) history[history.length-1].content=out;
+  else history.push({role:"assistant",content:out});
+  render(body,withThink(reason,out));
+  const words=out.trim()?out.trim().split(/\s+/).length:0;
+  const bits=[`${secs.toFixed(1)}s`];
+  if(words) bits.push(`~${words} words`);
+  if(tps) bits.push(`${tps.toFixed(1)} tok/s`);
+  if(ttft!=null) bits.push(`first token ${ttft.toFixed(2)}s`);
+  bot.querySelectorAll(".meta,.cont").forEach(e=>e.remove());
+  const meta=document.createElement("div");
+  lastCut = finish==="length" || stopped;
+  let tail="";
+  if(stopped){ tail=" · stopped by you"; }
+  else if(finish==="length"){
+    tail=` · CUT OFF at the ${$("#c-max").value}-token limit`;
+    // The thinking is its own field now, so its share is a straight comparison. This is the
+    // moment it matters most: a reply cut off at the limit because the model was still thinking.
+    if(reason){ const pct=Math.round(100*reason.length/Math.max(reason.length+out.length,1));
+                tail+=` — reasoning took ${pct}% of it`; }
+  }
+  if(flagged>0){ bot.classList.add("flagged"); meta.className="meta warn";
+    meta.textContent=bits.join(" · ")+` · flagged ${flagged} token${flagged===1?"":"s"}`
+      +` — usually looping or losing coherence`+tail; }
+  // Stopping is something the user chose, so it is not coloured as a problem. Hitting the token
+  // limit is one, because they did not choose it.
+  else { meta.className=(lastCut && !stopped)?"meta warn":"meta";
+         meta.textContent=bits.join(" · ")+tail; }
+  body.appendChild(meta);
+  if(lastCut){
+    const b=document.createElement("button");
+    b.className="cont"; b.textContent="Continue from here →";
+    b.onclick=()=>{ if(!busy) ask("",true); };
+    body.appendChild(b);
+  }
+  quality(seen?flagged/seen:0,seen);
+  busy=false; ctrl=null; reqId=null;
+  sendEl.textContent="Send"; sendEl.classList.remove("stop"); sendEl.disabled=false;
+  qEl.focus(); scroll(); refresh();
+}
+
+/* ── analytics ── */
+async function loadStats(){
+  let s; try{ s=await (await fetch("/stats")).json(); }catch(e){ return; }
+  const h=s.history||[], a=s.aggregate||{}, H=health;
+  const tps=h.filter(r=>r.tok_s).map(r=>r.tok_s);
+  const ttfts=h.filter(r=>r.ttft).map(r=>r.ttft);
+  const lens=h.map(r=>r.tokens||0);
+  const flags=h.map(r=>(r.flagged||0)>0);
+
+  set("#s-tps", a.median_tok_s!=null?a.median_tok_s.toFixed(1):null);
+  $("#s-tps-sub").textContent = tps.length
+    ? `median of ${tps.length} replies · fastest ${Math.max(...tps).toFixed(1)} · slowest ${Math.min(...tps).toFixed(1)}`
+    : "no replies yet";
+  line($("#ch-tps"), tps);
+
+  set("#s-ttft", a.median_ttft!=null?a.median_ttft.toFixed(2)+"s":null);
+  set("#s-up", fmtS(H.uptime_s));
+  set("#s-started", H.uptime_s!=null?`${fmtS(H.uptime_s)} ago`:null);
+  set("#s-req", H.requests_served!=null?H.requests_served.toLocaleString():null);
+  set("#s-queue", H.queue_depth!=null?H.queue_depth:null);
+  set("#s-load", H.load_seconds!=null?H.load_seconds.toFixed(2)+"s":null);
+  set("#s-load-sub", H.load_seconds!=null?"to have the model ready to answer":"");
+  set("#s-flag", H.flagged_tokens!=null?H.flagged_tokens.toLocaleString():null);
+  set("#s-flag-sub", H.flagged_share!=null
+      ? `${(H.flagged_share*100).toFixed(2)}% of ${(H.total_tokens||0).toLocaleString()} generated`
+      : "");
+  $("#s-ttft-sub").textContent = ttfts.length?`median across ${ttfts.length} replies`:"";
+  line($("#ch-ttft"), ttfts, {color:"var(--accent2)"});
+
+  const totTok=a.tokens||0, fl=a.flagged||0;
+  set("#s-q", totTok?((fl/totTok*100).toFixed(1)+"%"):null);
+  $("#s-q-sub").textContent = totTok
+    ? `${fl.toLocaleString()} of ${totTok.toLocaleString()} tokens flagged · ${
+        h.filter(r=>(r.flagged||0)>0).length} replies affected` : "";
+  bars($("#ch-q"), h.map(r=>r.flagged||0), flags);
+
+  set("#s-len", lens.length?Math.round(lens.reduce((x,y)=>x+y,0)/lens.length):null);
+  $("#s-len-sub").textContent = lens.length
+    ? `average tokens per reply · ${a.cut_off||0} hit the limit` : "";
+  bars($("#ch-len"), lens, h.map(r=>r.finish==="length"));
+
+  const kvNow=(H.kv_bytes_per_token||0)*
+    history.reduce((x,m)=>x+Math.ceil((m.content||"").length/4),0);
+  const parts=[];
+  if(H.resident_gb!=null){
+    parts.push({label:"experts in RAM", v:H.resident_gb*1e9, c:"var(--accent)"});
+    if(H.model_gb) parts.push({label:"experts on disk",
+                               v:Math.max(0,(H.model_gb-H.resident_gb))*1e9, c:"var(--line)"});
+  }
+  if(kvNow) parts.push({label:"KV cache", v:kvNow, c:"var(--accent2)"});
+  if(parts.length){
+    stack($("#ch-mem"), parts);
+    $("#s-mem").textContent = H.mode==="stream"
+      ? `Streaming: ${H.resident_gb} GB of experts kept in memory, the rest read from disk as `
+        +`the router asks for them. KV cache grows ${(H.kv_bytes_per_token/1024).toFixed(0)} KB `
+        +`per token of conversation.`
+      : `The whole model is in memory. KV cache grows ${(H.kv_bytes_per_token/1024).toFixed(0)} `
+        +`KB per token of conversation.`;
+  } else { $("#ch-mem").innerHTML='<div class="empty">no memory data yet</div>'; }
+
+  const miss=h.filter(r=>r.miss_rate!=null).map(r=>r.miss_rate*100);
+  $("#sec-cache").style.display = miss.length?"":"none";
+  if(miss.length){
+    set("#s-miss", (miss.reduce((x,y)=>x+y,0)/miss.length).toFixed(2)+"%");
+    $("#s-miss-sub").textContent = `average across ${miss.length} replies · `
+      +`peak ${Math.max(...miss).toFixed(2)}% · every miss is a read from SSD`;
+    line($("#ch-miss"), miss, {color:"var(--warn)"});
+  }
+
+  const rows=h.slice(-25).reverse();
+  $("#tbl").innerHTML = rows.length ? `<table><tr><th>when</th><th style="text-align:right">tokens</th>
+    <th style="text-align:right">sec</th><th style="text-align:right">tok/s</th>
+    <th style="text-align:right">1st tok</th><th style="text-align:right">flagged</th>
+    <th>ended</th></tr>` + rows.map(r=>{
+      const d=new Date(r.t*1000);
+      return `<tr class="${(r.flagged||0)>0?'flag':''}"><td>${d.toLocaleTimeString()}</td>
+        <td class="n">${r.tokens??NA}</td><td class="n">${(r.seconds??0).toFixed(1)}</td>
+        <td class="n">${r.tok_s??NA}</td><td class="n">${r.ttft?r.ttft.toFixed(2):NA}</td>
+        <td class="n">${r.flagged||0}</td>
+        <td>${r.finish==="length"?"hit limit":(r.finish||NA)}</td></tr>`;}).join("")
+      + "</table>" : '<div class="empty">no replies yet — send one from the Chat tab</div>';
+  cost();
+}
+
+function stopNow(){
+  if(!busy || stopped) return;
+  stopped=true;
+  // Tell the server by name FIRST. Aborting only closes the socket, and a closed socket is not
+  // noticed until the next write fails -- which at single-digit tokens per second can be
+  // seconds away, with the model still running the whole time.
+  if(reqId) fetch("/v1/cancel",{method:"POST",headers:{"content-type":"application/json"},
+                                body:JSON.stringify({id:reqId})}).catch(()=>{});
+  if(ctrl) try{ ctrl.abort(); }catch(e){}
+}
+$("#f").addEventListener("submit",e=>{e.preventDefault();
+  if(busy){ stopNow(); return; }
+  const t=qEl.value.trim(); if(!t) return;
+  qEl.value=""; qEl.style.height="auto"; ask(t);});
+qEl.addEventListener("keydown",e=>{ if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();
+  $("#f").requestSubmit();}});
+qEl.addEventListener("input",()=>{qEl.style.height="auto";
+  qEl.style.height=Math.min(qEl.scrollHeight,128)+"px";});
+show("chat");
+refresh(); pollFeed();
+setInterval(()=>{ if(!busy){ refresh(); if(!$("#v-stats").hidden) loadStats(); } },4000);
+/* The feed polls faster than the rest of the page and keeps polling DURING a reply. Everything
+   else is skipped while `busy` because it would fight the generation for the connection, but the
+   feed is the one surface whose whole job is to say what is happening right now -- and a reply is
+   exactly when memory pressure and cache activity occur. It costs one small request every two
+   seconds and returns an empty list when nothing has happened. */
+setInterval(pollFeed, 2000);
+setInterval(pollTools, 2500);
+</script>

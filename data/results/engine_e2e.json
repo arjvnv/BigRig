@@ -1,0 +1,39 @@
+{
+ "model": "OLMoE-1B-7B-0125-4bit",
+ "capacity": 16,
+ "ntok": 32,
+ "bytes_match": true,
+ "output_identical": true,
+ "report": {
+  "tokens": 32,
+  "expert_requests": 4096,
+  "misses": 2039,
+  "miss_rate": 0.4978,
+  "gb_fetched": 7.216,
+  "fetch_seconds": 1.311,
+  "fetch_gbs": 5.51,
+  "byte_checks": 64,
+  "byte_mismatches": 0,
+  "model": "olmoe",
+  "n_experts": 64,
+  "capacity_per_layer": 16,
+  "residency_pct": 25.0,
+  "policy": "lfuda",
+  "moe_layers": 16,
+  "host": {
+   "ram_gbs": 95.96,
+   "disk_gbs": 8.44,
+   "kappa": 11.4,
+   "fetch_threads": 12
+  },
+  "projected": {
+   "residency": 0.25,
+   "capacity_experts": 16,
+   "miss_rate_used": 0.4978,
+   "seconds_per_token": 0.02909,
+   "tok_s": 34.38,
+   "disk_fraction_of_time": 0.919,
+   "note": "residency is the CONFIGURED pool size, not inferred from free memory"
+  }
+ }
+}

@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 132" width="560" height="132"
+     role="img" aria-label="bigrig">
+  <!-- Four bars rising through a gate: the experts that fit, and the meter that watches them.
+       The last bar is the accent because it is the one being measured. -->
+  <g transform="translate(24,30)">
+    <rect x="0"  y="46" width="13" height="26" rx="6.5" fill="#c9c3b8"/>
+    <rect x="21" y="32" width="13" height="40" rx="6.5" fill="#a8a094"/>
+    <rect x="42" y="16" width="13" height="56" rx="6.5" fill="#6b6862"/>
+    <rect x="63" y="0"  width="13" height="72" rx="6.5" fill="#2f6f5e"/>
+  </g>
+  <text x="126" y="72" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Inter,Helvetica,Arial,sans-serif"
+        font-size="52" font-weight="600" letter-spacing="-1.4" fill="#1b1a18">bigrig</text>
+  <text x="129" y="100" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace"
+        font-size="15" letter-spacing="0.2" fill="#6b6862">big MoE models on a Mac that can't hold them</text>
+</svg>

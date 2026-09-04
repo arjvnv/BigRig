@@ -1,0 +1,69 @@
+# ── Things that are large and re-creatable ──────────────────────────────────
+# Model weights (100+ GB). Re-downloadable from HuggingFace.
+models/
+
+# Packed / compressed expert blobs. Rebuilt on demand from the model itself
+# (`bigrig prepare`, or a streamed model's first run). The packed copy is what
+# the zero-copy path needs; without it the engine still runs, on the copy path.
+data/blobs/
+# ...except one manifest, which is 230 KB of byte offsets and no weights. The pool-sizing and
+# CLI tests read it, so tracking it is the difference between a fresh clone running 1,800
+# assertions and running none of that file's.
+!data/blobs/Qwen3-30B-A3B-3bit.experts.manifest.json
+!data/blobs/OLMoE-1B-7B-0125-4bit.experts.manifest.json
+
+# Routing traces and per-token dumps — regenerable from src/ + models/
+*.npz
+data/traces/
+# ...except the one the test suite replays. It is 750 KB of expert indices, no weights, and
+# tracking it is what makes `./run-tests.sh` green on a fresh clone instead of crashing.
+!data/traces/qwen3_full.npz
+data/results/pv_v1_tiebug/
+# Per-model hot-expert usage, written on every run so the next warm pass starts with the
+# experts this model actually uses. Pure runtime state -- it made `git status` dirty after
+# every dev run, and no test reads it.
+data/results/usage_*.json
+
+# Evaluation corpora that are downloaded, not authored
+data/corpora/wikitext2_valid.txt
+
+# ── Build / environment ─────────────────────────────────────────────────────
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+
+# ── Noise ───────────────────────────────────────────────────────────────────
+*.log
+logs/
+.DS_Store
+.webui-syntax-check.js
+.webui-broken.html
+.webui-notools/
+
+# ── Internal: research, lab notebook and process records ────────────────────
+# These stay on the author's disk and out of the published repo. They are the
+# working record of how the product was arrived at, not part of the product.
+notes/
+src/
+paper/
+ROADMAP.md
+docs/MEASUREMENTS.md
+docs/competition-perplexity-lily.md
+docs/RELEASING.md
+tests/test_tier.py
+
+# Research outputs. Only the handful of fixtures the test suite replays are
+# tracked, and those are force-added; everything else here is a lab artifact.
+data/bench/
+data/corpora/
+data/results/*
+!data/results/engine_e2e.json
+!data/results/host_profile.json
+!data/results/mon_pertoken.json
+!data/results/stream_bench.jsonl
+!data/results/stream_roundtrip.json
+!data/results/tier_frontier.json
+!data/results/warm_locality.json

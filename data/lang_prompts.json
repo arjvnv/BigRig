@@ -1,0 +1,14 @@
+[
+ {"lang":"en","prompt":"Explain how a heat pump moves warmth from cold outdoor air into a house."},
+ {"lang":"en","prompt":"Describe why bread dough rises, and what the yeast is actually doing."},
+ {"lang":"en","prompt":"What makes a bridge suspension cable strong enough to hold the deck?"},
+ {"lang":"zh","prompt":"请解释热泵是如何把室外冷空气中的热量搬进房子里的。"},
+ {"lang":"zh","prompt":"请说明面团为什么会发起来，酵母到底在做什么。"},
+ {"lang":"zh","prompt":"是什么让悬索桥的钢缆足以承受桥面的重量？"},
+ {"lang":"es","prompt":"Explica cómo una bomba de calor traslada el calor del aire frío exterior al interior de una casa."},
+ {"lang":"es","prompt":"Describe por qué sube la masa del pan y qué hace realmente la levadura."},
+ {"lang":"es","prompt":"¿Qué hace que el cable de un puente colgante sea lo bastante fuerte para sostener el tablero?"},
+ {"lang":"code","prompt":"Write a Python function that merges two sorted lists into one sorted list, with a docstring and three test cases."},
+ {"lang":"code","prompt":"Write a Python class that implements a fixed-size ring buffer with push, pop and len."},
+ {"lang":"code","prompt":"Write a Python script that reads a CSV file and prints the mean of each numeric column."}
+]

@@ -1,0 +1,18 @@
+{
+ "ram_gbs": 99.49,
+ "disk_gbs": 5.34,
+ "kappa": 18.6,
+ "fetch_threads": 8,
+ "disk_by_threads": {
+  "1": 2.82,
+  "2": 3.6,
+  "4": 4.97,
+  "8": 5.34,
+  "12": 4.19
+ },
+ "parallel_speedup": 1.89,
+ "available_gb": 15.93,
+ "under_pressure": false,
+ "measured_on": "<local model path>",
+ "seconds": 1.99
+}

@@ -1,0 +1,98 @@
+[
+ {
+  "prompt": "Discuss the arguments for and against remote work from the perspective of employers, employees, and cities.",
+  "category": "analytical"
+ },
+ {
+  "prompt": "Describe a bustling open-air market in a coastal town at dawn, using all five senses.",
+  "category": "descriptive"
+ },
+ {
+  "prompt": "Describe the causes, major events, and consequences of the Industrial Revolution in Britain.",
+  "category": "factual"
+ },
+ {
+  "prompt": "Write a short story about a lighthouse keeper who discovers something unusual washed up on the shore one winter morning.",
+  "category": "narrative"
+ },
+ {
+  "prompt": "Write detailed step-by-step instructions for building a raised garden bed, including materials, tools, and common mistakes.",
+  "category": "procedural"
+ },
+ {
+  "prompt": "Write a detailed technical explanation of how virtual memory works in a modern operating system, covering paging, the TLB, page faults, and swapping.",
+  "category": "technical"
+ },
+ {
+  "prompt": "Analyse the trade-offs between nuclear power and renewable energy for decarbonising an electrical grid.",
+  "category": "analytical"
+ },
+ {
+  "prompt": "Describe the process by which a star forms, lives, and eventually dies, for an interested non-specialist.",
+  "category": "descriptive"
+ },
+ {
+  "prompt": "Explain the water cycle in detail, including evaporation, condensation, precipitation, and human impacts on it.",
+  "category": "factual"
+ },
+ {
+  "prompt": "Write a story about two strangers who get stuck in an elevator during a citywide power outage.",
+  "category": "narrative"
+ },
+ {
+  "prompt": "Write a complete beginner's guide to making sourdough bread from scratch, including starter maintenance.",
+  "category": "procedural"
+ },
+ {
+  "prompt": "Explain in depth how the TCP three-way handshake works, what each flag means, and how connection teardown differs from connection setup.",
+  "category": "technical"
+ },
+ {
+  "prompt": "Describe the life and daily routine of a beekeeper across one full year, season by season.",
+  "category": "descriptive"
+ },
+ {
+  "prompt": "Describe how vaccines work, covering the immune response, types of vaccines, and herd immunity.",
+  "category": "factual"
+ },
+ {
+  "prompt": "Tell the story of a cartographer in the 1700s mapping a coastline that keeps changing between visits.",
+  "category": "narrative"
+ },
+ {
+  "prompt": "Give a thorough explanation of how a modern compiler performs register allocation, including graph colouring and spilling.",
+  "category": "technical"
+ },
+ {
+  "prompt": "Describe the interior of an abandoned train station being slowly reclaimed by plants and animals.",
+  "category": "descriptive"
+ },
+ {
+  "prompt": "Write a story about a night-shift radio DJ who starts receiving requests from a caller who should not exist.",
+  "category": "narrative"
+ },
+ {
+  "prompt": "Explain how public key cryptography works, covering key generation, encryption, digital signatures, and why factoring matters.",
+  "category": "technical"
+ },
+ {
+  "prompt": "Write a story about a family clearing out a grandparent's attic and finding something that changes what they believed.",
+  "category": "narrative"
+ },
+ {
+  "prompt": "Explain how a modern database engine executes a JOIN, covering nested loop, hash, and merge joins and when each is chosen.",
+  "category": "technical"
+ },
+ {
+  "prompt": "Explain in detail how GPS determines your position, including satellite clocks, trilateration, and relativistic corrections.",
+  "category": "technical"
+ },
+ {
+  "prompt": "Explain how noise-cancelling headphones work, from microphone to inverted waveform to the limits of the technique.",
+  "category": "technical"
+ },
+ {
+  "prompt": "Explain how a refrigerator keeps food cold, covering the refrigeration cycle and each component's role.",
+  "category": "technical"
+ }
+]
