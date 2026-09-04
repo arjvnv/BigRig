@@ -47,7 +47,7 @@ It prints what this machine can run. No model is downloaded and nothing is writt
 For working on BigRig itself, or to get changes that are not in a release yet:
 
 ```bash
-git clone https://github.com/arjvnv/bigrig.git && cd bigrig
+git clone https://github.com/arjvnv/BigRig.git && cd BigRig
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e .
 ```

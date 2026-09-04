@@ -45,9 +45,9 @@ bigrig = "bigrig_engine.cli:main"
 rig = "bigrig_engine.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/arjvnv/bigrig"
-Source = "https://github.com/arjvnv/bigrig"
-Issues = "https://github.com/arjvnv/bigrig/issues"
+Homepage = "https://github.com/arjvnv/BigRig"
+Source = "https://github.com/arjvnv/BigRig"
+Issues = "https://github.com/arjvnv/BigRig/issues"
 
 [tool.setuptools]
 # Explicit, so tests/ and the research scripts in src/ never end up in a wheel.

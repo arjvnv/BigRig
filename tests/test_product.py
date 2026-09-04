@@ -716,8 +716,11 @@ check("the page the engine serves is shipped in the wheel",
       'bigrig_engine = ["webui.html"]' in _pp)
 check("both command names are declared", 'bigrig = "bigrig_engine.cli:main"' in _pp
       and 'rig = "bigrig_engine.cli:main"' in _pp)
+# Case-insensitively: GitHub resolves either spelling, and the repository is `BigRig` while
+# the package is `bigrig`. What must hold is the OWNER -- pointing a published package at
+# someone else's repository is the failure worth catching.
 check("the project points at the repository it actually lives in",
-      "github.com/arjvnv/bigrig" in _pp and "github.com/bigrig/bigrig" not in _pp)
+      "github.com/arjvnv/bigrig" in _pp.lower() and "github.com/bigrig/bigrig" not in _pp.lower())
 check("research scripts and tests are not shipped",
       'packages = ["bigrig_layer", "bigrig_engine", "bigrig_engine.policies"]' in _pp)
 
