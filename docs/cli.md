@@ -1,6 +1,6 @@
 # CLI reference
 
-[← bigrig](../README.md) · [Install](install.md) · [Quickstart](quickstart.md) · [Models](models.md) · [CLI](cli.md) · [How it works](HOW-IT-WORKS.md)
+[← BigRig](../README.md) · [Install](install.md) · [Quickstart](quickstart.md) · [Models](models.md) · [CLI](cli.md) · [How it works](HOW-IT-WORKS.md)
 
 ---
 
@@ -31,7 +31,7 @@ rig <command> [args]        # `bigrig` is the same command
 Every command supports `--help`.
 
 **The first run tunes itself.** The first time a streamed model runs at a given memory budget,
-bigrig spends a minute or two measuring how many experts to keep in memory for the best speed on
+BigRig spends a minute or two measuring how many experts to keep in memory for the best speed on
 *this* Mac, then remembers the answer. Every later run uses it. Skip it with `--no-tune`, or
 answer the question yourself with `--residency`.
 

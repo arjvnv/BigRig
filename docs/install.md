@@ -1,6 +1,6 @@
 # Install
 
-[← bigrig](../README.md) · [Install](install.md) · [Quickstart](quickstart.md) · [Models](models.md) · [CLI](cli.md) · [How it works](HOW-IT-WORKS.md)
+[← BigRig](../README.md) · [Install](install.md) · [Quickstart](quickstart.md) · [Models](models.md) · [CLI](cli.md) · [How it works](HOW-IT-WORKS.md)
 
 ---
 
@@ -44,7 +44,7 @@ It prints what this machine can run. No model is downloaded and nothing is writt
 
 ## From source
 
-For working on bigrig itself, or to get changes that are not in a release yet:
+For working on BigRig itself, or to get changes that are not in a release yet:
 
 ```bash
 git clone https://github.com/arjvnv/bigrig.git && cd bigrig

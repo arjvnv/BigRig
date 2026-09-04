@@ -1,6 +1,6 @@
 # Models
 
-[← bigrig](../README.md) · [Install](install.md) · [Quickstart](quickstart.md) · [Models](models.md) · [CLI](cli.md) · [How it works](HOW-IT-WORKS.md)
+[← BigRig](../README.md) · [Install](install.md) · [Quickstart](quickstart.md) · [Models](models.md) · [CLI](cli.md) · [How it works](HOW-IT-WORKS.md)
 
 ---
 
@@ -74,7 +74,7 @@ Mac, and the table above is what those predictions were checked against.
 
 ## Quantisation
 
-Most MLX models ship at 4-bit. bigrig will shrink a model further **only with your agreement**,
+Most MLX models ship at 4-bit. BigRig will shrink a model further **only with your agreement**,
 and never below 3 bits by default — 2-bit measured at +83% to +145% perplexity, and produced
 unusable output on a real model. `--min-bits 2` overrides that if you want to see it.
 

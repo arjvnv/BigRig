@@ -1,6 +1,6 @@
 # Quick start
 
-[← bigrig](../README.md) · [Install](install.md) · [Quickstart](quickstart.md) · [Models](models.md) · [CLI](cli.md) · [How it works](HOW-IT-WORKS.md)
+[← BigRig](../README.md) · [Install](install.md) · [Quickstart](quickstart.md) · [Models](models.md) · [CLI](cli.md) · [How it works](HOW-IT-WORKS.md)
 
 ---
 
@@ -45,7 +45,7 @@ reads out of the downloaded files directly.
 rig serve OLMoE-1B-7B-0125-Instruct-4bit
 ```
 
-**The first time** a streamed model runs at a given memory budget, bigrig spends a minute or two
+**The first time** a streamed model runs at a given memory budget, BigRig spends a minute or two
 measuring how many experts to keep in memory for the best speed on *your* Mac, says so while it
 does, and remembers the answer. Every later start is immediate. (`--no-tune` skips it.)
 
@@ -93,7 +93,7 @@ leave.
 
 ## If the model does not fit
 
-bigrig stops and asks, because the two ways forward cost different things:
+BigRig stops and asks, because the two ways forward cost different things:
 
 ```
     [1] Shrink it to fit     full speed, but the weights change
@@ -107,7 +107,7 @@ neither `--compress` nor `--exact`, it refuses rather than guessing.
 
 Some models need more memory than your Mac has, at any setting. `bigrig doctor` says so before
 you download — `IMPOSSIBLE ON THIS MAC`, with the number it would need — and nothing else in
-bigrig will try to talk you past it. That is not a limitation of the engine to work around; it is
+BigRig will try to talk you past it. That is not a limitation of the engine to work around; it is
 the machine's answer.
 
 Next: [models.md](models.md) · [cli.md](cli.md)

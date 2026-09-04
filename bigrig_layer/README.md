@@ -1,4 +1,4 @@
-# bigrig — a runtime quality meter for local LLM inference
+# BigRig — a runtime quality meter for local LLM inference
 
 Tells you, **while a model is generating**, whether the output it is producing is poor — with no
 reference answer, no second model, and no second forward pass.

@@ -3,7 +3,7 @@
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
   <source media="(prefers-color-scheme: light)" srcset="assets/logo-light.svg">
-  <img alt="bigrig" src="assets/logo-light.svg" width="46%">
+  <img alt="BigRig" src="assets/logo-light.svg" width="46%">
 </picture>
 
 <br>
@@ -16,8 +16,8 @@
 
 ### Run the Mixture-of-Experts models your Mac cannot hold — unchanged, and fast.
 
-**A 20.4 GB model, served from 9.7 GB of RAM, at 19–21 tokens a second, on a MacBook Air.**
-Not a smaller model. Not a more aggressive quantisation. The same weights, byte for byte.
+Your weights are never modified, and BigRig tells you exactly what *your* machine
+can do with a model before you download a single byte of it.
 
 **[Quickstart](docs/quickstart.md)** ·
 [Install](docs/install.md) ·
@@ -35,24 +35,28 @@ Not a smaller model. Not a more aggressive quantisation. The same weights, byte 
 A 35B Mixture-of-Experts model uses about 3B of its parameters for any given token — but every
 runtime loads all 35B into memory, and then your Mac says no.
 
-bigrig keeps the experts a model is actually using in RAM and reads the rest off the SSD as the
+BigRig keeps the experts a model is actually using in RAM and reads the rest off the SSD as the
 router asks for them. Apple Silicon shares one memory between CPU and GPU, so a cached expert is
 handed to the GPU without being copied at all. The result is that **the memory a model needs
-stops tracking its size**: it becomes attention plus a working set, which is a small fraction of
-the whole.
+stops tracking its size.** What has to stay resident is the attention weights plus one layer's
+worth of experts, and that is a small fraction of the whole.
 
-If a model already fits, bigrig says so and gets out of the way. If it cannot be made to fit at
+In practice a 17–20 GB model runs in six or seven gigabytes, and the bigger the model the wider
+that gap gets — `doctor` puts gpt-oss-120b, 65.8 GB on disk, at the same seven gigabytes.
+
+If a model already fits, BigRig says so and gets out of the way. If it cannot be made to fit at
 any setting, it says that too, before you download 40 GB to find out.
 
 - **Your weights, untouched.** Streaming changes where a weight lives, never what it is. Decode
   is bit-identical to the same model held resident — checked layer by layer across 4,392 live
   layer computations. Prompt processing matches to the last bit of a float, or one bit off it:
   the same variation mlx_lm itself shows between two prefill widths.
-- **It tells you before you download.** `bigrig doctor <model>` reads a model's shape off the
-  hub and answers for *your* Mac — will it run, how much memory it needs, and roughly how fast,
-  in tokens per second. Nothing is downloaded and nothing is written.
-- **It measures itself on your machine.** The first run of a streamed model spends a minute or
-  two finding how many experts to keep resident for the best speed on your hardware, and
+- **It answers for your machine, not ours.** Speed depends on your chip and your SSD, so BigRig
+  measures rather than guesses. `bigrig doctor <model>` reads the model's shape from the hub,
+  profiles your Mac, and tells you whether it runs, what memory it needs and roughly how many
+  tokens a second you will see. Nothing is downloaded and nothing is written.
+- **It tunes itself where it is installed.** The first run of a streamed model spends a minute
+  or two finding how many experts to keep resident for the best speed on your hardware, and
   remembers the answer. Every later start is immediate.
 - **It asks before it changes anything.** Shrinking a model is the only path that alters weights,
   so it is the only one that needs your agreement — and every run prints which mode it is
@@ -97,28 +101,32 @@ set on the agent's process only.
 
 ---
 
-## What runs, and how fast
+## How fast, on your Mac
 
-Measured end to end on an M4 MacBook Air with 24 GB, at a 9.7 GB memory ceiling. "Warm" is a
-server that has been running; "cold" is one that has just started.
+An M1 Air and an M4 Max are not the same machine, and a model that is comfortable on one is not
+on the other. So BigRig does not publish a number and invite you to hope it applies. `doctor`
+profiles the memory and disk bandwidth of the Mac it is running on, works out how many bytes each
+token has to move for the model you named, and answers in one of four words:
 
-| model | on disk | resident | decode | first token |
-|---|---|---|---|---|
-| DeepSeek-Coder-V2-Lite-4bit | 8.8 GB | 44% | **25.9 tok/s** | 0.7 s @ 61 tokens |
-| Qwen3.6-35B-A3B-4bit | 20.4 GB | 15% | **19–21 warm, 10.5 cold** | 5.1 s @ 453, 12.4 s @ 1,749 |
-| Nemotron-3-Nano-30B-A3B-4bit | 17.8 GB | 15% | **11.5–13.2 tok/s** | 3.2 s @ 69 tokens |
-| Qwen3-30B-A3B-3bit | 17.2 GB | — | **10–14.5 tok/s** | — |
-| GLM-4.7-Flash-4bit | 16.9 GB | 8% | **6.2–6.6 tok/s** | 9.2 s @ 409 tokens |
-| OLMoE-1B-7B-4bit | 3.9 GB | 100% | fits whole, no streaming | — |
+| verdict | tokens/s | what it means |
+|---|---|---|
+| **FAST** | ≥ 15 | fast enough for a coding agent |
+| **GOOD** | 8–15 | comfortable for chat, workable for an agent |
+| **USABLE** | 3–8 | fine for chat, slow for an agent |
+| **SLOW** | < 3 | it runs, but you will be waiting on it |
 
-Conversations reuse what has already been read: a follow-up turn on a 900-token document
-reached its first token in **1.1 s instead of 11.3 s**.
+You get that answer, and the memory figure behind it, before anything is downloaded.
 
-**Beyond what we have run here**, `doctor` computes the floor from the model's own shape. It puts
-gpt-oss-120b (65.8 GB) at 7.2 GB and Qwen3-Next-80B-A3B (45 GB) at 6.2 GB — the same floor class
-as the 20 GB models above, because a model's floor is set by its attention weights and one layer's
-worth of experts, not by its total size. Those two are predictions from measured arithmetic, not
-runs; `doctor` labels them as such, and so do we.
+Two things shift the verdict, and neither is obvious. **A model with more, smaller experts moves
+fewer bytes a token than one with fewer, larger ones**, so the larger of two models is regularly
+the faster one. And **conversations get cheaper as they go**: what has already been read is reused, so
+a follow-up turn reaches its first token roughly ten times sooner than the one that opened the
+document.
+
+Six families have been run end to end during development, from 3.9 GB to 20.4 GB on disk, at
+memory ceilings under 10 GB — the fastest of them at 25.9 tokens a second, the slowest at 6.2.
+Per-model figures, and the machine they were taken on, are in
+**[docs/models.md](docs/models.md)**.
 
 ---
 
@@ -130,12 +138,10 @@ three-projection SwiGLU that Qwen, DeepSeek, GLM and gpt-oss use, and the two-pr
 `fc1`/`fc2` that Nemotron uses. Expert count, top-k, quantisation and layer path are read from
 the checkpoint, never assumed.
 
-Six families are measured end to end (the table above). `doctor` has read and answered for
-checkpoints from Qwen3, Qwen3.6, Qwen3-Next, Qwen3-Coder, DeepSeek-V2 and V3, GLM-4.5 through
-4.7, gpt-oss, Kimi-Linear, MiniMax, Hunyuan, ERNIE, Granite, Phi-MoE and LongCat — from 4 GB up
-to 378 GB. Mixtral is the one layout that is refused: it stores each expert as separate tensors
-rather than stacked, so there is no single range to read an expert from, and `doctor` says so
-plainly instead of calling it "not an MoE model".
+`doctor` has read and answered for checkpoints from Qwen3, Qwen3.6, Qwen3-Next, Qwen3-Coder,
+DeepSeek-V2 and V3, GLM-4.5 through 4.7, gpt-oss, Kimi-Linear, MiniMax, Hunyuan, ERNIE, Granite,
+Phi-MoE and LongCat — from 4 GB up to 378 GB. Where a checkpoint stores its experts in a layout
+that cannot be streamed, it says which layout and why, rather than calling it "not an MoE model".
 
 Multimodal checkpoints load text-only; the vision tower is neither loaded nor charged to memory.
 Dense (non-MoE) models are not the target — there is nothing to keep resident selectively.
@@ -148,10 +154,10 @@ Full list, and how the speed prediction works: **[docs/models.md](docs/models.md
 
 - **An Apple Silicon Mac** (M1 or later) and macOS. MLX is Apple-only; this engine is built on it.
 - **Python 3.10+.**
-- **Memory.** By default bigrig plans to use 35% of installed RAM so the rest of your Mac keeps
-  working, and it never exceeds that. Most 17–20 GB models need a 6–7 GB ceiling, which that
-  default clears on a 24 GB Mac. On a 16 GB Mac the default leaves 5.6 GB, so raise it —
-  `doctor` prints the exact figure and the command (`BIGRIG_MAX_GB=7 bigrig run <model>`).
+- **Memory.** By default BigRig plans to use 35% of installed RAM so the rest of your Mac keeps
+  working, and it never exceeds that. Most 17–20 GB models need a six to seven gigabyte ceiling,
+  which that default clears on a 24 GB Mac. On a 16 GB Mac it does not, so raise it — `doctor`
+  prints the exact figure and the command (`BIGRIG_MAX_GB=7 bigrig run <model>`).
 - **Disk.** The model, plus one more copy of its experts for a streamed model's fast path. That
   copy doubles the model's footprint; the size is printed before it is made, it is skipped when
   the disk is tight, and `--no-pack` declines it. A model that fits in RAM writes nothing extra.
