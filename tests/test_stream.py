@@ -625,6 +625,32 @@ finally:
     os.unlink(_blob.name)
 
 
+print("\n" + "=" * 82); print("9. THE HOT SET IS WARMED BEFORE THE FIRST PROMPT, AND NEVER HURTS"); print("=" * 82)
+# warm_hot_set reads the most-used experts into the page cache synchronously at startup. It
+# must be bounded, must never raise, and must do nothing when there is nothing sensible to do.
+_r = stream.warm_hot_set("/nonexistent/model", "nope")
+check("a missing model returns a reason, not an exception",
+      _r["bytes"] == 0 and "no expert source" in _r["stopped"], str(_r))
+_olm = os.path.join(ROOT, "models", "OLMoE-1B-7B-0125-4bit")
+_r = stream.warm_hot_set(_olm, "no-such-usage-record-xyz")
+check("no usage record yet is a reason, not an exception",
+      _r["bytes"] == 0 and "usage record" in _r["stopped"], str(_r))
+check("a spare-memory figure below the margin warms nothing",
+      stream.warm_hot_set(_olm, "OLMoE-1B-7B-0125-4bit", spare_gb=0.5)["bytes"] == 0)
+_up = stream.usage_path("OLMoE-1B-7B-0125-4bit")
+if os.path.exists(_up) and os.path.exists(BLOB):
+    _r = stream.warm_hot_set(_olm, "OLMoE-1B-7B-0125-4bit", max_gb=0.01)
+    check("the byte cap is honoured", 0 < _r["bytes"] <= 0.02e9, f"{_r['bytes']} bytes")
+    check("...and the experts it read are counted", _r["experts"] >= 1, str(_r["experts"]))
+    _r = stream.warm_hot_set(_olm, "OLMoE-1B-7B-0125-4bit", max_gb=2.0, max_seconds=0.0)
+    check("the time cap is honoured and reported",
+          _r["bytes"] <= 8e6 and ("time limit" in _r["stopped"] or "stop" in _r["stopped"]), str(_r))
+else:
+    print("  SKIPPED - the OLMoE usage record or blob is absent; cap checks need a real one.")
+check("the defaults keep it well under the three-second whole-model read it replaces",
+      stream.HOT_WARM_MAX_S <= 2.0 and stream.HOT_WARM_MAX_GB <= 3.0,
+      f"{stream.HOT_WARM_MAX_S}s / {stream.HOT_WARM_MAX_GB} GB")
+
 print("\n" + "=" * 82)
 print(f"{'ALL TESTS PASSED' if not FAIL else str(len(FAIL))+' FAILURES: '+', '.join(FAIL)}")
 print("=" * 82)

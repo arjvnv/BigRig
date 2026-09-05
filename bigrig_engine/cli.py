@@ -653,6 +653,14 @@ def cmd_run(a) -> int:
     print(f"  {st['serving']}", flush=True)      # the disclosure must never sit in a buffer
     if st.get("streamed") and st.get("resident_gb"):
         print(f"  {st['resident_gb']:.1f} GB of expert weights held in memory", flush=True)
+        # The same head start serve gives itself: the most-used experts into the page cache
+        # before the first prompt, bounded to well under a second.
+        if not getattr(a, "no_warm", False):
+            from .stream import warm_hot_set
+            hw = warm_hot_set(s.model_dir, s.name)
+            if hw.get("bytes"):
+                print(f"  {hw['bytes'] / 1e9:.1f} GB of the most-used experts read into the page "
+                      f"cache ({hw['seconds']:.2f}s)", flush=True)
     print(f"  quality monitor {'on' if st['monitor'] else 'off'}. Ctrl-C to stop, "
           f"'/stats' for numbers, '/quit' to exit.\n")
     history = []
@@ -1229,6 +1237,9 @@ def build_parser():
     common(r)
     r.add_argument("--max-tokens", type=int, default=512)
     r.add_argument("--temperature", type=float, default=0.7)
+    r.add_argument("--no-warm", action="store_true",
+                   help="do not read this model's most-used experts into the page cache before "
+                        "the first prompt.")
     r.set_defaults(fn=cmd_run)
 
     cp = sub.add_parser("compress", help="shrink a model so every expert fits in RAM")

@@ -166,6 +166,7 @@ class _State:
         self.stopping = False
         # Who may talk to this server, filled in by `serve()`. Defaults are the safe ones so a
         # _State built directly by a test is not accidentally wide open.
+        self.hot_warm: dict = {}
         self.bind_host = "127.0.0.1"
         self.loopback = True
         self.origins: frozenset = frozenset()
@@ -1764,6 +1765,23 @@ def serve(session, host: str = "127.0.0.1", port: int = 8080, verbose: bool = Tr
                   "the shape of\n  the matmul and so the order of the reduction; in bfloat16 "
                   "that moves logits enough to\n  change a token where the top two are close. "
                   "Use one request per pass if you need\n  reproducibility.")
+    # THE HOT SET GOES INTO THE PAGE CACHE BEFORE THE PORT OPENS. Everything else warms in the
+    # background afterwards, as before. The split is the point: the most-used tenth of a model's
+    # experts carry about half of all expert reads and take half a second to read, so the first
+    # request gets them from memory instead of paying the cold-disk price on every one.
+    if warm_cache and getattr(session, "streamed", False):
+        from . import stream as _stm
+        try:
+            from .calibrate import available_gb as _avail
+            _spare = _avail()
+        except Exception:                   # noqa: BLE001 -- never worth an exception
+            _spare = None
+        hot = _stm.warm_hot_set(session.model_dir, session.name, spare_gb=_spare)
+        state.hot_warm = hot
+        if hot.get("bytes"):
+            state.event("warm", f"read the {hot['experts']} most-used experts "
+                                f"({hot['bytes'] / 1e9:.2f} GB) into the page cache in "
+                                f"{hot['seconds']:.2f}s before opening the port")
     httpd = ThreadingHTTPServer((host, port), make_handler(state))
     httpd.daemon_threads = True
     threading.Thread(target=httpd.serve_forever, name="bigrig-http", daemon=True).start()
@@ -1780,6 +1798,10 @@ def serve(session, host: str = "127.0.0.1", port: int = 8080, verbose: bool = Tr
                f"  {s['serving']}"]
         if s.get("streamed") and s.get("resident_gb"):
             out.append(f"  {s['resident_gb']:.1f} GB of expert weights held in memory")
+        hw = getattr(state, "hot_warm", None) or {}
+        if hw.get("bytes"):
+            out.append(f"  {hw['bytes'] / 1e9:.1f} GB of the most-used experts read into the page "
+                       f"cache before the port opened ({hw['seconds']:.2f}s)")
         out.append(f"  quality monitor: {'on' if s['monitor'] else 'off'}")
         out.append("")
         # The browser link goes FIRST among the things to try. Most people who need this tool

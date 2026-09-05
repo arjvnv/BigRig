@@ -1847,6 +1847,80 @@ def hot_regions(manifest: dict, usage: dict, limit_bytes: int) -> list:
     return out
 
 
+# THE HOT SET, READ BEFORE THE FIRST PROMPT RATHER THAN AFTER IT.
+#     warm_page_cache runs in the background after the port opens, on the reasoning that reading
+#     a whole 12.68 GB model takes three seconds and no request should wait for that. Right, and
+#     incomplete: routing is skewed, not flat. On Qwen3.6's own usage record the most-used 10% of
+#     experts carry 47% of all uses, and that 10% is 1.8 GB -- under half a second at disk speed.
+#     Reading THAT set synchronously costs a fraction of a second at startup.
+#
+#     WHAT IT BUYS, MEASURED, AND WHAT IT DOES NOT. On a page cache churned by streaming another
+#     16.5 GB model through it, Qwen3.6's first request:
+#
+#                          first token     decode
+#         no warm          2.91 / 2.64 s   11.0 / 10.6 tok/s
+#         2 GB in 0.37 s   2.67 / 2.27 s   10.6 / 10.2 tok/s
+#         4 GB in 0.91 s        2.27 s          10.2 tok/s
+#
+#     About 10-12% off the first token, and nothing for decode -- and the reason is the pool
+#     itself. LFUDA already keeps the hottest experts in slots, so the set warmed here is largely
+#     the set already resident, and a decode miss is by definition an expert OUTSIDE it: the cold
+#     tail, which a 2 GB or a 4 GB warm barely reaches. Prefill is different: a prompt touches
+#     nearly every expert, so the hot pages it finds in memory are pages it would otherwise have
+#     read from disk. This is a prefill win, priced honestly, and 2 GB is where it stops paying.
+#     Bounded twice: by bytes, so it never becomes the three-second read this replaces, and by
+#     wall clock, so a slow disk cannot turn "sub-second" into a stall at startup.
+HOT_WARM_MAX_GB = 2.0
+HOT_WARM_MAX_S = 1.5
+
+
+def warm_hot_set(model_dir: str, model_name: str, max_gb: float | None = None,
+                 max_seconds: float | None = None, spare_gb: float | None = None) -> dict:
+    """Read this model's most-used experts into the page cache, and return what was read.
+
+    Returns a dict with `bytes`, `seconds`, `experts` and, when nothing was read, `stopped`
+    saying why in a sentence. Never raises: a warm that fails is a warm that did not happen, and
+    the first prompt reads from disk exactly as it would have anyway.
+    """
+    import json as _json
+    import time as _t
+    out = {"bytes": 0, "seconds": 0.0, "experts": 0, "stopped": ""}
+    try:
+        man, blob = expert_source(model_dir)
+    except Exception as e:                       # noqa: BLE001 -- warming is never worth an exception
+        out["stopped"] = f"no expert source: {type(e).__name__}"
+        return out
+    if not blob:
+        out["stopped"] = "no packed blob; the hot set is read from the model's own files as needed"
+        return out
+    try:
+        with open(usage_path(model_name)) as fh:
+            usage = _json.load(fh) or {}
+    except (OSError, ValueError):
+        out["stopped"] = "no usage record yet; the first run writes one"
+        return out
+    cap_gb = HOT_WARM_MAX_GB if max_gb is None else float(max_gb)
+    if spare_gb is not None:
+        # Never take what the machine does not have. The same rule the background warm uses.
+        cap_gb = min(cap_gb, max(0.0, float(spare_gb) - 1.0))
+    if cap_gb <= 0:
+        out["stopped"] = "not enough spare memory to warm anything"
+        return out
+    hot = hot_regions(man, usage, int(cap_gb * 1e9))
+    if not hot:
+        out["stopped"] = "usage record names no experts this manifest knows"
+        return out
+    total = sum(int(n) for _, n in hot)
+    deadline = _t.perf_counter() + (HOT_WARM_MAX_S if max_seconds is None else float(max_seconds))
+    res = warm_page_cache(blob, budget_bytes=total,
+                          should_stop=lambda: _t.perf_counter() > deadline, regions=hot)
+    out.update({"bytes": int(res.get("bytes", 0)), "seconds": float(res.get("seconds", 0.0)),
+                "experts": len(hot), "stopped": res.get("stopped", "")})
+    if out["bytes"] < total and not out["stopped"]:
+        out["stopped"] = "hit the time limit"
+    return out
+
+
 def warm_page_cache(path: str, budget_bytes: int = 0, should_stop=None,
                     chunk: int = 32 << 20, should_pause=None, regions=None) -> dict:
     """Pull the expert file into the OS page cache, sequentially, in the background.
