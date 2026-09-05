@@ -103,7 +103,7 @@ def _fmt_plan(plan: dict) -> str:
 def _doctor_remote(repo_id: str, budget_gb: float) -> int:
     """Answer for a model that has not been downloaded. Nothing is fetched but metadata."""
     from .preflight import remote_shape, verdict
-    from .session import OS_AND_RUNTIME_GB, WORKING_MEMORY_GB
+    from .session import serving_reserve_gb
     print(f"\n  {repo_id}")
     print("    reading the model's shape from the hub (no weights are downloaded) ...")
     try:
@@ -140,7 +140,7 @@ def _doctor_remote(repo_id: str, budget_gb: float) -> int:
           f"minimum {sh['top_k']} a layer)")
     print(f"    always resident  {_human(sh['non_expert_gb'])}")
 
-    v = verdict(sh, budget_gb, OS_AND_RUNTIME_GB + WORKING_MEMORY_GB)
+    v = verdict(sh, budget_gb, serving_reserve_gb())
     from .session import MAX_ALLOWED_GB
     print(f"\n    your budget      {_human(budget_gb)}"
           + (f"  (ceiling is {_human(MAX_ALLOWED_GB)}; less is free right now)"
@@ -170,7 +170,7 @@ def _doctor_remote(repo_id: str, budget_gb: float) -> int:
                   f"{_human(MAX_ALLOWED_GB)} ceiling); with more free, the plan holds more experts")
         else:
             hint = ceiling_hint(budget_gb, total, tier, repo_id, shape=sh,
-                                reserve_gb=OS_AND_RUNTIME_GB + WORKING_MEMORY_GB,
+                                reserve_gb=serving_reserve_gb(),
                                 disk_gbs=disk_gbs)
             for line in hint.splitlines():
                 print(f"                     {line}")
@@ -207,7 +207,7 @@ def _doctor_remote(repo_id: str, budget_gb: float) -> int:
 
 def cmd_doctor(a) -> int:
     from .calibrate import available_gb, under_pressure
-    from .session import resolve_budget, OS_AND_RUNTIME_GB, WORKING_MEMORY_GB
+    from .session import resolve_budget, serving_reserve_gb
     print("\n  MACHINE")
     avail = available_gb()
     budget = resolve_budget(getattr(a, "memory", None), quiet=True)
@@ -270,11 +270,12 @@ def cmd_doctor(a) -> int:
             # resulting `.manifest.json not found -- run pack_experts()` went to stderr, naming a
             # Python function no user has ever called, in the middle of an unrelated report.
             # The same budget and the same reserve `serve` will use, so the two cannot report
-            # different plans for the same machine.
+            # different plans for the same machine -- which was NOT true until both sides were
+            # made to call `serving_reserve_gb`; this path was short by the prompt cache.
             ne = non_expert_gb(md, manifest=r["manifest"]) if os.path.isdir(md) else 0.0
             st = choose_strategy(r["manifest"], budget_gb=budget,
                                  top_k=model_top_k(md, r["manifest"]),
-                                 reserve_gb=round(OS_AND_RUNTIME_GB + WORKING_MEMORY_GB, 2),
+                                 reserve_gb=serving_reserve_gb(),
                                  non_expert_gb=ne)
             verdict = describe_strategy(st, measured_disk_gbs())
         except MemoryError as e:

@@ -657,8 +657,16 @@ print("=" * 84)
 # 4,109-token prompt: 44/128 peaked at 7.89 GB with 1.09 GB of RSS, 34/128 at 9.07 GB with
 # 6.23 GB of RSS and the guard killed it. Reserving more made the server less safe.
 _init = inspect.getsource(session.Session.__init__)
+# Asserted on the VALUE rather than on a slice of source text. The old form split __init__ on
+# the literal "serving_reserve_gb = round", so moving that sum into a shared function broke the
+# test rather than the invariant -- the same brittleness that let the reserve drift in the
+# first place. What must hold is that the reserve is the three terms and nothing else: no
+# reply-KV term folded in on top of the ceiling that already enforces it.
 check("the reply's KV is not reserved in the plan as well as enforced in the ceiling",
-      "TARGET_REPLY_TOKENS" not in _init.split("serving_reserve_gb = round")[1][:200])
+      abs(session.serving_reserve_gb()
+          - (session.OS_AND_RUNTIME_GB + session.WORKING_MEMORY_GB
+             + session.PROMPT_CACHE_GB)) < 1e-9,
+      f"{session.serving_reserve_gb()}")
 check("...and the reason is recorded, because the direction is counter-intuitive",
       "A smaller pool is not automatically a safer one" in _init)
 check("the OS slack is not counted twice either",

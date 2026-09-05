@@ -44,6 +44,38 @@ check("bytes_per_expert x experts x layers equals the blob size",
       abs(sh["bytes_per_expert"] * sh["n_experts"] * sh["n_layers"] - sh["expert_bytes"]) < 1e-6,
       f"{sh['bytes_per_expert']*sh['n_experts']*sh['n_layers']} vs {sh['expert_bytes']}")
 
+# ---------------------------------------------------------------- one reserve, not two
+# doctor computed the reserve as runtime + working memory and a live Session computed it as
+# runtime + working memory + prompt cache, so doctor promised a pool 0.5 GB larger than serve
+# would build. Right at the boundary that is a "yes" followed by a refusal. Both now call
+# session.serving_reserve_gb, and these checks exist so a term added to one reaches both.
+from bigrig_engine.session import (serving_reserve_gb, OS_AND_RUNTIME_GB,       # noqa: E402
+                                   WORKING_MEMORY_GB, PROMPT_CACHE_GB)
+check("the reserve counts the prompt cache, which is what serve actually holds back",
+      abs(serving_reserve_gb() - (OS_AND_RUNTIME_GB + WORKING_MEMORY_GB + PROMPT_CACHE_GB)) < 1e-9,
+      f"{serving_reserve_gb()}")
+check("...and it is strictly larger than the runtime-plus-working-memory sum doctor once used",
+      serving_reserve_gb() > OS_AND_RUNTIME_GB + WORKING_MEMORY_GB)
+check("a caller that switches the prompt cache off is not charged for it",
+      abs(serving_reserve_gb(prompt_cache_gb=0) - (OS_AND_RUNTIME_GB + WORKING_MEMORY_GB)) < 1e-9)
+check("a nonsensical negative prompt cache cannot shrink the reserve",
+      serving_reserve_gb(prompt_cache_gb=-99) == serving_reserve_gb(prompt_cache_gb=0))
+check("a per-model working memory flows through rather than being ignored",
+      serving_reserve_gb(1.0) < serving_reserve_gb(3.0))
+_cli_src = open(os.path.join(ROOT, "bigrig_engine", "cli.py")).read()
+check("no path computes the reserve by hand any more, which is how the two drifted",
+      "OS_AND_RUNTIME_GB + WORKING_MEMORY_GB" not in _cli_src)
+check("...and every doctor site asks the one function for it",
+      _cli_src.count("serving_reserve_gb()") >= 3, str(_cli_src.count("serving_reserve_gb()")))
+# The invariant that matters to a user: for one budget, doctor and serve size the same pool.
+for _m, _name in ((QW, "Qwen3-30B"), (manifest("OLMoE-1B-7B-0125-4bit"), "OLMoE")):
+    _sr = serving_reserve_gb()
+    _a = autoconfig.choose_capacity(_m, budget_gb=12.0, reserve_gb=_sr)
+    _b = autoconfig.choose_capacity(_m, budget_gb=12.0, reserve_gb=_sr)
+    check(f"{_name}: doctor and serve size the same pool from the same budget",
+          abs(_a["pool_gb"] - _b["pool_gb"]) < 1e-9 and _a["reserve_gb"] == _sr,
+          f"{_a['pool_gb']:.3f} vs {_b['pool_gb']:.3f}")
+
 c = autoconfig.choose_capacity(QW, budget_gb=12.0)
 check("the chosen pool actually fits the stated budget",
       c["pool_gb"] + c["reserve_gb"] <= 12.0, f"pool {c['pool_gb']:.2f} + {c['reserve_gb']}")
@@ -676,8 +708,18 @@ check("...and a name that matches nothing says so and points at `list`",
 # answers -- and the first one a user reads is the one they believe.
 check("both commands resolve the budget in one shared place",
       "resolve_budget" in _doc and "resolve_budget" in inspect.getsource(_sess.Session.__init__))
+# THIS CHECK IS WHY THE BUG SURVIVED. It asserted that doctor's source contained the string
+# "OS_AND_RUNTIME_GB + WORKING_MEMORY_GB" and called that "the same reserve serve uses" -- but
+# serve's reserve had a third term, the prompt cache, so the string was present and the claim
+# was false. The text matched; the invariant did not. Assert the VALUES agree instead, which
+# is the thing a user experiences, and which no amount of moving code around can fake.
+_doc_reserve = _sess.serving_reserve_gb()
+_serve_reserve = round(_sess.OS_AND_RUNTIME_GB + _sess.WORKING_MEMORY_GB
+                       + _sess.PROMPT_CACHE_GB, 2)
 check("...and doctor plans with the same reserve serve uses",
-      "OS_AND_RUNTIME_GB + WORKING_MEMORY_GB" in _doc)
+      abs(_doc_reserve - _serve_reserve) < 1e-9, f"doctor {_doc_reserve} vs serve {_serve_reserve}")
+check("...and doctor asks for it rather than adding the terms up itself",
+      "serving_reserve_gb" in _doc and "OS_AND_RUNTIME_GB + WORKING_MEMORY_GB" not in _doc)
 check("...and says so when the budget is not simply what is free",
       "budget for this run" in _doc)
 _env = _os.environ.get("BIGRIG_MEM_GB")

@@ -74,6 +74,29 @@ except Exception:                                   # the engine must run withou
 #     formula pretending to more than it knows.
 WORKING_MEMORY_GB = 3.0
 
+
+def serving_reserve_gb(working_memory_gb: float = WORKING_MEMORY_GB,
+                       prompt_cache_gb: float = None) -> float:
+    """Memory held back from the expert pool for everything that is not model weights.
+
+    ONE FUNCTION, BECAUSE TWO COPIES OF THIS SUM DRIFTED APART AND NOBODY NOTICED.
+        `doctor` computed the reserve as runtime + working memory. A live `Session` computed it
+        as runtime + working memory + the prompt cache -- 0.5 GB more. So doctor planned a pool
+        half a gigabyte larger than `serve` would actually build: it promised 34 experts and the
+        server made room for 27, and a model sitting right on the boundary was told it would run
+        and then refused. The comment beside one of the doctor call sites asserted that the two
+        "cannot report different plans for the same machine", which is exactly the invariant
+        that had broken.
+
+        Both paths now call this. Adding a term here reaches doctor and serve at the same time,
+        which is the only way this stays true.
+
+    `prompt_cache_gb` of None means the default a Session takes when the caller says nothing --
+    which is what doctor must assume, because that is the session the user is about to start.
+    """
+    pc = PROMPT_CACHE_GB if prompt_cache_gb is None else max(0.0, float(prompt_cache_gb))
+    return round(OS_AND_RUNTIME_GB + float(working_memory_gb) + pc, 2)
+
 # Below this the number has stopped being a limit and become a refusal. If memory is this tight
 # the model should not have loaded at all.
 MIN_REPLY_TOKENS = 256
@@ -825,8 +848,8 @@ class Session:
         if self.kv_bits not in (None, 2, 3, 4, 5, 6, 8):
             raise ValueError(f"kv_bits must be one of 2,3,4,5,6,8 or None, got {self.kv_bits}")
         self.kv_quant_start = int(KV_QUANT_START if kv_quant_start is None else kv_quant_start)
-        self.serving_reserve_gb = round(OS_AND_RUNTIME_GB + self.working_memory_gb
-                                        + self.prompt_cache_gb, 2)
+        self.serving_reserve_gb = serving_reserve_gb(self.working_memory_gb,
+                                                     self.prompt_cache_gb)
         if not self.kv_bytes_per_token:      # nothing to derive from; keep the tuned constant
             self.serving_reserve_gb = autoconfig.RESERVE_GB
         try:
