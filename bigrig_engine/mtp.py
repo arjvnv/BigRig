@@ -202,6 +202,30 @@ def supports(model, cache=None) -> str:
 
 
 # ------------------------------------------------------------------------------- the loop
+# WHY THIS DRAFTS ONE TOKEN AND NOT THREE, MEASURED (2026-09-05).
+#     The obvious extension is a longer draft verified in one pass: draft d1..d3, forward
+#     [token, d1, d2, d3], accept the matching prefix, and read the UNION of the four rows'
+#     experts once instead of four times. On a disk-bound engine that would pay. This engine is
+#     not disk-bound at steady state. The cost of a streamed forward, Qwen3.6-35B-A3B-4bit at a
+#     9 GB ceiling, pool warm, median of five:
+#
+#         rows    ms/pass    vs 1 row
+#            1        53       1.00x
+#            2        96       1.83x
+#            4       163       3.10x
+#            8       332       6.31x
+#
+#     Near-linear in rows. Each row misses ~7 of its 8 experts and each miss is admitted into a
+#     slot by a 1.77 MB GPU copy; the union of four rows is ~22 experts against 8, so the pass
+#     costs ~3x, and the copy -- not the disk read -- is what it costs. At 88% acceptance three
+#     drafts yield 1 + .88 + .77 + .68 = 3.3 expected tokens for 3.1x the time: about 1.07x,
+#     which is what one draft already measures. Partial acceptance would also need the
+#     recurrent-layer state at an interior position, which a forward does not expose, so it
+#     would cost a second pass on top.
+#
+#     Speculative decoding pays on this engine only when admitting an expert stops being a copy
+#     -- the views path, whose per-row kernel is the near-tie question already recorded there.
+#     Until then, one draft, and the number it measured.
 def stream(model, head: MTPHead, tokenizer, prompt, max_tokens: int = 256, prompt_cache=None,
            sampler=None, prefill_step_size: int = 64, stats: Stats | None = None,
            prompt_progress_callback=None, on_logits=None):
