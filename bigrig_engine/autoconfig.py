@@ -94,7 +94,8 @@ def plan_full_layers(n_layers: int, n_experts: int, top_k: int, capacity: int,
 
 
 def choose_capacity(manifest: dict, budget_gb: float | None = None, top_k: int = 8,
-                    reserve_gb: float = RESERVE_GB, non_expert_gb: float = 0.0) -> dict:
+                    reserve_gb: float = RESERVE_GB, non_expert_gb: float = 0.0,
+                    resident_reserve_gb: float | None = None) -> dict:
     """How many experts per layer fit, and what that implies.
 
     Returns `capacity`, plus `fits_entirely` when the whole model would fit anyway -- in which
@@ -122,7 +123,11 @@ def choose_capacity(manifest: dict, budget_gb: float | None = None, top_k: int =
     per_expert_all_layers = sh["bytes_per_expert"] * sh["n_layers"] / 1e9
     cap = int(pool_gb / per_expert_all_layers)
     cap = max(0, min(sh["n_experts"], cap))
-    fits = total_gb + reserve_gb <= avail
+    # A model that fits entirely is resident, so it is judged against the resident reserve --
+    # the same reasoning as choose_strategy. Falls back to `reserve_gb` when the caller has not
+    # said, which keeps every existing caller's answer unchanged.
+    fits = total_gb + (reserve_gb if resident_reserve_gb is None
+                       else float(resident_reserve_gb)) <= avail
 
     if cap < top_k:
         raise MemoryError(
@@ -170,7 +175,8 @@ DEFAULT_MIN_BITS = 3
 
 def choose_strategy(manifest: dict, budget_gb: float | None = None, top_k: int = 8,
                     reserve_gb: float = RESERVE_GB, non_expert_gb: float = 0.0,
-                    min_bits: int = DEFAULT_MIN_BITS) -> dict:
+                    min_bits: int = DEFAULT_MIN_BITS,
+                    resident_reserve_gb: float | None = None) -> dict:
     """Decide HOW to run this model on this machine, not just how much of it to keep.
 
     Three outcomes, in the order they are preferred:
@@ -190,7 +196,16 @@ def choose_strategy(manifest: dict, budget_gb: float | None = None, top_k: int =
     """
     sh = model_shape(manifest)
     avail = available_gb() if budget_gb is None else float(budget_gb)
+    # TWO ROOMS, BECAUSE THE THREE MODES DO NOT COST THE SAME TO RUN.
+    #     `native` and `compress` both keep every expert in RAM, so neither ever services a miss
+    #     and neither allocates the admission buffer that is the largest transient in a streamed
+    #     step. Measured, that difference is about 1.5 GB (see RESIDENT_WORKING_MEMORY_GB).
+    #     Charging a resident model for machinery it does not run pushed models into streaming
+    #     that had room to run whole -- the slower path, for memory nobody was going to use.
+    #     Defaults to `reserve_gb` so a caller that says nothing gets exactly the old behaviour.
+    res_reserve = reserve_gb if resident_reserve_gb is None else float(resident_reserve_gb)
     room = avail - reserve_gb - MIN_HEADROOM_GB - non_expert_gb
+    resident_room = avail - res_reserve - MIN_HEADROOM_GB - non_expert_gb
     q = (manifest["layers"][str(sh["layer_keys"][0])].get("quant")
          or {"bits": 4, "group_size": 64})
     src = _bpp(int(q["bits"]), int(q["group_size"]))
@@ -198,9 +213,9 @@ def choose_strategy(manifest: dict, budget_gb: float | None = None, top_k: int =
     total_gb = sh["expert_bytes"] / 1e9
 
     per_layer_all = sh["bytes_per_expert"] * sh["n_layers"] / 1e9
-    if total_gb <= room:
+    if total_gb <= resident_room:
         return {"mode": "native", "expert_gb": total_gb, "available_gb": avail,
-                "room_gb": room, "source_bits": int(q["bits"]),
+                "room_gb": resident_room, "source_bits": int(q["bits"]),
                 "reason": "the model already fits; streaming or compressing it would only "
                           "make it slower or worse"}
 
@@ -210,7 +225,7 @@ def choose_strategy(manifest: dict, budget_gb: float | None = None, top_k: int =
                          (2, 128)] if c[0] >= min_bits],
             key=lambda c: -_bpp(*c)):
         gb = params * _bpp(bits, group) / 1e9
-        if gb <= room:
+        if gb <= resident_room:
             # Also compute the streaming fallback HERE, where `room` already has the non-expert
             # weights subtracted. Letting the caller recompute it from choose_capacity() -- which
             # does not know about them -- made the two disagree: choose_strategy said "does not

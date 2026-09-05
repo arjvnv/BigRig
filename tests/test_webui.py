@@ -203,9 +203,14 @@ else:
 #
 #     Checked by term, against the server's own reserve, rather than by re-deriving the sum here
 #     -- which would be a third copy and would drift from both.
-_reserve_terms = re.search(r"self\.serving_reserve_gb\s*=\s*round\((.*?),\s*2\)",
+#     The sum itself now lives in `session.serving_reserve_gb`, because doctor and serve had
+#     each grown their own copy and the two had drifted. The per-session terms are still handed
+#     to it at the call site, which is what this reads -- so the page is still checked against
+#     the server's own list of terms rather than against a re-derivation here.
+_reserve_terms = re.search(r"self\.serving_reserve_gb\s*=\s*serving_reserve_gb\((.*?)\)",
                            _sess, re.S)
-check("the server's reserve is written as a sum this test can read", bool(_reserve_terms))
+check("the server's reserve is written as a call this test can read the terms from",
+      bool(_reserve_terms))
 if _reserve_terms:
     _terms = set(re.findall(r"self\.([a-z_]+_gb)", _reserve_terms.group(1)))
     _fit = script[script.index("function slotsThatFit"):script.index("function kvTokensThatFit")]

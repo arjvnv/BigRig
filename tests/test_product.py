@@ -67,6 +67,58 @@ check("no path computes the reserve by hand any more, which is how the two drift
       "OS_AND_RUNTIME_GB + WORKING_MEMORY_GB" not in _cli_src)
 check("...and every doctor site asks the one function for it",
       _cli_src.count("serving_reserve_gb()") >= 3, str(_cli_src.count("serving_reserve_gb()")))
+# ---------------------------------------------------------------- resident costs less to run
+# A model that keeps every expert in RAM never services a miss, so it never allocates the
+# admission buffer that is the largest transient in a streamed step. Measured at 0.52-0.95 GB
+# across 1.1 to 9.1 GB of resident weights, against 0.68-2.90 GB streamed. Charging a resident
+# model the streamed reserve pushed models into streaming -- or into being COMPRESSED, which
+# alters the weights -- when they had room to run whole and untouched.
+from bigrig_engine.session import RESIDENT_WORKING_MEMORY_GB                    # noqa: E402
+check("a resident model reserves less than a streamed one",
+      serving_reserve_gb(streamed=False) < serving_reserve_gb(),
+      f"{serving_reserve_gb(streamed=False)} vs {serving_reserve_gb()}")
+check("...by exactly the difference between the two working-memory measurements",
+      abs((serving_reserve_gb() - serving_reserve_gb(streamed=False))
+          - (WORKING_MEMORY_GB - RESIDENT_WORKING_MEMORY_GB)) < 1e-9)
+check("the resident figure still clears the worst resident run measured (0.95 GB)",
+      RESIDENT_WORKING_MEMORY_GB >= 0.95 * 1.5, f"{RESIDENT_WORKING_MEMORY_GB}")
+check("...and is not so large it stops being a saving",
+      RESIDENT_WORKING_MEMORY_GB < WORKING_MEMORY_GB)
+# The behaviour that matters: a model at the boundary now runs whole instead of being altered.
+_ds = manifest("OLMoE-1B-7B-0125-4bit")
+_kw = dict(top_k=8, non_expert_gb=0.27)
+# A budget where the model's experts fit under the resident reserve but not under the streamed
+# one -- found by search rather than hardcoded, so it survives a change to either constant.
+def _mode(b, resident):
+    """The mode at budget b, or None where the planner refuses the model outright."""
+    try:
+        kw = dict(_kw, budget_gb=b, reserve_gb=serving_reserve_gb())
+        if resident:
+            kw["resident_reserve_gb"] = serving_reserve_gb(streamed=False)
+        return autoconfig.choose_strategy(_ds, **kw)["mode"]
+    except MemoryError:
+        return None
+
+_bnd = next(b / 10 for b in range(40, 200)
+            if _mode(b / 10, False) not in (None, "native") and _mode(b / 10, True) == "native")
+_old = autoconfig.choose_strategy(_ds, budget_gb=_bnd, reserve_gb=serving_reserve_gb(), **_kw)
+_new = autoconfig.choose_strategy(_ds, budget_gb=_bnd, reserve_gb=serving_reserve_gb(),
+                                  resident_reserve_gb=serving_reserve_gb(streamed=False), **_kw)
+check("at the boundary the resident reserve runs a model whole rather than altering it",
+      _old["mode"] in ("compress", "stream") and _new["mode"] == "native",
+      f'{_bnd} GB: {_old["mode"]} -> {_new["mode"]}')
+check("...and a caller that does not ask for it gets exactly the old answer",
+      autoconfig.choose_strategy(_ds, budget_gb=_bnd, reserve_gb=serving_reserve_gb(),
+                                 **_kw)["mode"] == _old["mode"])
+# It must never make a STREAMED plan larger: the streamed reserve is untouched by any of this.
+for _b in (8.0, 9.0, 10.0, 11.0):
+    _a = autoconfig.choose_capacity(QW, budget_gb=_b, reserve_gb=serving_reserve_gb())
+    _c = autoconfig.choose_capacity(QW, budget_gb=_b, reserve_gb=serving_reserve_gb(),
+                                    resident_reserve_gb=serving_reserve_gb(streamed=False))
+    check(f"a streamed pool at {_b:.0f} GB is unchanged by the resident reserve",
+          _a["capacity"] == _c["capacity"] and abs(_a["pool_gb"] - _c["pool_gb"]) < 1e-9,
+          f'{_a["capacity"]} vs {_c["capacity"]}')
+
 # The invariant that matters to a user: for one budget, doctor and serve size the same pool.
 for _m, _name in ((QW, "Qwen3-30B"), (manifest("OLMoE-1B-7B-0125-4bit"), "OLMoE")):
     _sr = serving_reserve_gb()

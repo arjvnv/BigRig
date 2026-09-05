@@ -276,6 +276,7 @@ def cmd_doctor(a) -> int:
             st = choose_strategy(r["manifest"], budget_gb=budget,
                                  top_k=model_top_k(md, r["manifest"]),
                                  reserve_gb=serving_reserve_gb(),
+                                 resident_reserve_gb=serving_reserve_gb(streamed=False),
                                  non_expert_gb=ne)
             verdict = describe_strategy(st, measured_disk_gbs())
         except MemoryError as e:

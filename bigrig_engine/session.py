@@ -74,9 +74,47 @@ except Exception:                                   # the engine must run withou
 #     formula pretending to more than it knows.
 WORKING_MEMORY_GB = 3.0
 
+# WHAT A MODEL THAT KEEPS EVERY EXPERT IN RAM NEEDS INSTEAD, WHICH IS FAR LESS.
+#     The 3.0 above was measured on two STREAMED models and applied to every model, including
+#     ones that stream nothing. That is not a small conservatism: a resident model allocates no
+#     admission buffer, because there is no miss to service -- the largest transient in a
+#     streamed step simply does not exist. Measured the same way, peak above resident weights on
+#     a 1,200-token prompt at a 9 GB ceiling, MLX's own active-memory peak and the process
+#     footprint side by side:
+#
+#         RESIDENT                    MLX peak   footprint   weights held
+#         Qwen3-MOE-4x0.6B-4bit         0.44 GB    0.52 GB    1.12 GB
+#         OLMoE-1B-7B-4bit              0.53 GB    0.63 GB    4.09 GB
+#         DeepSeek-Coder-V2-Lite-4bit   0.64 GB    0.95 GB    9.05 GB   (native, 12.5 GB budget)
+#
+#         STREAMED                    MLX peak   footprint   experts
+#         Qwen3-30B-A3B-3bit            0.68 GB    1.84 GB   2.06 MB each
+#         Qwen3.6-35B-A3B-4bit          1.26 GB    1.86 GB   1.77 MB each
+#         DeepSeek-Coder-V2-Lite-4bit   1.88 GB    1.39 GB   4.87 MB each
+#         Nemotron-3-Nano-30B-4bit      2.66 GB    3.08 GB   5.61 MB each
+#         GLM-4.7-Flash-4bit            2.90 GB    3.12 GB   5.31 MB each
+#
+#     1.5 is 1.6x the worst resident measurement, against the 3.0 above which clears its own
+#     worst case by 3%. It is NOT a formula: the five streamed points rise with expert size and
+#     then do not, and fitting a curve to that would be inventing a law from noise -- the same
+#     mistake the note above this one records. What the split rests on is a mechanism.
+#
+#     WHERE THIS RUNS OUT. The three resident points do rise with the weights held -- 0.52, 0.63,
+#     0.95 GB at 1.1, 4.1 and 9.1 GB resident -- so a model very much larger than 9 GB held
+#     whole may need more than 1.5. That has not been measured and 1.5 should not be trusted
+#     blindly above roughly 20 GB resident. It is also the case that a machine holding a 20 GB
+#     model in RAM is not one where this reserve is the binding constraint.
+#
+#     WHAT IT BUYS. The native and compress paths both hold every expert in RAM, so both are
+#     planned against this instead of 3.0. A model needing up to 1.5 GB more than the old
+#     threshold now runs fully resident rather than being pushed into streaming -- and resident
+#     is the faster path, so this makes models faster rather than merely smaller.
+RESIDENT_WORKING_MEMORY_GB = 1.5
 
-def serving_reserve_gb(working_memory_gb: float = WORKING_MEMORY_GB,
-                       prompt_cache_gb: float = None) -> float:
+
+def serving_reserve_gb(working_memory_gb: float = None,
+                       prompt_cache_gb: float = None,
+                       streamed: bool = True) -> float:
     """Memory held back from the expert pool for everything that is not model weights.
 
     ONE FUNCTION, BECAUSE TWO COPIES OF THIS SUM DRIFTED APART AND NOBODY NOTICED.
@@ -95,7 +133,9 @@ def serving_reserve_gb(working_memory_gb: float = WORKING_MEMORY_GB,
     which is what doctor must assume, because that is the session the user is about to start.
     """
     pc = PROMPT_CACHE_GB if prompt_cache_gb is None else max(0.0, float(prompt_cache_gb))
-    return round(OS_AND_RUNTIME_GB + float(working_memory_gb) + pc, 2)
+    wm = (WORKING_MEMORY_GB if streamed else RESIDENT_WORKING_MEMORY_GB) \
+        if working_memory_gb is None else float(working_memory_gb)
+    return round(OS_AND_RUNTIME_GB + wm + pc, 2)
 
 # Below this the number has stopped being a limit and become a refusal. If memory is this tight
 # the model should not have loaded at all.
@@ -890,6 +930,8 @@ class Session:
         # request into a crash.
         self.strategy = None if capacity is not None else autoconfig.choose_strategy(
             man, budget_gb=budget_gb, top_k=top_k, reserve_gb=self.serving_reserve_gb,
+            resident_reserve_gb=serving_reserve_gb(prompt_cache_gb=self.prompt_cache_gb,
+                                                   streamed=False),
             non_expert_gb=self.non_expert_gb,
             min_bits=autoconfig.DEFAULT_MIN_BITS if min_bits is None else min_bits)
         if capacity is not None:                       # an explicit request always wins
