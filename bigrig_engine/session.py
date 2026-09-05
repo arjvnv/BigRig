@@ -1703,8 +1703,14 @@ class Session:
                     stop=None, think: bool = True, continue_last: bool = False,
                     prefill_step_size: int | None = None, on_prefill=None,
                     lookahead: bool = False, lookahead_tokens: int = 8, tools=None,
-                    mtp: bool | None = None, hide_reasoning: bool = False):
+                    mtp: bool | None = None, hide_reasoning: bool = False,
+                    response_format=None):
         """Yield (text_chunk, info) as the model generates. `info` carries live quality state.
+
+        `response_format` is OpenAI's: None, {"type": "json_object"} or {"type": "json_schema",
+        "json_schema": {...}}. When set, the sampler is constrained so the reply is one complete
+        JSON object (see grammar.py), the schema is placed in front of the model, and thinking is
+        off -- the reply IS the JSON, which is what that mode means.
 
         Stops at a turn boundary as well as at the model's own EOS. A model without a chat
         template has no reliable EOS for a turn, so without this it writes both sides of the
@@ -1715,6 +1721,23 @@ class Session:
         if seed is not None:
             mx.random.seed(seed)
         sampler = make_sampler(temp=temperature, top_p=top_p)
+        json_proc = None
+        if response_format is not None:
+            from . import grammar as _gr
+            kind, schema = _gr.parse_response_format(response_format)
+            if kind is not None:
+                json_proc = _gr.JSONProcessor(self.tokenizer, schema)
+                think = False
+                note = _gr.schema_instruction(kind, schema)
+                # In front of the conversation as a system message, so it binds the whole reply
+                # and survives any user text that says otherwise. Appended to an existing system
+                # message rather than displacing it.
+                msgs = list(messages or [])
+                if msgs and msgs[0].get("role") == "system":
+                    msgs[0] = {**msgs[0], "content": f"{msgs[0].get('content', '')}\n\n{note}"}
+                else:
+                    msgs.insert(0, {"role": "system", "content": note})
+                messages = msgs
         text = self._prompt(messages, prompt, think=think, continue_last=continue_last,
                             tools=tools)
         if self.handle:
@@ -1744,6 +1767,8 @@ class Session:
             return out
 
         gen_kw = {}
+        if json_proc is not None:
+            gen_kw["logits_processors"] = [json_proc]
         if on_prefill is not None:
             # Reading the prompt is not instant here and the user is looking at a blank window
             # while it happens. On gpt-oss at 3% residency a 68-token prompt -- which is what
@@ -1861,6 +1886,13 @@ class Session:
                    "reasoning_delta": "", "prompt_tokens": 0, "generation_tokens": 0,
                    "degraded": False}
         rsent = 0                      # reasoning characters already handed to the caller
+        # A constrained reply takes the standard path. The MTP and lookahead generators are
+        # handed their arguments by name and would drop a logits processor on the floor -- a
+        # request that asked for JSON would get unconstrained text and no error. Structured
+        # output is a correctness feature; the two opt-in speed paths yield to it.
+        if json_proc is not None:
+            lookahead = False
+            mtp = False
         if self.mtp_head is not None and mtp is not False and not lookahead:
             from . import mtp as _mtp
             self.mtp_last = _mtp.Stats()

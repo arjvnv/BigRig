@@ -243,6 +243,7 @@ check("defaults are sane when nothing is supplied",
                 "lookahead": False, "lookahead_tokens": server.LOOKAHEAD_TOKENS,
                 "mtp": None,                     # "whatever the server was started with"
                 "tools": None,
+                "response_format": None,         # OpenAI's field; None means unconstrained
                 "_rid": ""}, str(S({})))
 # Tools are absent unless sent, and a request that sends them gets them forwarded rather than
 # quietly dropped -- which is what both endpoints did before, returning HTTP 200 and an essay
@@ -669,6 +670,55 @@ if up:
                   {"messages": [{"role": "user", "content": "still here?"}], "max_tokens": 5},
                   timeout=90)
     check("the server is healthy after the oversized body", st6 == 200)
+
+    # ---------------------------------------------------------------- structured output, live
+    # The pure checks are in test_grammar; this is the one that matters to a client: ask the
+    # real server for JSON and parse what comes back.
+    st8, d8 = post("/v1/chat/completions",
+                   {"messages": [{"role": "user", "content": "Describe a cat as JSON with fields "
+                                                             "name and legs."}],
+                    "max_tokens": 80, "temperature": 0.9,
+                    "response_format": {"type": "json_object"}}, timeout=180)
+    _c8 = (d8.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+    try:
+        _o8 = json.loads(_c8); _parses8 = isinstance(_o8, dict)
+    except ValueError:
+        _parses8 = False
+    check("json_object: a live reply at temperature 0.9 is still one parseable object",
+          st8 == 200 and _parses8, repr(_c8[:80]))
+    st9, d9 = post("/v1/chat/completions",
+                   {"messages": [{"role": "user", "content": "Describe a cat."}],
+                    "max_tokens": 200, "temperature": 0.0,
+                    "response_format": {"type": "json_schema",
+                                        "json_schema": {"name": "cat", "schema": {
+                                            "type": "object", "required": ["name", "legs"]}}}},
+                   timeout=180)
+    _c9 = (d9.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+    try:
+        _o9 = json.loads(_c9)
+    except ValueError:
+        _o9 = None                          # NOT {} -- an unparseable reply must read as one
+    # What the constraint GUARANTEES: the reply is one parseable object, always. Required keys
+    # are held for while the model makes progress; a 1B model that recites the schema and then
+    # cannot produce a top-level key it has never seen would otherwise be left emitting
+    # whitespace to max_tokens and hand back an UNCLOSED document -- so after a stall the object
+    # is allowed to close (grammar.STALL_TOKENS). Parseable is the floor; the keys are checked
+    # by the client, which is a thing a client can do and repairing JSON is not.
+    check("json_schema: a live reply is a parseable object, even from a model that cannot "
+          "satisfy the schema", st9 == 200 and isinstance(_o9, dict), repr(_c9[:80]))
+    st10, d10 = post("/v1/chat/completions",
+                     {"messages": [{"role": "user", "content": "hi"}],
+                      "response_format": {"type": "yaml"}}, timeout=30)
+    check("a bad response_format is a 400 that names the legal types",
+          st10 == 400 and "json_object" in json.dumps(d10), f"{st10}")
+    st11, d11 = post("/v1/chat/completions",
+                     {"messages": [{"role": "user", "content": "hi"}],
+                      "response_format": {"type": "json_object"},
+                      "tools": [{"type": "function", "function": {
+                          "name": "f", "parameters": {"type": "object", "properties": {}}}}]},
+                     timeout=30)
+    check("tools and response_format together are refused rather than mangled",
+          st11 == 400 and "combined" in json.dumps(d11), f"{st11}")
 
     # ---------------------------------------------------------------- who may drive this server
     # This server has no authentication, so "who is asking" is the whole defence. A wildcard

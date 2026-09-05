@@ -156,6 +156,33 @@ differs somewhere in a near-tie. Off by default for that reason. The numbers are
 measurement; this is the software form of the design that a native Metal kernel
 would make exact.
 
+## Structured output: `response_format`
+
+The OpenAI field, on `/v1/chat/completions`:
+
+```json
+{"response_format": {"type": "json_object"}}
+{"response_format": {"type": "json_schema", "json_schema": {"name": "x", "schema": {...}}}}
+```
+
+The sampler is constrained so the reply is **one complete JSON object and nothing else** — no
+prose around it, no code fence, no trailing sentence. This is enforced token by token against a
+JSON grammar, so it holds at any temperature and for any model, and it costs nothing per token the
+model was not already paying: the model's own preference order among legal tokens is untouched,
+and a token is only ever removed when it would have broken the document.
+
+With a `json_schema`, the schema is placed in front of the model in words and every name in its
+top-level `required` list must appear as a key before the object is allowed to close. Property
+**types** are not enforced at the token level. If a model cannot produce a required key — a small
+model that recites the schema instead of filling it, say — the object is still allowed to close
+after it has stalled, so the reply always parses and the missing key is something the client can
+check for, which broken JSON is not.
+
+Thinking is turned off for a constrained request: the reply *is* the JSON, as in OpenAI's own
+mode. `response_format` and `tools` cannot be combined — a tool call is not a JSON object — and
+sending both is a `400` that says so. The two opt-in speed paths (`--mtp`, lookahead) yield to a
+constrained request, which takes the standard path.
+
 ## Models that think before answering
 
 Qwen3.5/3.6, GLM-4.x, Nemotron and their kin produce a block of reasoning before the answer; the

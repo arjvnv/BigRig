@@ -998,6 +998,21 @@ def make_handler(state: _State):
             # by name later. A conforming OpenAI client never sends one; without it the stop
             # button falls back to closing the socket, which works but is not immediate.
             rid = body.get("bigrig_id")
+            # `response_format` IS part of the OpenAI schema. Validated here so a malformed one
+            # is a 400 with a sentence, not a 500 from inside generation.
+            rf = body.get("response_format")
+            if rf is not None:
+                from .grammar import parse_response_format
+                rf_kind, _schema = parse_response_format(rf)  # raises ValueError with the reason
+                if rf_kind is None:
+                    rf = None                                # {"type": "text"} means nothing
+                elif body.get("tools"):
+                    # A tool call is emitted in the model's own markup, which the JSON constraint
+                    # would tear apart mid-token; the reply would be neither a tool call nor an
+                    # object. OpenAI permits the pair; this server refuses it plainly rather
+                    # than returning something no client could parse.
+                    raise ValueError("`response_format` and `tools` cannot be combined: a tool "
+                                     "call is not a JSON object. Send one or the other.")
             # GUESSING AHEAD, ASKED FOR PER REQUEST BECAUSE ONLY THE REQUEST KNOWS IF IT HELPS.
             #     Whether drafting from earlier text pays is a property of the WORK, not of the
             #     machine, and the two directions are both large. Measured on this model:
@@ -1035,6 +1050,7 @@ def make_handler(state: _State):
                     # switch the head OFF, which is what an A/B on one warm server needs.
                     "mtp": (None if "mtp" not in body else bool(body.get("mtp"))),
                     "tools": tools or None,
+                    "response_format": rf,
                     "_rid": str(rid)[:64] if isinstance(rid, (str, int)) else ""}
 
         def _client_gone(self) -> bool:
