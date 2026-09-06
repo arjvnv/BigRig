@@ -20,6 +20,22 @@ from .calibrate import available_gb, under_pressure
 #   activations        transient, but peak matters because peak is what triggers swap
 RESERVE_GB = 3.0
 MIN_HEADROOM_GB = 1.0
+# The absolute least slack to leave above everything the planner has accounted for, on any
+# machine. Below this a transient MLX allocation lands in swap. Headroom scales DOWN toward this
+# on a tight budget and never below it -- see scaled_headroom.
+HEADROOM_FLOOR_GB = 0.5
+
+
+def scaled_headroom(budget_gb: float) -> float:
+    """Slack to leave free, scaled to the budget.
+
+    A flat 1.0 GB is right at 9 GB and wrong at 3.5, where it is a third of everything the user
+    has. The KV cache and the scratch peak are both accounted for elsewhere (the context limit
+    and the working-memory reserve), so this is pure margin -- and margin should be a share of
+    the budget, floored so it never vanishes. 12% of the budget, capped at the flat 1.0 it
+    replaces and floored at HEADROOM_FLOOR_GB: unchanged at 8.3 GB and up, gently smaller below.
+    """
+    return round(max(HEADROOM_FLOOR_GB, min(MIN_HEADROOM_GB, float(budget_gb) * 0.12)), 2)
 
 
 def model_shape(manifest: dict) -> dict:
@@ -95,7 +111,8 @@ def plan_full_layers(n_layers: int, n_experts: int, top_k: int, capacity: int,
 
 def choose_capacity(manifest: dict, budget_gb: float | None = None, top_k: int = 8,
                     reserve_gb: float = RESERVE_GB, non_expert_gb: float = 0.0,
-                    resident_reserve_gb: float | None = None) -> dict:
+                    resident_reserve_gb: float | None = None,
+                    headroom_gb: float | None = None) -> dict:
     """How many experts per layer fit, and what that implies.
 
     Returns `capacity`, plus `fits_entirely` when the whole model would fit anyway -- in which
@@ -104,13 +121,14 @@ def choose_capacity(manifest: dict, budget_gb: float | None = None, top_k: int =
     """
     sh = model_shape(manifest)
     avail = available_gb() if budget_gb is None else float(budget_gb)
+    headroom = MIN_HEADROOM_GB if headroom_gb is None else float(headroom_gb)
     # MIN_HEADROOM is subtracted as well, not just declared. Sizing the pool to consume every
     # last byte leaves 0.0 GB of slack, and the first KV cache growth then lands in swap.
     # Attention, embeddings and the lm_head are resident whatever the pool does, so they come
     # out of the budget before the pool is sized. They are 0.67 GB on Qwen3-30B, which is why
     # leaving them out was survivable there, and 2.39 GB on gpt-oss-120b, which is why it was
     # not: the pool was planned as though a fifth of the budget were still free.
-    pool_gb = avail - reserve_gb - MIN_HEADROOM_GB - max(0.0, float(non_expert_gb))
+    pool_gb = avail - reserve_gb - headroom - max(0.0, float(non_expert_gb))
     per_layer_all = sh["bytes_per_expert"] * sh["n_experts"] / 1e9
     total_gb = sh["expert_bytes"] / 1e9
 
@@ -176,7 +194,8 @@ DEFAULT_MIN_BITS = 3
 def choose_strategy(manifest: dict, budget_gb: float | None = None, top_k: int = 8,
                     reserve_gb: float = RESERVE_GB, non_expert_gb: float = 0.0,
                     min_bits: int = DEFAULT_MIN_BITS,
-                    resident_reserve_gb: float | None = None) -> dict:
+                    resident_reserve_gb: float | None = None,
+                    headroom_gb: float | None = None) -> dict:
     """Decide HOW to run this model on this machine, not just how much of it to keep.
 
     Three outcomes, in the order they are preferred:
@@ -204,8 +223,9 @@ def choose_strategy(manifest: dict, budget_gb: float | None = None, top_k: int =
     #     that had room to run whole -- the slower path, for memory nobody was going to use.
     #     Defaults to `reserve_gb` so a caller that says nothing gets exactly the old behaviour.
     res_reserve = reserve_gb if resident_reserve_gb is None else float(resident_reserve_gb)
-    room = avail - reserve_gb - MIN_HEADROOM_GB - non_expert_gb
-    resident_room = avail - res_reserve - MIN_HEADROOM_GB - non_expert_gb
+    headroom = MIN_HEADROOM_GB if headroom_gb is None else float(headroom_gb)
+    room = avail - reserve_gb - headroom - non_expert_gb
+    resident_room = avail - res_reserve - headroom - non_expert_gb
     q = (manifest["layers"][str(sh["layer_keys"][0])].get("quant")
          or {"bits": 4, "group_size": 64})
     src = _bpp(int(q["bits"]), int(q["group_size"]))

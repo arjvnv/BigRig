@@ -961,6 +961,11 @@ def _auto_tune(a, s):
                             inp["n_exp"], inp["top_k"], inp["n_layers"], inp["gb_per_slot"],
                             inp["fits"], probes=3, verbose=True)
         _knee.save(res)
+        # And, at the capacity just chosen, how much scratch this model really needs -- so the
+        # served run reserves that instead of the flat 3 GB default. One wide-prefill pass, at
+        # the served capacity, recorded as a running maximum; see workmem.py.
+        _knee.measure_workmem(_knee_maker(a, path, inp["budget"]), os.path.basename(path),
+                              inp["budget"], int(res["capacity"]))
         # The probe's tok/s is a like-for-like ranking under identical short prompts, NOT the
         # speed a user will see on a real reply (measured 18.3 in the probe against 5.7 on the
         # reply that followed). So the pick is reported and the probe number is not.
@@ -1004,6 +1009,8 @@ def cmd_knee(a) -> int:
                         inp["top_k"], inp["n_layers"], gb_per_slot, fits,
                         probes=a.probes, tolerance=a.tolerance)
     where = _knee.save(res)
+    _knee.measure_workmem(_knee_maker(a, path, budget), os.path.basename(path), budget,
+                          int(res["capacity"]))
     print(f"\n  knee: {res['capacity']} of {n_exp} experts per layer "
           f"({res['resident_gb']} GB)")
     print(f"  {res['why']}")

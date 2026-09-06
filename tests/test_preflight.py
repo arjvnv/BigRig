@@ -86,17 +86,21 @@ for n_experts in (128,):
                 need, plan = preflight.smallest_ceiling(sh, RESERVE)
                 if need is None:
                     continue
-                # It must run AT the number reported.
+                # It must run AT the number reported -- with the SAME budget-scaled headroom
+                # smallest_ceiling used to find it, or the re-check reserves a different amount
+                # than the search did and the two disagree (the doctor/serve consistency rule).
                 try:
                     autoconfig.choose_capacity(sh["manifest"], budget_gb=need, top_k=top_k,
-                                               reserve_gb=RESERVE, non_expert_gb=nx)
+                                               reserve_gb=RESERVE, non_expert_gb=nx,
+                                               headroom_gb=autoconfig.scaled_headroom(need))
                 except MemoryError:
                     bad_needs.append((n_experts, top_k, per, nx, need))
                 # And NOT at a tenth of a gigabyte less, or it is not the smallest.
                 try:
-                    autoconfig.choose_capacity(sh["manifest"], budget_gb=round(need - 0.1, 1),
-                                               top_k=top_k, reserve_gb=RESERVE,
-                                               non_expert_gb=nx)
+                    less = round(need - 0.1, 1)
+                    autoconfig.choose_capacity(sh["manifest"], budget_gb=less,
+                                               top_k=top_k, reserve_gb=RESERVE, non_expert_gb=nx,
+                                               headroom_gb=autoconfig.scaled_headroom(less))
                     not_minimal.append((n_experts, top_k, per, nx, need))
                 except MemoryError:
                     pass

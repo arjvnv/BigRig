@@ -196,7 +196,7 @@ def remote_shape(repo_id: str, token: str | None = None) -> dict:
             "arch": cfg.get("model_type", "?")}
 
 
-def smallest_ceiling(shape: dict, reserve_gb: float, hi: float = 1024.0) -> tuple:
+def smallest_ceiling(shape: dict, reserve_gb: float, hi: float = 1024.0) -> tuple:  # noqa: C901
     """(the smallest budget `choose_capacity` accepts, the plan it gives there), or (None, None).
 
     Found by ASKING the planner, never by adding up its constants. It is monotone -- more memory
@@ -209,7 +209,8 @@ def smallest_ceiling(shape: dict, reserve_gb: float, hi: float = 1024.0) -> tupl
         try:
             return autoconfig.choose_capacity(
                 shape["manifest"], budget_gb=gb, top_k=shape["top_k"],
-                reserve_gb=reserve_gb, non_expert_gb=shape["non_expert_gb"])
+                reserve_gb=reserve_gb, non_expert_gb=shape["non_expert_gb"],
+                headroom_gb=autoconfig.scaled_headroom(gb))
         except MemoryError:
             return None
 
@@ -251,7 +252,8 @@ def verdict(shape: dict, budget_gb: float, reserve_gb: float, search: bool = Tru
     try:
         plan = autoconfig.choose_capacity(
             shape["manifest"], budget_gb=budget_gb, top_k=shape["top_k"],
-            reserve_gb=reserve_gb, non_expert_gb=shape["non_expert_gb"])
+            reserve_gb=reserve_gb, non_expert_gb=shape["non_expert_gb"],
+            headroom_gb=autoconfig.scaled_headroom(budget_gb))
         fits_now, why = True, ""
     except MemoryError as e:
         plan, fits_now, why = None, False, str(e)

@@ -399,6 +399,70 @@ class Progress:
             self.stream.flush()
 
 
+def measure_workmem(make_session, model_name: str, budget_gb: float, capacity: int,
+                    prog=None) -> dict | None:
+    """Measure this model's scratch peak at the capacity it will be served at, and record it.
+
+    THE SAFE CEILING, NOT A TYPICAL RUN. The transient a forward pass allocates is bounded by
+    the width of the prefill pass, which the engine caps regardless of how long the prompt is.
+    So the worst case is a single full-width pass, and this drives one with a prompt comfortably
+    wider than any model's step here. Reserving from this peak covers any prompt a user can send.
+
+    Recorded via workmem.record, which keeps a running maximum and refuses a reading that did not
+    drive a wide enough pass -- so a machine that cannot even build this pool writes nothing and
+    the flat default stands. Never raises: a failed measurement leaves the default in place.
+    """
+    from . import workmem as _wm
+    import mlx.core as mx
+    # THE PROMPT MUST DRIVE A FULL-WIDTH PREFILL PASS, or it under-measures the ceiling. The
+    # scratch peak is set by the widest pass the engine runs, which is `prefill_step` tokens
+    # (512 on the widest model here). A prompt shorter than that runs one narrow pass and peaks
+    # low -- the one way this measurement could reserve too little. Sized past 1,200 tokens so a
+    # full pass runs on any model, with a second partial pass after it, exactly as a long real
+    # prompt would.
+    long_prompt = ("Explain, in thorough detail and with concrete worked examples, how a "
+                   "mixture-of-experts transformer routes each token to a subset of its experts, "
+                   "why this makes the model sparse at inference, and how streaming those experts "
+                   "from disk changes the memory and speed trade-off on a laptop, covering the "
+                   "router, the gate, the top-k selection, and the eviction policy in turn. ") * 20
+    try:
+        s = make_session(capacity)
+    except Exception:                            # noqa: BLE001 -- a probe must never block a run
+        return None
+    try:
+        base = mx.get_active_memory() / 1e9
+        mx.reset_peak_memory()
+        n = 0
+        for _c, _i in s.stream_text([{"role": "user", "content": long_prompt}],
+                                    max_tokens=24, think=False):
+            n += 1
+        peak = mx.get_peak_memory() / 1e9 - base
+        prefill = int(getattr(s, "_wm_max_prefill", 0) or 0)
+        foot = 0.0
+        try:
+            from .calibrate import phys_footprint_gb
+            foot = phys_footprint_gb()
+        except Exception:                        # noqa: BLE001
+            foot = 0.0
+        if prog is not None:
+            prog.line(f"  scratch memory at {capacity} of {n_experts_hint(s)}: {peak:.2f} GB over "
+                      f"resident (reserving from this instead of the flat default)")
+        _wm.record(model_name, budget_gb, peak, footprint_gb=foot,
+                   prefill_tokens=prefill, decode_tokens=max(n, 24))
+        return {"peak_gb": round(peak, 3), "prefill_tokens": prefill}
+    except Exception:                            # noqa: BLE001
+        return None
+    finally:
+        s.close()
+
+
+def n_experts_hint(s) -> int:
+    try:
+        return int(s.plan.get("n_experts") or 0)
+    except Exception:                            # noqa: BLE001
+        return 0
+
+
 def measure(make_session, model_name: str, budget_gb: float, n_experts: int, top_k: int,
             n_layers: int, gb_per_slot: float, fits: int, probes: int = 3,
             tolerance: float = DEFAULT_TOLERANCE, verbose: bool = True) -> dict:

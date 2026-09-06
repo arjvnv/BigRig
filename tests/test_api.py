@@ -546,9 +546,19 @@ check("the reserve clears both models that were measured",
       session.WORKING_MEMORY_GB >= 2.96, str(session.WORKING_MEMORY_GB))
 check("...without being so large it refuses models that fit",
       session.WORKING_MEMORY_GB <= 3.5, str(session.WORKING_MEMORY_GB))
-check("it does not pretend to a per-model formula it cannot support with two points",
-      session.Session._working_memory({"layers": {"0": {"bytes_per_expert": 13_240_000}}}, 4)
-      == session.Session._working_memory({}, 8) == session.WORKING_MEMORY_GB)
+# Working memory is no longer a flat constant: a model measured on this machine reserves what
+# it actually needs (workmem.py), CLAMPED to WORKING_MEMORY_GB as a ceiling. What must hold is
+# that with NO measurement the default stands, and that the measured value can only ever be
+# lower -- never higher than the shipped 3.0.
+import tempfile as _tf_wm, os as _os_wm                                # noqa: E402
+from bigrig_engine import workmem as _wm_mod                            # noqa: E402
+_uid = "no-such-measured-model-xyz"
+check("with no measurement the flat default is used unchanged",
+      _wm_mod.load(_uid, 9.0) is None
+      and _wm_mod.reserve_from(0.0, session.WORKING_MEMORY_GB) == session.WORKING_MEMORY_GB)
+check("a measured model can only ever reserve LESS, never more than the default",
+      all(_wm_mod.reserve_from(pk, session.WORKING_MEMORY_GB) <= session.WORKING_MEMORY_GB
+          for pk in (0.4, 1.0, 2.0, 3.0, 5.0)))
 
 # THE WIDTH OF THE PREFILL PASS IS A PROPERTY OF THE MODEL AND MUST NOT BE ONE OF THE POOL.
 #     It used to be `MAX_PREFILL_SPANS * capacity // top_k`, and these checks used to assert

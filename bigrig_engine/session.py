@@ -23,6 +23,7 @@ import mlx.core as mx
 
 from . import autoconfig, calibrate, consent, precision, predict, stream, synccal
 from . import knee as _knee
+from . import workmem as _workmem
 
 try:
     from bigrig_layer.adaptive import AdaptiveMeter
@@ -879,11 +880,18 @@ class Session:
         # that is 0.67 GB unreserved against a 9 GB ceiling. The CLI happened to be safe because
         # it downloads to a real directory first; anything using the Python API was not.
         self.non_expert_gb = precision.non_expert_gb(self.config_dir, manifest=man)
-        self.working_memory_gb = self._working_memory(man, top_k)
+        self.working_memory_gb = self._working_memory(man, top_k, budget_gb)
         # Charged to the reserve BEFORE the pool is planned, so the pool is one that leaves room
         # for it. Adding it afterwards would mean the ceiling the user set is not the ceiling.
-        self.prompt_cache_gb = max(0.0, float(PROMPT_CACHE_GB if prompt_cache_gb is None
-                                              else prompt_cache_gb))
+        # SCALED TO THE BUDGET when the caller did not set one. 0.5 GB of remembered prompt is a
+        # good trade at 9 GB and a luxury at 3.5, where it is a seventh of everything free -- and
+        # on a machine that tight, running at all beats remembering the last turn. Caps at the
+        # 0.5 it replaces (unchanged at 8.3 GB and up), floors at 0.0 (below which it is off).
+        if prompt_cache_gb is None:
+            self.prompt_cache_gb = round(min(PROMPT_CACHE_GB,
+                                             max(0.0, float(budget_gb) * 0.06)), 2)
+        else:
+            self.prompt_cache_gb = max(0.0, float(prompt_cache_gb))
         self.kv_bits = (int(kv_bits) if kv_bits else None) or KV_BITS
         if self.kv_bits not in (None, 2, 3, 4, 5, 6, 8):
             raise ValueError(f"kv_bits must be one of 2,3,4,5,6,8 or None, got {self.kv_bits}")
@@ -892,10 +900,12 @@ class Session:
                                                      self.prompt_cache_gb)
         if not self.kv_bytes_per_token:      # nothing to derive from; keep the tuned constant
             self.serving_reserve_gb = autoconfig.RESERVE_GB
+        self.headroom_gb = autoconfig.scaled_headroom(budget_gb)
         try:
             self.plan = autoconfig.choose_capacity(man, budget_gb=budget_gb, top_k=top_k,
                                                    reserve_gb=self.serving_reserve_gb,
-                                                   non_expert_gb=self.non_expert_gb)
+                                                   non_expert_gb=self.non_expert_gb,
+                                                   headroom_gb=self.headroom_gb)
         except MemoryError:
             # The planner refuses a model it cannot fit, which is right when it is the one
             # choosing. It is not right when the caller has already chosen: everywhere else in
@@ -932,7 +942,7 @@ class Session:
             man, budget_gb=budget_gb, top_k=top_k, reserve_gb=self.serving_reserve_gb,
             resident_reserve_gb=serving_reserve_gb(prompt_cache_gb=self.prompt_cache_gb,
                                                    streamed=False),
-            non_expert_gb=self.non_expert_gb,
+            non_expert_gb=self.non_expert_gb, headroom_gb=self.headroom_gb,
             min_bits=autoconfig.DEFAULT_MIN_BITS if min_bits is None else min_bits)
         if capacity is not None:                       # an explicit request always wins
             self.strategy = {"mode": "stream",
@@ -1122,6 +1132,15 @@ class Session:
                               len(getattr(self.tokenizer, "get_vocab", dict)()) or 0)
         self.flagged_tokens = 0
         self.total_tokens = 0
+        # PASSIVE WORKING-MEMORY MEASUREMENT. The scratch peak a real forward pass reaches, over
+        # this session's lifetime, so the next run at this budget can reserve what this model
+        # actually needs instead of the flat default. Baseline is taken on the first generation
+        # (the pool is built and warmed by then); the max prompt width and decode total gate
+        # whether the reading is representative enough to trust. See workmem.py.
+        self._wm_baseline = None
+        self._wm_peak = 0.0
+        self._wm_max_prefill = 0
+        self._wm_decode = 0
         # RUNS OF FLAGS, NOT SINGLE FLAGS, ARE WHAT DEGRADATION LOOKS LIKE.
         #     The meter judges each token against this model's own normal at z = 2.5, so about
         #     one healthy token in a hundred trips it by chance -- measured, 2 of 281 on a clean
@@ -1314,15 +1333,20 @@ class Session:
         if self.handle:
             self.handle.reset_stats()
 
-    @staticmethod
-    def _working_memory(manifest, top_k: int) -> float:
+    def _working_memory(self, manifest, top_k: int, budget_gb: float) -> float:
         """What a step costs beyond the resident weights and the KV cache.
 
-        Measured on two models that differ by six times in expert size and still landed within
-        0.6 GB of each other once the prefill width was bounded -- see WORKING_MEMORY_GB. The
-        signature keeps the manifest and top-k so a per-model term can be reintroduced if a third
-        model shows one is needed, rather than inventing one from two points.
+        The flat WORKING_MEMORY_GB was measured on two models and applied to all; it is the
+        largest single item a small machine reserves and most models need far less. If this
+        model has been measured on this machine at this budget (by the tune, or by a previous
+        served run -- see workmem.py) the reserve is sized from that peak instead, with a margin
+        and a floor, and CLAMPED to the flat default as a ceiling so it can only ever free
+        memory, never take more than the shipped constant. No measurement -> the flat default,
+        unchanged.
         """
+        rec = _workmem.load(self.name, budget_gb)
+        if rec:
+            return _workmem.reserve_from(float(rec["peak_gb"]), WORKING_MEMORY_GB)
         return WORKING_MEMORY_GB
 
     def _load_mtp(self, verbose: bool = True) -> None:
@@ -1767,6 +1791,15 @@ class Session:
             return out
 
         gen_kw = {}
+        # The scratch baseline: memory in use before this generation's first forward pass, with
+        # the peak counter reset so what follows is measured against it. Once per session, on the
+        # first call, when the pool is built and any warm pass has run.
+        if self._wm_baseline is None:
+            try:
+                self._wm_baseline = mx.get_active_memory() / 1e9
+                mx.reset_peak_memory()
+            except Exception:                   # noqa: BLE001 -- a measurement, never a failure
+                self._wm_baseline = 0.0
         if json_proc is not None:
             gen_kw["logits_processors"] = [json_proc]
         if on_prefill is not None:
@@ -1945,6 +1978,14 @@ class Session:
                     self._generated_ids.append(int(r.token))
                 self.total_tokens += 1
                 self.flagged_tokens += int(bool(flagged))
+                if self._wm_baseline is not None:
+                    try:
+                        self._wm_peak = max(self._wm_peak,
+                                            mx.get_peak_memory() / 1e9 - self._wm_baseline)
+                    except Exception:           # noqa: BLE001
+                        pass
+                    self._wm_max_prefill = max(self._wm_max_prefill, int(r.prompt_tokens or 0))
+                    self._wm_decode += 1
                 raw += r.text
                 # A CONSTRUCT CANNOT BE REWRITTEN A PIECE AT A TIME.
                 #     Rewriting only the newly-arrived tail splits `<|channel|>analysis` from its
@@ -2253,6 +2294,12 @@ class Session:
     # ------------------------------------------------------------------ reporting
     def close(self) -> None:
         """Give back everything this session holds. Safe to call more than once."""
+        try:
+            if self._wm_peak > 0:
+                _workmem.record(self.name, self.pool_budget_gb, self._wm_peak,
+                                prefill_tokens=self._wm_max_prefill, decode_tokens=self._wm_decode)
+        except Exception:                       # noqa: BLE001 -- a record, never a teardown failure
+            pass
         h = getattr(self, "handle", None)
         if h is not None and hasattr(h, "close"):
             try:
