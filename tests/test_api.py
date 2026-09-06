@@ -13,6 +13,7 @@ import re
 import numpy as _np
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -205,25 +206,43 @@ print("=" * 84)
 # chunked encoding, so a browser's fetch reader could never see the body end. The page sent one
 # message, waited forever for a `done` that never came, and the input stayed disabled. curl
 # never noticed because it reads until the socket closes.
-_sv = inspect.getsource(server.make_handler)
-# Slice to end_headers(), which is where the header block genuinely ends. A fixed character
-# window failed here because the explanation above the line is longer than the window was.
-_sse_blocks = [b.split("end_headers()")[0] for b in _sv.split("text/event-stream")[1:]]
-check("every SSE response declares Connection: close",
-      all('send_header("Connection", "close")' in b for b in _sse_blocks),
-      f"{len(_sse_blocks)} SSE handlers")
-check("...and actually closes the socket, not just says so",
-      all("self.close_connection = True" in b for b in _sse_blocks))
-# Three now: OpenAI, Anthropic, and the Responses API that Codex CLI requires. Each one is a
-# separate handler, so each has to declare and honour Connection: close on its own.
-check("all three streams -- OpenAI, Anthropic and Responses -- are covered",
-      len(_sse_blocks) == 3,
-      str(len(_sse_blocks)))
-check("the reason is recorded where the next person will look",
-      "input box stays disabled after the first message" in _sv)
-# Blocking replies use Content-Length instead, which is the other valid way to end a body.
-check("blocking replies declare a Content-Length",
-      'send_header("Content-Length"' in inspect.getsource(server._json))
+# Checked against the real server around a fake model (tests/_fakeserver.py): each of the three
+# streams -- OpenAI, Anthropic, and the Responses API that Codex CLI requires -- is requested
+# over HTTP, and the body has to END: the header says close, and the read returns instead of
+# hanging until the timeout. A source-text check for `send_header("Connection", "close")` is what
+# this replaced; it could not tell whether the socket actually closed.
+import socket as _socket
+sys.path.insert(0, os.path.join(ROOT, "tests"))
+from _fakeserver import fake_server, get as _fget, post as _fpost, sse_events as _sse   # noqa: E402
+_streams = {
+    "/v1/chat/completions": {"messages": [{"role": "user", "content": "hi"}], "stream": True, "max_tokens": 3},
+    "/v1/messages": {"model": "m", "max_tokens": 3, "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+    "/v1/responses": {"model": "m", "input": "hi", "stream": True, "max_output_tokens": 3},
+}
+_ends = {"/v1/chat/completions": lambda ev: ev and ev[-1] == "DONE",
+         "/v1/messages": lambda ev: any(isinstance(e, dict) and e.get("type") == "message_stop" for e in ev),
+         "/v1/responses": lambda ev: any(isinstance(e, dict) and e.get("type") in ("response.completed", "response.incomplete")
+                                         for e in ev)}
+with fake_server() as (_url, _state, _fs):
+    for _path, _body in _streams.items():
+        try:
+            _t0 = time.perf_counter()
+            _st, _payload, _h = _fpost(_url, _path, _body, raw=True, timeout=5)
+            _took = time.perf_counter() - _t0
+            _ev = _sse(_payload)
+            check(f"{_path} streams as SSE, says Connection: close, and the body actually ends",
+                  _st == 200 and "text/event-stream" in _h.get("Content-Type", "")
+                  and _h.get("Connection", "").lower() == "close" and _took < 4 and _ends[_path](_ev),
+                  f"status {_st} type {_h.get('Content-Type')} conn {_h.get('Connection')} {_took:.2f}s "
+                  f"last {_ev[-1] if _ev else None}")
+        except _socket.timeout:
+            check(f"{_path} streams as SSE, says Connection: close, and the body actually ends", False,
+                  "the read hung: the body never ended")
+    # Blocking replies end the other valid way, with a Content-Length that matches the body.
+    _st, _payload, _h = _fpost(_url, "/v1/chat/completions",
+                               {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 3}, raw=True)
+    check("blocking replies declare a Content-Length that matches the body",
+          _st == 200 and _h.get("Content-Length") == str(len(_payload)), f"{_h.get('Content-Length')} vs {len(_payload)}")
 
 print("\n" + "=" * 84)
 print("4c. A MODEL MUST NOT WRITE BOTH SIDES OF THE CONVERSATION")
@@ -243,8 +262,7 @@ check("the stops are applied only when the model has no template of its own",
       "if not self.has_chat_template" in _st)
 check("a model's ability to chat is detected once, at load",
       hasattr(session.Session, "_detect_chat_template"))
-check("...and reported, because a fabricated dialogue is indistinguishable from a bad answer",
-      '"chat_template": self.has_chat_template' in inspect.getsource(session.Session.stats))
+# ...and reported: `chat_template` is asserted on a live server's /health in tests/test_product.py.
 _ui = open(os.path.join(ROOT, "bigrig_engine/webui.html")).read()
 # Greps against source text kept failing on line wrapping and spacing rather than on behaviour --
 # five times in this suite's history. Match against normalised copies instead: _uic with all
@@ -393,14 +411,34 @@ print("\n" + "=" * 84)
 print("4z. AN INSTALLED PACKAGE MUST NOT STORE 60 GB OF WEIGHTS IN site-packages")
 print("=" * 84)
 import bigrig_engine as _pkg                                            # noqa: E402
-_src = inspect.getsource(_pkg.home)
-check("BIGRIG_HOME wins outright", "BIGRIG_HOME" in _src)
+# home() is driven, not read: the three cases each get an environment that selects them.
 # Deriving from __file__ unconditionally put models inside site-packages, where reinstalling the
 # package or deleting the virtualenv destroys them. Verified in a clean install before publishing.
+_prev = os.environ.get("BIGRIG_HOME")
+os.environ["BIGRIG_HOME"] = "~/some-external-disk"
+check("BIGRIG_HOME wins outright, and a ~ in it is expanded",
+      _pkg.home() == os.path.expanduser("~/some-external-disk"), _pkg.home())
+if _prev is None:
+    del os.environ["BIGRIG_HOME"]
+else:
+    os.environ["BIGRIG_HOME"] = _prev
 check("a source checkout is recognised by its pyproject.toml, not assumed",
-      "pyproject.toml" in _src)
+      os.path.exists(os.path.join(ROOT_DIR, "pyproject.toml")) and _pkg.home() == ROOT_DIR)
+# The installed case: hide the pyproject marker from home() by pointing the package's idea of its
+# root at a directory without one.
+import tempfile as _tf
+with _tf.TemporaryDirectory() as _td:
+    _real = os.path.dirname
+    _fake_pkg_dir = os.path.join(_td, "site-packages", "bigrig_engine")
+    os.makedirs(_fake_pkg_dir)
+    _saved_file = _pkg.__file__
+    try:
+        _pkg.__file__ = os.path.join(_fake_pkg_dir, "__init__.py")
+        _installed = _pkg.home()
+    finally:
+        _pkg.__file__ = _saved_file
 check("...and anything else falls back to a real user directory",
-      "~/.bigrig" in _src)
+      _installed == os.path.expanduser("~/.bigrig"), _installed)
 check("running in this checkout resolves to this checkout",
       _pkg.home() == ROOT_DIR, f"{_pkg.home()} vs {ROOT_DIR}")
 _prev = os.environ.get("BIGRIG_HOME")
@@ -498,8 +536,18 @@ check("...and accepts what fits",
 check("...and falls back to the fixed ceiling when no session is available",
       _raises(lambda: anth.parse({"messages": [{"role": "user", "content": "x"}],
                                   "max_tokens": anth.MAX_TOKENS_LIMIT + 1}), anth.BadRequest))
-check("no hardcoded 32768 is left deciding anything on either path",
-      "32768" not in inspect.getsource(server.make_handler))
+# The ceiling the server enforces is the session's, whatever it is -- checked by giving the fake
+# a ceiling no constant would guess and asking for more than it.
+from _fakeserver import FakeSession as _FS3                                        # noqa: E402
+with fake_server(_FS3(max_completion_tokens=777)) as (_url, _state, _fs):
+    _st, _h, _ = _fget(_url, "/health")
+    _fpost(_url, "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 100000})
+    _st2, _b2, _ = _fpost(_url, "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 100000})
+    _st3, _b3, _ = _fpost(_url, "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 777})
+    check("no hardcoded 32768 is left deciding anything on either path",
+          _h.get("max_completion_tokens") == 777 and _st2 == 400 and "777" in json.dumps(_b2)
+          and _st3 == 200 and _fs.calls and _fs.calls[-1]["max_tokens"] == 777,
+          f"health {_h.get('max_completion_tokens')}; over: {_st2} {_b2}; at: {_st3}")
 
 print("\n" + "=" * 84)
 print("4n. THE MEMORY CEILING IS ACTUALLY THE CEILING")
@@ -507,25 +555,38 @@ print("=" * 84)
 # THE GAP: BIGRIG_MEM_GB was read only by src/memguard.py, which the engine never armed. So
 # `BIGRIG_MEM_GB=9 rig serve` planned against whatever the machine had free -- 13.6 GB of a
 # 24 GB Mac -- and stayed under 9 GB only because --residency happened to land there.
+# resolve_budget is called, not read: the environment, the flag, a malformed value, and the
+# ceiling are each driven through the real function.
+_env_before = os.environ.get("BIGRIG_MEM_GB")
+try:
+    os.environ["BIGRIG_MEM_GB"] = "3.5"
+    check("the engine reads the budget from the environment", session.resolve_budget(quiet=True) == 3.5)
+    check("an explicit --memory still wins over the environment", session.resolve_budget(4.0, quiet=True) == 4.0)
+    os.environ["BIGRIG_MEM_GB"] = "lots"
+    _fb = session.resolve_budget(quiet=True)
+    check("a malformed value falls back to what is free rather than crashing the server",
+          isinstance(_fb, float) and 0 < _fb <= session.MAX_ALLOWED_GB, str(_fb))
+    os.environ["BIGRIG_MEM_GB"] = str(session.MAX_ALLOWED_GB * 4)
+    check("...and nothing gets past the ceiling, whichever way it was asked for",
+          session.resolve_budget(quiet=True) == session.MAX_ALLOWED_GB
+          and session.resolve_budget(session.MAX_ALLOWED_GB * 4, quiet=True) == session.MAX_ALLOWED_GB)
+finally:
+    if _env_before is None:
+        os.environ.pop("BIGRIG_MEM_GB", None)
+    else:
+        os.environ["BIGRIG_MEM_GB"] = _env_before
+# One place answers it: the Session's budget IS resolve_budget's answer, and it is what the
+# planner was handed. Checked on a live session further down where one is available; here the
+# doctor and serve paths share the function by identity.
+import bigrig_engine.cli as _cli                                                    # noqa: E402
 _init = inspect.getsource(session.Session.__init__)
-check("the engine reads the budget from the environment",
-      'os.environ.get("BIGRIG_MEM_GB")' in inspect.getsource(session.resolve_budget))
-check("an explicit --memory still wins over the environment",
-      session.resolve_budget(4.0) == 4.0)
-check("a malformed value falls back rather than crashing the server",
-      "except ValueError" in inspect.getsource(session.resolve_budget))
 check("...and one place answers it, so no two commands can disagree",
-      "resolve_budget" in _init)
-check("the resolved budget is what capacity planning is given",
-      _init.index("budget_gb = self.budget_gb")
-      < _init.index("autoconfig.choose_capacity(man, budget_gb=budget_gb"))
-check("...and the strategy choice too",
-      _init.index("budget_gb = self.budget_gb")
-      < _init.index("man, budget_gb=budget_gb"))
-check("the server reports the budget and what it is using of it",
-      all(k in inspect.getsource(session.Session.stats)
-          for k in ('"budget_gb"', '"footprint_gb"', '"max_completion_tokens"',
-                    '"token_limit_reason"')))
+      "resolve_budget(" in inspect.getsource(_cli.cmd_doctor) and "resolve_budget(" in _init)
+with fake_server() as (_url, _state, _fs):
+    _st, _h, _ = _fget(_url, "/health")
+    check("the server reports the budget and what it is using of it",
+          all(k in _h for k in ("budget_gb", "footprint_gb", "max_completion_tokens", "token_limit_reason")),
+          str(sorted(k for k in _h if "budget" in k or "footprint" in k or "token" in k)))
 check("the page builds its menu from the ceiling, not from the context window",
       "health.max_completion_tokens" in _uic and "Math.min(ctx,32768)" not in _uic)
 check("...and says which limit is in force", "Capped by memory, not by the model" in _uip)
@@ -624,8 +685,8 @@ check("an explicit residency that leaves no room says so out loud",
 check("...and says what to do about it", "lower --residency, or raise the budget" in _init)
 check("...only when it is actually the binding problem",
       'self.token_limit_reason == "memory"' in _init and "MIN_REPLY_TOKENS" in _init)
-check("the reserve is reported, so the arithmetic can be checked from outside",
-      '"serving_reserve_gb"' in inspect.getsource(session.Session.stats))
+# The reserve is reported so the arithmetic can be checked from outside: `serving_reserve_gb` is
+# asserted on a live server's /health in tests/test_product.py.
 
 print("\n" + "=" * 84)
 print("4p. PREFILL IS THE WIDEST PASS, SO IT IS THE ONE THAT HAS TO BE BOUNDED")
@@ -834,15 +895,46 @@ check("...and a hostile one cannot make it unbounded",
       len(_S2({"bigrig_id": "z" * 5000})["_rid"]) == 64)
 check("...and a nonsense type is dropped rather than crashing",
       _S2({"bigrig_id": {"a": 1}})["_rid"] == "")
-# _rid must never reach the generator, which has no such parameter.
-_ro = inspect.getsource(server._State._run_one)
-check("internal fields are stripped before generation is called",
-      'not k.startswith("_")' in _ro)
-check("...on the batched path too",
-      'not k.startswith("_")' in inspect.getsource(server._State._run_batch))
-check("stopping by name is a route", '"/v1/cancel"' in inspect.getsource(server.make_handler))
-check("...that refuses a request with no id",
-      "`id` is required" in inspect.getsource(server.make_handler))
+# _rid must never reach the generator, which has no such parameter. Checked by serving a request
+# through the real handler and pump into a fake session that records exactly what it was called
+# with -- an underscore field arriving there would have been a TypeError on a real Session.
+from _fakeserver import FakeSession as _FakeSession                                 # noqa: E402
+with fake_server(_FakeSession(reply=" ".join(["word"] * 40), delay=0.05)) as (_url, _state, _fs):
+    _st, _b, _ = _fpost(_url, "/v1/chat/completions",
+                        {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 2, "bigrig_id": "abc"})
+    check("internal fields are stripped before generation is called",
+          _st == 200 and _fs.calls and not any(k.startswith("_") for k in _fs.calls[-1]),
+          str(sorted(_fs.calls[-1]) if _fs.calls else _b))
+    check("...and the request's own fields still arrive", _fs.calls and _fs.calls[-1]["max_tokens"] == 2)
+    # Stopping by name: a slow streamed reply, cancelled from a second connection while it runs.
+    import threading as _thr
+    _got = {}
+
+    def _slow():
+        _got["st"], _got["payload"], _ = _fpost(_url, "/v1/chat/completions",
+                                                {"messages": [{"role": "user", "content": "go"}], "stream": True,
+                                                 "max_tokens": 40, "bigrig_id": "stop-me"}, raw=True, timeout=10)
+    _t = _thr.Thread(target=_slow); _t.start()
+    for _ in range(100):                                    # wait until it is actually in flight
+        with _state.count_lock:
+            _inflight = "stop-me" in _state.by_id
+        if _inflight:
+            break
+        time.sleep(0.01)
+    _t0 = time.perf_counter()
+    _st, _b, _ = _fpost(_url, "/v1/cancel", {"id": "stop-me"})
+    _t.join(timeout=5)
+    _ev = _sse(_got.get("payload", b""))
+    _n_text = sum(1 for e in _ev if isinstance(e, dict) and e.get("choices"))
+    check("stopping by name is a route that finds the request in flight",
+          _st == 200 and _b.get("cancelled") is True and _b.get("id") == "stop-me", str(_b))
+    check("...and the reply then ends early, well short of what was asked for",
+          not _t.is_alive() and 0 < _n_text < 40 and time.perf_counter() - _t0 < 3,
+          f"{_n_text} text frames, alive={_t.is_alive()}")
+    _st, _b, _ = _fpost(_url, "/v1/cancel", {"id": "nobody"})
+    check("...an unknown id is reported as not found, not as an error", _st == 200 and _b.get("cancelled") is False, str(_b))
+    _st, _b, _ = _fpost(_url, "/v1/cancel", {"x": 1})
+    check("...that refuses a request with no id", _st == 400 and "id" in json.dumps(_b), str(_b))
 
 check("the page sends an id it can later stop by", "bigrig_id:reqId" in _uic)
 check("...and stops by name BEFORE closing the socket, not instead of it",
@@ -956,13 +1048,8 @@ check("...because the checkpoint used to measure this is refused by the strict o
       "tie_word_embeddings" in _ld)
 check("whether a token came from the draft is reported per token",
       '"from_draft"' in inspect.getsource(session.Session.stream_text))
-check("...and the acceptance rate is reported, so a bad draft is distinguishable "
-      "from a bad idea",
-      '"draft_acceptance"' in inspect.getsource(session.Session.stats))
-check("acceptance is a share of tokens actually produced",
-      "self.draft_accepted / self.total_tokens" in inspect.getsource(session.Session.stats))
-check("no draft means no draft fields pretending to be measurements",
-      '"draft": self.draft_name or None' in inspect.getsource(session.Session.stats))
+# The acceptance rate (`draft_acceptance`) and `draft` are asserted on a live server's /health in
+# tests/test_product.py: absent draft -> null fields, never a number pretending to be measured.
 check("the flag exists on the commands that generate",
       '"--draft"' in open(os.path.join(ROOT, "bigrig_engine/cli.py")).read())
 check("...and says the draft is paid for out of the same budget",
@@ -1000,19 +1087,29 @@ check("...and the hold is computed on the RAW text, before the rewrite",
 check("...and only for models that emit these markers at all",
       "if self._harmony:" in _stx and "full = raw" in _stx)
 
-check("the engine can report how far into the prompt it is",
-      "on_prefill" in inspect.getsource(session.Session.stream_text))
-check("...through the callback mlx_lm provides, not a guess",
-      '"prompt_progress_callback"' in inspect.getsource(session.Session.stream_text))
-_ro = inspect.getsource(server._State._run_one)
-check("the server forwards that progress", 'j.out.put_nowait(("prefill"' in _ro)
-check("...without ever blocking the one thread allowed to touch MLX",
-      "put_nowait" in _ro and "except queue.Full" in _ro)
-check("...and stops reporting to a client that has gone", "j.cancelled.is_set()" in _ro)
-_sv = inspect.getsource(server.make_handler)
-check("progress is sent as its own frame, not as generated text",
-      '"prefill_done": info["prefill_done"]' in _sv)
-check("...and is never mistaken for a token", 'if c is None and "prefill_total" in info' in _sv)
+# The engine reports prefill progress through `on_prefill`, which stream_text wires to mlx_lm's
+# prompt_progress_callback (tests/test_snapshot.py drives that end with a real model). Here the
+# server side: a fake session calls the callback the same way, and the OpenAI stream must carry
+# the progress as its own frames -- never as text a client would print.
+check("stream_text takes the progress callback",
+      "on_prefill" in inspect.signature(session.Session.stream_text).parameters)
+with fake_server(_FakeSession(reply="alpha beta gamma delta", delay=0.01)) as (_url, _state, _fs):
+    _st, _payload, _h = _fpost(_url, "/v1/chat/completions",
+                               {"messages": [{"role": "user", "content": "one two three four five six"}],
+                                "stream": True, "max_tokens": 4}, raw=True)
+    _ev = [e for e in _sse(_payload) if isinstance(e, dict)]
+    _prog = [e for e in _ev if "prefill_done" in (e.get("bigrig") or {})]
+    _text = "".join((e["choices"][0]["delta"] or {}).get("content") or "" for e in _ev if e.get("choices"))
+    check("the server forwards prefill progress as its own frames", len(_prog) >= 2, f"{len(_prog)} frames")
+    check("...each carrying done and total, climbing to the whole prompt",
+          all(set(e["bigrig"]) >= {"prefill_done", "prefill_total"} for e in _prog)
+          and _prog[-1]["bigrig"]["prefill_done"] == _prog[-1]["bigrig"]["prefill_total"] > 0,
+          str([e["bigrig"] for e in _prog]))
+    check("...and never as generated text: the reply is exactly the model's words",
+          _text == "alpha beta gamma delta" and all(not (e["choices"][0]["delta"] or {}).get("content") for e in _prog),
+          repr(_text))
+    check("...before any text arrives", _ev.index(_prog[0]) < next(i for i, e in enumerate(_ev)
+                                                                     if (e["choices"][0]["delta"] or {}).get("content")))
 check("the page shows what it is waiting for", "reading your message" in _uip)
 check("...with the elapsed time, so a slow model reads as slow and not as stuck",
       "working · ${s}s" in _ui or "working \u00b7 ${s}s" in _ui)
@@ -1028,8 +1125,14 @@ check("continuing leaves the assistant turn OPEN instead of starting a new one",
 check("...and it is one or the other, never both",
       '"continue_final_message" if continue_last else "add_generation_prompt"' in _pr)
 check("the reason is recorded", "carries on the sentence it was cut off in" in _pr)
-check("the flag reaches the engine from the request",
-      '"continue_last"' in inspect.getsource(server.make_handler))
+with fake_server() as (_url, _state, _fs):
+    _hist = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "The answer is"}]
+    _fpost(_url, "/v1/chat/completions", {"messages": _hist, "max_tokens": 2, "continue_last": True})
+    _fpost(_url, "/v1/chat/completions", {"messages": _hist, "max_tokens": 2})
+    check("the flag reaches the engine from the request, and is off when absent",
+          len(_fs.calls) == 2 and _fs.calls[0].get("continue_last") is True
+          and _fs.calls[1].get("continue_last") is False,
+          str([c.get("continue_last") for c in _fs.calls]))
 check("the button only appears when the reply actually hit the limit",
       'lastCut = finish==="length"' in _ui and "if(lastCut){" in _ui)
 check("continuing appends to the same reply rather than starting a new one",
@@ -1188,10 +1291,21 @@ check("replies cut off at the limit are counted", _a["cut_off"] == 1)
 check("totals add up", _a["tokens"] == 60 and _a["seconds"] == 8.0 and _a["flagged"] == 1, str(_a))
 check("a single reply is its own median",
       server._aggregate(_FakeState(_rows[:1]))["median_tok_s"] == 5.0)
-check("/health carries the rate so the chat page can estimate time",
-      '"median_tok_s": agg.get("median_tok_s")' in inspect.getsource(server.make_handler))
-check("...from the same helper /stats uses, so the two can never disagree",
-      inspect.getsource(server.make_handler).count("_aggregate(state)") == 2)
+# Served, not read: after real replies through the fake, /health and /stats must both carry the
+# rate and agree on it, and the server's own counters must be there.
+with fake_server() as (_url, _state, _fs):
+    for _ in range(3):
+        _fpost(_url, "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 3})
+    _, _h, _ = _fget(_url, "/health")
+    _, _s, _ = _fget(_url, "/stats")
+    check("/health carries the rate so the chat page can estimate time",
+          isinstance(_h.get("median_tok_s"), (int, float)) and _h["median_tok_s"] > 0, str(_h.get("median_tok_s")))
+    check("...from the same helper /stats uses, so the two can never disagree",
+          _h.get("median_tok_s") == (_s.get("aggregate") or _s).get("median_tok_s"),
+          f"{_h.get('median_tok_s')} vs {(_s.get('aggregate') or _s).get('median_tok_s')}")
+    check("the server's own counters are served",
+          all(k in _h for k in ("uptime_s", "queue_depth", "requests_served")) and _h["requests_served"] == 3,
+          str({k: _h.get(k) for k in ("uptime_s", "queue_depth", "requests_served")}))
 check("the page no longer patches the rate in behind refresh's back",
       "health.median_tok_s = a.median_tok_s" not in _ui)
 check("the estimate is drawn from that field", "health.median_tok_s" in _uic)
@@ -1203,12 +1317,8 @@ for f in ("uptime_s", "requests_served", "queue_depth", "load_seconds",
           "flagged_tokens", "flagged_share"):
     check(f"{f} is shown only when the server supplies it",
           f"H.{f}!=null" in _uic or f"H.{f}||0" in _uic, f)
-check("the server's own counters are served",
-      all(k in inspect.getsource(server.make_handler)
-          for k in ("uptime_s", "queue_depth", "requests_served")))
-check("...and the model's counters come from the session",
-      all(k in inspect.getsource(session.Session.stats)
-          for k in ('"load_seconds"', '"flagged_tokens"', '"flagged_share"')))
+# ...and the model's counters (`load_seconds`, `flagged_tokens`, `flagged_share`) come from the
+# session: asserted on a live server's /health in tests/test_product.py.
 
 print("\n" + "=" * 84)
 print("4g. THE ANALYTICS VIEW PLOTS MEASUREMENTS, NOT A SNAPSHOT")
@@ -1381,9 +1491,22 @@ check("it works in dark mode as well as light",
 check("...and every colour token is defined on bare :root, not only inside a media query",
       set(re.findall(r"(--[a-z0-9]+):", ui.split("@media")[0]))
       >= set(re.findall(r"(--[a-z0-9]+):", ui)) - {"--x"})
-check("the page is served from GET /", '"/"' in inspect.getsource(server.make_handler))
-check("...and a missing file gives an error, not a traceback",
-      "web interface is missing" in inspect.getsource(server.make_handler))
+with fake_server() as (_url, _state, _fs):
+    _st, _page, _h = _fget(_url, "/", raw=True)
+    check("the page is served from GET /",
+          _st == 200 and "text/html" in _h.get("Content-Type", "") and b"<title>" in _page and len(_page) > 10_000,
+          f"{_st} {_h.get('Content-Type')} {len(_page)} bytes")
+    # A missing file: point the server's idea of its own directory somewhere empty for one request.
+    import tempfile as _tf2
+    with _tf2.TemporaryDirectory() as _td:
+        _saved = server.__file__
+        try:
+            server.__file__ = os.path.join(_td, "server.py")
+            _st, _err, _ = _fget(_url, "/")
+        finally:
+            server.__file__ = _saved
+    check("...and a missing file gives an error, not a traceback",
+          _st == 500 and "missing" in json.dumps(_err), f"{_st} {_err}")
 check("the server ships the page as package data",
       'bigrig_engine = ["webui.html"]' in open(
           os.path.join(ROOT, "pyproject.toml")).read())

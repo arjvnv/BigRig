@@ -742,6 +742,21 @@ if up:
     check("used + remaining equals the ceiling on every turn",
           all(h["context_used"] + h["context_remaining"] == h["max_completion_tokens"] for h in (hc1, hc2)))
 
+    # ---------------------------------------------------------------- what a live session reports
+    # These used to be source-text checks on Session.stats; a live server is the real thing.
+    _want = {"chat_template": bool, "serving_reserve_gb": (int, float), "load_seconds": (int, float),
+             "flagged_tokens": int, "flagged_share": (int, float), "draft_acceptance": (int, float, type(None)),
+             "draft": (str, type(None)), "supports_tools": bool, "max_completion_tokens": int,
+             "token_limit_reason": str, "budget_gb": (int, float), "footprint_gb": (int, float)}
+    _missing = [k for k, t in _want.items() if not isinstance(hc2.get(k, object()), t)]
+    check("a live session reports every field the page and the docs rely on, with the right type",
+          not _missing, str({k: hc2.get(k) for k in _missing}))
+    check("no draft means no draft fields pretending to be measurements",
+          hc2.get("draft") is None and hc2.get("draft_acceptance") is None,
+          f"{hc2.get('draft')!r} / {hc2.get('draft_acceptance')!r}")
+    check("the reserve is reported so the arithmetic can be checked from outside",
+          0.5 <= float(hc2.get("serving_reserve_gb") or 0) <= 6.0, str(hc2.get("serving_reserve_gb")))
+
     # ---------------------------------------------------------------- conversations survive a restart, live
     # The server writes the conversation cache to disk on its idle tick (persist.py). After the
     # chats above, files must appear without any request asking for them, and a restarted server
