@@ -859,9 +859,12 @@ if os.path.isdir(os.path.join(ROOT, "models", "OLMoE-1B-7B-0125-4bit")):
     _saved = [f for dp, _, fs in os.walk(_pdir) for f in fs if f.endswith(".safetensors")]
     check("the saved conversations are still on disk after the stop", bool(_saved), str(_saved))
     LOG2 = LOG + ".2"
+    from bigrig_engine import embed as _embed
+    _with_emb = _embed.is_local(_embed.DEFAULT_REPO)          # never a download from a test
     proc = subprocess.Popen(
         [os.path.join(ROOT, ".venv/bin/python"), "-m", "bigrig_engine.cli", "serve",
-         "OLMoE-1B-7B-0125-4bit", "--force-stream", "--residency", "0.5", "--port", str(PORT)],
+         "OLMoE-1B-7B-0125-4bit", "--force-stream", "--residency", "0.5", "--port", str(PORT)]
+        + (["--embeddings"] if _with_emb else []),
         stdout=open(LOG2, "w"), stderr=subprocess.STDOUT, cwd=ROOT)
     _h = None
     for _ in range(600):
@@ -876,6 +879,26 @@ if os.path.isdir(os.path.join(ROOT, "models", "OLMoE-1B-7B-0125-4bit")):
           _h is not None and int(_h.get("resumed_conversations") or 0) >= 1, str(_h and _h.get("resumed_conversations")))
     _log2 = open(LOG2).read()
     check("...and says so in its banner", "resumed from the last run" in _log2, _log2[-400:])
+    if _with_emb:
+        # ------------------------------------------------------------ embeddings, beside a real model
+        import base64 as _b64
+        _st, _e = post("/v1/embeddings", {"input": ["The cat sits on the mat.", "A cat is sitting on a mat.", "Tax law."]}, timeout=60)
+        _v = [d["embedding"] for d in _e.get("data", [])] if _st == 200 else []
+        _dot = lambda a, b: sum(x * y for x, y in zip(a, b))                   # noqa: E731
+        check("/v1/embeddings answers beside the chat model, with the encoder's vectors",
+              _st == 200 and len(_v) == 3 and len(_v[0]) == 384 and _dot(_v[0], _v[1]) > 0.9 and _dot(_v[0], _v[2]) < 0.5,
+              f"{_st} {str(_e)[:200]}")
+        _st, _e64 = post("/v1/embeddings", {"input": "hello", "encoding_format": "base64"}, timeout=60)
+        check("...in base64 too", _st == 200 and len(_b64.b64decode(_e64["data"][0]["embedding"])) == 384 * 4)
+        check("the encoder's memory is charged to the ceiling before the pool was planned",
+              (_h.get("reserved_gb") or 0) > 0.1 and (_h.get("embeddings") or {}).get("dimensions") == 384,
+              f"reserved {_h.get('reserved_gb')} embeddings {_h.get('embeddings')}")
+        _, _m = get("/v1/models")
+        check("...and /v1/models lists it", any(x.get("bigrig", {}).get("kind") == "embedding" for x in _m.get("data", [])))
+        _st, _c = post("/v1/chat/completions", {"messages": [{"role": "user", "content": "Name a colour."}], "max_tokens": 8}, timeout=120)
+        check("a chat reply still comes through the same server afterwards", _st == 200 and _c["choices"][0]["message"]["content"])
+    else:
+        print("  SKIPPED - the default embedding model is not downloaded; no download from a test")
     proc.terminate()
     try:
         proc.wait(timeout=15)

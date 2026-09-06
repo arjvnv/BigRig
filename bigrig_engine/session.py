@@ -820,6 +820,7 @@ class Session:
                  persist: bool = True,
                  kv_quant_start: int | None = None,
                  mtp: str | None = None, mtp_bits: int | None = 4, announce: bool = True,
+                 reserved_gb: float = 0.0,
                  stream_embedding: bool = True):
         # Everything this session was built from, so it can be rebuilt with one setting changed
         # without the caller having to remember the other twenty.
@@ -829,7 +830,7 @@ class Session:
             "force_stream": force_stream, "min_bits": min_bits, "preference": preference,
             "interactive": False, "remember": remember, "warm": warm,
             "full_layers": full_layers, "no_full_layers": no_full_layers,
-            "draft": draft, "draft_tokens": draft_tokens,
+            "draft": draft, "draft_tokens": draft_tokens, "reserved_gb": reserved_gb,
             "prefetch_width": prefetch_width, "reroute": reroute, "nocache": nocache,
             "prompt_cache_gb": prompt_cache_gb, "kv_bits": kv_bits, "persist": persist,
             "kv_quant_start": kv_quant_start, "mtp": mtp, "mtp_bits": mtp_bits,
@@ -885,6 +886,11 @@ class Session:
             self.draft_gb = _dir_gb(os.path.expanduser(draft))
             budget_gb = max(budget_gb * 0.5, budget_gb - self.draft_gb)
             self.draft_name = os.path.basename(os.path.expanduser(draft).rstrip("/"))
+        # ANYTHING ELSE THAT LIVES BESIDE THE POOL -- the embedding encoder `--embeddings` loads
+        # -- is charged the same way, before the pool is planned, so the ceiling still holds.
+        self.reserved_gb = max(0.0, float(reserved_gb or 0.0))
+        if self.reserved_gb:
+            budget_gb = max(budget_gb * 0.5, budget_gb - self.reserved_gb)
         # THE MODEL'S OWN NEXT-TOKEN HEAD, CHARGED TO THE BUDGET BEFORE THE POOL IS PLANNED.
         #     Like a draft model, it lives beside the pool and the ceiling still has to hold.
         #     With its experts at 4-bit it occupies about a third of the file (measured 0.55 GB
@@ -2633,6 +2639,7 @@ class Session:
                 if self.mtp_stats is not None else {}),
              "draft": self.draft_name or None,
              "draft_gb": round(self.draft_gb, 2) if self.draft_name else None,
+             "reserved_gb": round(self.reserved_gb, 3) if getattr(self, "reserved_gb", 0.0) else None,
              "draft_tokens": self.draft_tokens if self.draft_name else None,
              "draft_accepted": self.draft_accepted if self.draft_name else None,
              "draft_acceptance": (round(self.draft_accepted / self.total_tokens, 4)

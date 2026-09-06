@@ -168,6 +168,7 @@ class _State:
         # _State built directly by a test is not accidentally wide open.
         self.hot_warm: dict = {}
         self.bind_host = "127.0.0.1"
+        self.embedder = None                 # embed.Embedder when `--embeddings` was given
         self.loopback = True
         self.origins: frozenset = frozenset()
         # GIVING MEMORY BACK. The pool is ordinary anonymous memory -- measured, not assumed:
@@ -467,6 +468,18 @@ class _State:
             #     the GPU at 70% doing entirely wasted work.
             if j.cancelled.is_set():
                 self._finish(j, ("done", None, None))
+                return
+            if "_embed" in j.kw:
+                # An embedding request. Same thread, same queue, same one-at-a-time rule: the
+                # encoder is MLX work too, and interleaving it with a reply would have both
+                # touching the device from the pump at once.
+                try:
+                    vecs, n_tok, cut = self.embedder.embed(list(j.kw["_embed"]))
+                    self._finish(j, ("embed", (vecs, n_tok, cut), None))
+                except Exception as e:                               # noqa: BLE001
+                    self._finish(j, ("error", e, None))
+                with self.count_lock:
+                    self.served += 1
                 return
             kw = {k: v for k, v in j.kw.items() if not k.startswith("_")}
 
@@ -774,7 +787,11 @@ def make_handler(state: _State):
                     "shrink_log": list(state.shrink_log),
                     "page_cache_warm": state.warm,
                     "median_tok_s": agg.get("median_tok_s"),
-                    "median_ttft": agg.get("median_ttft"), **s})
+                    "median_ttft": agg.get("median_ttft"),
+                    "embeddings": ({"model": state.embedder.name, "dimensions": state.embedder.dimensions,
+                                    "max_tokens": state.embedder.max_tokens,
+                                    "gb": round(state.embedder.gb, 3)} if state.embedder else None),
+                    **s})
             if path in ("/stats", "/v1/stats") and state.session is None:
                 return _json(self, 503, {"status": "reloading"})
             if path in ("/stats", "/v1/stats"):
@@ -795,9 +812,14 @@ def make_handler(state: _State):
                     seq = state.event_seq
                 return _json(self, 200, {"events": evs, "seq": seq})
             if self.path.rstrip("/") == "/v1/models":
-                return _json(self, 200, {"object": "list", "data": [
-                    {"id": state.session.name, "object": "model",
-                     "created": int(state.started), "owned_by": "bigrig"}]})
+                models = [{"id": state.session.name, "object": "model",
+                           "created": int(state.started), "owned_by": "bigrig"}]
+                if state.embedder is not None:
+                    models.append({"id": state.embedder.name, "object": "model",
+                                   "created": int(state.started), "owned_by": "bigrig",
+                                   "bigrig": {"kind": "embedding", "dimensions": state.embedder.dimensions,
+                                              "max_tokens": state.embedder.max_tokens}})
+                return _json(self, 200, {"object": "list", "data": models})
             return _json(self, 404, {"error": {"message": f"no route {self.path}",
                                                "type": "invalid_request_error"}})
 
@@ -813,7 +835,7 @@ def make_handler(state: _State):
                     "type": "server_error"}})
             if p not in ("/v1/chat/completions", "/v1/completions", "/v1/messages",
                          "/v1/messages/count_tokens", "/v1/cancel", "/v1/config",
-                         "/v1/responses", "/v1/debug/pressure"):
+                         "/v1/responses", "/v1/embeddings", "/v1/debug/pressure"):
                 return _json(self, 404, {"error": {"message": f"no route {self.path}",
                                                    "type": "invalid_request_error"}})
             try:
@@ -857,6 +879,9 @@ def make_handler(state: _State):
                             setattr(state.memctl, k, max(0.0, float(body[k])))
                 return _json(self, 200, {"ok": True, "pressure": state.pressure,
                                          "forced": True, "polls": state.pressure_polls})
+
+            if p == "/v1/embeddings":
+                return self._embeddings(body)
 
             if p == "/v1/config":
                 # Changing residency means rebuilding the pool, which means touching MLX, which
@@ -1139,6 +1164,47 @@ def make_handler(state: _State):
             finally:
                 job.cancelled.set()
                 state.forget(rid)
+
+        # ---------------------------------------------------------------- embeddings
+        def _embeddings(self, body):
+            """OpenAI's /v1/embeddings, served by the encoder loaded with `--embeddings`."""
+            from . import embed as _embed
+            if state.embedder is None:
+                return _json(self, 404, {"error": {
+                    "message": "embeddings are not enabled on this server; start it with "
+                               f"`bigrig serve <model> --embeddings` (default encoder "
+                               f"{_embed.DEFAULT_REPO}, 133 MB) to serve /v1/embeddings",
+                    "type": "invalid_request_error"}})
+            try:
+                texts = _embed.parse_input(body)
+            except ValueError as e:
+                return self._bad(str(e))
+            job = state.submit({"_embed": texts})
+            try:
+                deadline = time.monotonic() + GET_TIMEOUT_S
+                while True:
+                    try:
+                        kind, a, _b = job.out.get(timeout=CLIENT_POLL_S)
+                    except queue.Empty:
+                        if self._client_gone():
+                            job.cancelled.set()
+                            return
+                        if time.monotonic() >= deadline:
+                            return _json(self, 504, {"error": {"message": "the embedding did not "
+                                                              "finish in time", "type": "server_error"}})
+                        continue
+                    if kind == "embed":
+                        vecs, n_tok, cut = a
+                        return _json(self, 200, _embed.response(
+                            vecs, state.embedder.name, n_tok, cut,
+                            encoding_format=body.get("encoding_format", "float"),
+                            dimensions=body.get("dimensions")))
+                    if kind == "done":                                # cancelled before it ran
+                        return
+                    return _json(self, 500, {"error": {"message": f"embedding failed: {a}",
+                                                       "type": "server_error"}})
+            finally:
+                job.cancelled.set()
 
         # ---------------------------------------------------------------- anthropic
         def _anthropic(self, body, count_only=False):
@@ -1741,9 +1807,10 @@ def _speed_verdict(state, s: dict, agg: dict) -> dict:
 
 def serve(session, host: str = "127.0.0.1", port: int = 8080, verbose: bool = True,
           batch: int = 1, release_memory: bool = True, reclaim_memory: bool = True,
-          warm_cache: bool = True, cors_origins=()):
+          warm_cache: bool = True, cors_origins=(), embedder=None):
     import mlx_lm.generate          # noqa: F401  -- create the thread-local stream HERE
     state = _State(session)
+    state.embedder = embedder
     state.bind_host = host.strip("[]").lower()
     state.loopback = state.bind_host in ("127.0.0.1", "localhost", "::1")
     state.origins = allowed_origins(state.bind_host, port, cors_origins)

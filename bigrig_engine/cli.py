@@ -615,6 +615,7 @@ def _session(a):
                 budget_gb=getattr(a, "memory", None), kv_bits=getattr(a, "kv_bits", None),
                 kv_quant_start=getattr(a, "kv_quant_start", None), verbose=True,
                 persist=not getattr(a, "no_persist", False),
+                reserved_gb=getattr(a, "_reserved_gb", 0.0),
                 force_stream=getattr(a, "force_stream", False),
                 min_bits=getattr(a, "min_bits", None),
                 preference=pref, interactive=True,
@@ -1145,6 +1146,15 @@ def cmd_calibrate(a) -> int:
 
 def cmd_serve(a) -> int:
     from .server import serve
+    embedder = None
+    if getattr(a, "embeddings", None):
+        # Loaded FIRST, so its memory is charged to the ceiling before the pool is planned.
+        from . import embed as _embed
+        repo = a.embeddings if isinstance(a.embeddings, str) else _embed.DEFAULT_REPO
+        embedder = _embed.Embedder(_embed.fetch(repo))
+        a._reserved_gb = embedder.gb
+        print(f"  embeddings: {embedder.name}, {embedder.dimensions} dimensions, up to "
+              f"{embedder.max_tokens} tokens, {embedder.gb * 1000:.0f} MB beside the pool", flush=True)
     s = _session(a)          # any consent question is asked HERE, before the port opens
     # A NON-LOOPBACK BIND PUTS AN UNAUTHENTICATED MODEL ON THE NETWORK. Say so, once, loudly.
     # There is no API key in this server; anyone who can reach the port can use the model and
@@ -1158,7 +1168,7 @@ def cmd_serve(a) -> int:
                  release_memory=getattr(a, "release_memory", True),
                  reclaim_memory=getattr(a, "reclaim_memory", True),
                  warm_cache=not getattr(a, "no_warm", False),
-                 cors_origins=tuple(getattr(a, "cors_origin", ()) or ()))
+                 cors_origins=tuple(getattr(a, "cors_origin", ()) or ()), embedder=embedder)
 
 
 # ------------------------------------------------------------------------------ entry point
@@ -1382,6 +1392,11 @@ def build_parser():
                     help="keep the conversation cache in memory only. By default it is also "
                          "written to disk while the server is idle so a restart resumes every "
                          "conversation it held; `bigrig sessions` shows and clears what is kept.")
+    sv.add_argument("--embeddings", nargs="?", const=True, default=None, metavar="REPO",
+                    help="also serve /v1/embeddings with a small sentence encoder, downloaded on "
+                         "first use (default BAAI/bge-small-en-v1.5: 133 MB, 384 dimensions, "
+                         "512 tokens, MIT). Any BERT-shaped sentence-transformers repo works. "
+                         "Its memory is charged to the ceiling before the pool is planned.")
     # ON BY DEFAULT, AND THE DEFAULT IS THE WHOLE POINT.
     #     Off, the failure is not a slow server, it is a dead one: Metal kills the process with
     #     'Insufficient Memory' when something else on the machine wants memory the pool is

@@ -82,6 +82,7 @@ Serves four things on one port:
 - `GET  /` — the web interface
 - `POST /v1/chat/completions`, `/v1/completions` — OpenAI
 - `POST /v1/messages`, `/v1/messages/count_tokens` — Anthropic
+- `POST /v1/embeddings` — OpenAI embeddings, when started with `--embeddings` (see below)
 - `GET  /health` — live residency, miss rate, mode, and whether weights were altered; `context_used` and `context_remaining` say how full the conversation is against the ceiling that binds on this Mac (`max_completion_tokens`), so a client can warn before the next turn has to start over
 
 Requests are served one at a time. One model, one expert pool: two generations at once would
@@ -192,6 +193,29 @@ rig serve <model> --kv-quant-start 16384   # stay full precision for longer befo
 
 `--kv-bits 0` (or `16`) turns compression off. It is a serve-time setting, not per-request: the
 cache is shared across a conversation, so its precision is fixed for the session.
+
+## Embeddings: `--embeddings`
+
+```bash
+rig serve <model> --embeddings                          # BAAI/bge-small-en-v1.5, fetched on first use
+rig serve <model> --embeddings sentence-transformers/all-MiniLM-L6-v2
+```
+
+Retrieval and codebase-indexing tools, and most agent memories, call `/v1/embeddings`; without it
+a server cannot be their backend. `--embeddings` loads a small sentence encoder beside the chat
+model and serves the OpenAI endpoint: `input` as a string or list, `encoding_format` `float` or
+`base64` (what the OpenAI SDK asks for), `dimensions` to cut and re-normalise. Inputs longer than
+the encoder's window are cut to it and the response says how many (`bigrig.truncated_inputs`);
+`usage` counts the tokens actually read.
+
+The default encoder is BAAI/bge-small-en-v1.5 -- MIT, 133 MB, 384 dimensions, 512 tokens. Any
+BERT-shaped sentence-transformers repo with a `tokenizer.json` loads the same way; CLS and mean
+pooling are read from the repo's own pooling config. The encoder is BigRig's own MLX
+implementation, checked against sentence-transformers (PyTorch) on the same texts: every vector
+matches to float32 noise (max element difference 3.6e-7, cosine 1.000000). Its memory is charged to
+the ceiling before the expert pool is planned, so the ceiling still holds; `/health` reports it
+under `embeddings` and `reserved_gb`. Embedding requests share the model's queue with replies --
+one thing on the device at a time.
 
 ## Conversations survive a restart
 

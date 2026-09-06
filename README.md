@@ -66,8 +66,9 @@ any setting, it says that too, before you download 40 GB to find out.
   and the next turn reads only its own new tokens. Your machine, your data directory:
   `bigrig sessions` shows and clears it, `--no-persist` turns it off.
 - **It speaks to the tools you already use.** OpenAI, Anthropic and Responses APIs on one port,
-  a one-command hook into Claude Code and Codex, and a self-contained web interface that makes
-  no external requests.
+  `/v1/embeddings` beside them (`--embeddings`, a 133 MB encoder that matches its PyTorch
+  reference), a one-command hook into Claude Code and Codex, and a self-contained web interface
+  that makes no external requests.
 
 ---
 
