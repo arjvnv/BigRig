@@ -50,6 +50,7 @@ These apply to `run`, `serve` and `launch`:
 | `--no-tune` | — | Skip the one-time first-run speed measurement and use the safe estimate |
 | `--prefetch N` | 0 (off) | Name N experts a layer ahead from the hidden state. Off: measured not to pay (0.84× prose, 0.98× code on Qwen3.6). Needs `bigrig predict <model>` first; `BIGRIG_STAGE=1` copies the named experts to the GPU during the layer's attention |
 | `--no-monitor` | — | Turn off quality monitoring |
+| `--no-persist` | — | `run`/`serve`: keep the conversation cache in memory only; by default it is also written to disk so a restart resumes (see below) |
 | `--threads N` | 8 | Reader threads for expert fetches |
 | `--trust-remote-code` | — | Also download the model's custom Python |
 
@@ -175,6 +176,35 @@ rig serve <model> --kv-quant-start 16384   # stay full precision for longer befo
 
 `--kv-bits 0` (or `16`) turns compression off. It is a serve-time setting, not per-request: the
 cache is shared across a conversation, so its precision is fixed for the session.
+
+## Conversations survive a restart
+
+The conversation cache is what makes a follow-up fast: the state for everything already said is
+kept, so the next turn reads only its own new tokens. It is also written to disk -- while a server
+is idle, and between turns in the terminal, never during a reply -- so a restart, an update or a
+pool rebuild resumes every conversation the last run held. Measured on Qwen3.6: a server started
+fresh answered the third turn of a two-turn conversation from the previous process with all 164
+prior tokens reused and a reply identical to one that never restarted.
+
+What is on disk mirrors what is in memory, no more: the same half-gigabyte budget, the same
+entries, and a conversation the cache lets go is removed from disk at the next flush. A saved
+state is restored only into the configuration that computed it -- the same model files, KV
+precision, serving mode and mlx_lm version; anything else and the files are discarded rather than
+restored into numbers they do not belong to.
+
+The files hold the tokens of your conversations, on your machine, under BigRig's data directory.
+
+```bash
+bigrig sessions                    # what is kept: model, conversations, size, age
+bigrig sessions --clear            # delete all of it (or: --clear <model>)
+rig serve <model> --no-persist     # memory only, nothing written
+```
+
+Models that reason before answering (Qwen3.6, Nemotron) carry state that cannot be rolled back,
+and their templates render a past turn differently from a live one, so their cache used to miss
+on every follow-up. The engine now also keeps the state at the point where the history ends and
+the current turn begins -- exactly what the next turn starts with -- so those models reuse the
+whole prior conversation too (measured: 0 tokens reused before, the entire history after).
 
 ## Structured output: `response_format`
 

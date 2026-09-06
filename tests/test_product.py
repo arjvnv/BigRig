@@ -742,6 +742,22 @@ if up:
     check("used + remaining equals the ceiling on every turn",
           all(h["context_used"] + h["context_remaining"] == h["max_completion_tokens"] for h in (hc1, hc2)))
 
+    # ---------------------------------------------------------------- conversations survive a restart, live
+    # The server writes the conversation cache to disk on its idle tick (persist.py). After the
+    # chats above, files must appear without any request asking for them, and a restarted server
+    # must report it resumed them. The store is the real one; it is cleared at the end.
+    from bigrig_engine import persist as _persist
+    _pdir = _persist.model_dir("OLMoE-1B-7B-0125-4bit")
+    check("health says the cache is being kept", hc2.get("persist") is True, str(hc2.get("persist")))
+    _found = []
+    for _ in range(30):                                 # the idle tick is a 0.2s poll
+        _found = [f for dp, _, fs in os.walk(_pdir) for f in fs if f.endswith(".safetensors")]
+        if _found:
+            break
+        time.sleep(0.1)
+    check("the conversations were written to disk on the idle tick, unasked", bool(_found), str(_found))
+    check("...no half-written file is left behind", not any(f.endswith(".tmp.safetensors") for f in _found))
+
     # ---------------------------------------------------------------- who may drive this server
     # This server has no authentication, so "who is asking" is the whole defence. A wildcard
     # CORS header let any page the user happened to have open POST here and READ the reply.
@@ -808,6 +824,45 @@ try:
     proc.wait(timeout=15)
 except subprocess.TimeoutExpired:
     proc.kill()
+
+print("\n" + "=" * 80); print("A RESTART RESUMES WHAT THE LAST SERVER HELD"); print("=" * 80)
+if os.path.isdir(os.path.join(ROOT, "models", "OLMoE-1B-7B-0125-4bit")):
+    # SIGTERM (what proc.terminate() sends) must be an orderly stop: the log ends with the same
+    # "stopping" line Ctrl-C prints, and the cache was flushed on close.
+    _log = open(LOG).read()
+    check("SIGTERM stopped the server cleanly (Python's default would have skipped teardown)",
+          "stopping" in _log, _log[-300:])
+    _pdir = _persist.model_dir("OLMoE-1B-7B-0125-4bit")
+    _saved = [f for dp, _, fs in os.walk(_pdir) for f in fs if f.endswith(".safetensors")]
+    check("the saved conversations are still on disk after the stop", bool(_saved), str(_saved))
+    LOG2 = LOG + ".2"
+    proc = subprocess.Popen(
+        [os.path.join(ROOT, ".venv/bin/python"), "-m", "bigrig_engine.cli", "serve",
+         "OLMoE-1B-7B-0125-4bit", "--force-stream", "--residency", "0.5", "--port", str(PORT)],
+        stdout=open(LOG2, "w"), stderr=subprocess.STDOUT, cwd=ROOT)
+    _h = None
+    for _ in range(600):
+        try:
+            _st, _h = get("/health", timeout=2)
+            if _st == 200:
+                break
+        except Exception:                               # noqa: BLE001
+            pass
+        time.sleep(0.2)
+    check("the restarted server reports the conversations it resumed",
+          _h is not None and int(_h.get("resumed_conversations") or 0) >= 1, str(_h and _h.get("resumed_conversations")))
+    _log2 = open(LOG2).read()
+    check("...and says so in its banner", "resumed from the last run" in _log2, _log2[-400:])
+    proc.terminate()
+    try:
+        proc.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    _r = _persist.clear("OLMoE-1B-7B-0125-4bit")
+    check("the test's conversations are cleared from the real store afterwards",
+          _r["conversations"] >= 1 and not os.path.isdir(_pdir), str(_r))
+else:
+    print("  SKIPPED - the test model is not downloaded")
 
 print("\n" + "=" * 80); print("THE FIRST-RUN PATH"); print("=" * 80)
 import os as _os

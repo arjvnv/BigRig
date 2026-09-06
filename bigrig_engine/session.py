@@ -589,6 +589,13 @@ class _TwoStagePromptCache:
         self.probation = LRUPromptCache(max_size=max_size, max_bytes=probation)
         self.protected = LRUPromptCache(max_size=max_size, max_bytes=max_bytes - probation)
         self.promotions = 0
+        self.max_bytes = int(max_bytes)
+        self.max_size = int(max_size)
+        # WHAT HAS BEEN STORED, for the copy on disk (persist.py). The LRUs evict without saying
+        # so; the flush asks each key whether it is still held and drops the file if not.
+        self.known: dict = {}
+        self.dirty = False
+        self._model_key = None
 
     @property
     def nbytes(self) -> int:
@@ -604,14 +611,38 @@ class _TwoStagePromptCache:
 
     def insert_cache(self, model, tokens, prompt_cache, *, proven: bool = False):
         """`proven` means the lookup for this request hit. See the class docstring."""
+        self._model_key = model
         if proven:
             self.promotions += 1
             self.protected.insert_cache(model, tokens, prompt_cache)
         else:
             self.probation.insert_cache(model, tokens, prompt_cache)
+        self.known[tuple(int(t) for t in tokens)] = {"proven": bool(proven), "saved": False}
+        self.dirty = True
+        # Each LRU holds at most max_size entries and evicts in insertion order, so within ONE
+        # segment a key older than that segment's newest max_size inserts is certainly gone.
+        # Bounds the table when no flush is reconciling it (persistence off) -- otherwise it
+        # grew by one key per request. Per segment, because the two evict independently.
+        same = [k for k, v in self.known.items() if v["proven"] == bool(proven)]
+        for k in same[: max(0, len(same) - self.max_size)]:
+            self.known.pop(k, None)
+
+    def held(self) -> list:
+        """The keys actually held right now, checked through the public lookup (exact match).
+        Copies each entry once; for the tests and the flush, never the reply path."""
+        out = []
+        for key in list(self.known):
+            try:
+                cache, rest, _ = self.fetch_nearest_cache(self._model_key, list(key))
+            except Exception:                    # noqa: BLE001
+                cache, rest = None, [1]
+            if cache is not None and not rest:
+                out.append(key)
+        return out
 
     def trim_to(self, *, n_bytes: int | None = None, n_sequences: int | None = None):
         """Probation goes first, then protected, because that is the order they are worth."""
+        self.dirty = True                        # something may have gone; the flush reconciles
         if n_bytes is None:
             self.probation.trim_to(n_bytes=0)
             self.protected.trim_to(n_bytes=0)
@@ -786,6 +817,7 @@ class Session:
                  draft: str | None = None, draft_tokens: int = 3,
                  prefetch_width: int = 0, reroute: float = 0.0, nocache: bool = False,
                  prompt_cache_gb: float | None = None, kv_bits: int | None = None,
+                 persist: bool = True,
                  kv_quant_start: int | None = None,
                  mtp: str | None = None, mtp_bits: int | None = 4, announce: bool = True,
                  stream_embedding: bool = True):
@@ -799,7 +831,7 @@ class Session:
             "full_layers": full_layers, "no_full_layers": no_full_layers,
             "draft": draft, "draft_tokens": draft_tokens,
             "prefetch_width": prefetch_width, "reroute": reroute, "nocache": nocache,
-            "prompt_cache_gb": prompt_cache_gb, "kv_bits": kv_bits,
+            "prompt_cache_gb": prompt_cache_gb, "kv_bits": kv_bits, "persist": persist,
             "kv_quant_start": kv_quant_start, "mtp": mtp, "mtp_bits": mtp_bits,
             "announce": announce,
         }
@@ -1257,7 +1289,21 @@ class Session:
         self.prompt_cache_hits = self.prompt_cache_misses = self.prompt_cache_reused = 0
         self.prompt_cache_matched = 0
         self._cache_proven = False
+        self.history_snapshots = 0
+        self._pre_prefill = 0
+        self._snapshot_bytes = 0
         self._prompt_cache = self._make_prompt_cache()
+        # CONVERSATIONS FROM THE LAST RUN, BACK INTO THE CACHE. Within the cache's own budget,
+        # which the reserve already prices, so nothing about the memory plan changes; only what
+        # this run would have computed (persist.fingerprint) is ever loaded. See persist.py.
+        self.persist = bool(persist)
+        self.resumed = {"restored": 0, "bytes": 0, "discarded": 0, "skipped": 0}
+        if self.persist and self._prompt_cache is not None:
+            try:
+                from . import persist as _persist
+                self.resumed = _persist.restore(self)
+            except Exception:                   # noqa: BLE001 -- a convenience, never a startup failure
+                pass
         # Named on the instance so the batch planner prices against the same numbers the pool was
         # planned with, rather than importing constants and drifting from them.
         self.capacity = int(self.plan.get("capacity") or 0)
@@ -1747,9 +1793,12 @@ class Session:
         return "", text
 
     def _prompt(self, messages=None, prompt: str = "", think: bool = True,
-                continue_last: bool = False, tools=None) -> str:
+                continue_last: bool = False, tools=None, history_only: bool = False) -> str:
+        """The rendered prompt. `history_only` renders the same messages WITHOUT the generation
+        prompt -- the part every later turn of this conversation will begin with -- and records
+        nothing, so the reasoning-start note stays that of the real prompt."""
         if not messages:
-            return self._note_reasoning_start(prompt)
+            return prompt if history_only else self._note_reasoning_start(prompt)
         kw = {}
         if not think and self.can_toggle_thinking:
             kw["enable_thinking"] = False
@@ -1764,6 +1813,13 @@ class Session:
         # Continuing leaves the assistant's turn OPEN instead of starting a new one, so the model
         # carries on the sentence it was cut off in rather than restarting the answer.
         kw["continue_final_message" if continue_last else "add_generation_prompt"] = True
+        if history_only:
+            kw = {k: v for k, v in kw.items() if k not in ("continue_final_message",)}
+            kw["add_generation_prompt"] = False
+            try:
+                return self.tokenizer.apply_chat_template(messages, tokenize=False, **kw)
+            except Exception:                    # noqa: BLE001 -- mirrors the fallback below
+                return "\n".join(f"{m.get('role','user')}: {m.get('content','')}" for m in messages)
         try:
             return self._note_reasoning_start(
                 self.tokenizer.apply_chat_template(messages, tokenize=False, **kw))
@@ -1778,6 +1834,90 @@ class Session:
             return self._note_reasoning_start(
                 "\n".join(f"{m.get('role','user')}: {m.get('content','')}"
                           for m in messages) + "\nassistant:")
+
+    def _snapshot_at_history(self, pc, full_ids, prompt_in, messages, prompt, think, tools, gen_kw):
+        """Store the cache state at the history boundary, for caches that cannot be rolled back.
+
+        THE MISS THIS FIXES, MEASURED ON QWEN3.6: every turn of a conversation missed the cache.
+            The entry stored after a reply is keyed on prompt + reply. The prompt ended with the
+            template's generation opener (`<|im_start|>assistant\n<think>\n`); when that turn is
+            re-rendered as HISTORY for the next request the template writes the assistant turn
+            differently -- no `<think>`, reasoning stripped -- so the stored key is never a prefix
+            of the next prompt. They agree up to the generation opener and diverge there.
+
+            A KV cache can be trimmed back to that common prefix, and mlx_lm's lookup does exactly
+            that, so GLM, DeepSeek and OLMoE reuse it. Qwen3.6 and Nemotron carry recurrent state
+            that has no "back", so the lookup can only serve an exact entry or a stored shorter
+            one -- and nothing shorter was ever stored. Three turns, three misses, the whole
+            conversation re-read each time.
+
+        WHAT THIS DOES. Renders the same messages without the generation prompt, finds where that
+        rendering and the real prompt part company, reads the prompt up to there itself -- the
+        same chunking and KV quantisation mlx_lm's own prefill applies -- and stores a copy of
+        the cache at that point, keyed on those tokens. The next turn begins with exactly them.
+        The rest of the prompt is then handed to generation as usual. Nothing about the tokens
+        the model sees changes; only where a copy of the state is taken.
+
+        WHEN IT DOES NOT RUN. A trimmable cache (it recovers the prefix itself); a boundary the
+        cache already holds; too few tokens to be worth a copy; a state larger than the segment
+        it would go to (it would be evicted on arrival, and the copy is the only extra memory
+        this ever takes -- bounded by the cache budget, taken between chunks when scratch is idle).
+
+        WHAT IT CHANGES ABOUT A REPLY: THE SAME THING A CACHE HIT ALREADY DOES. The prompt is read
+        in two pieces instead of one, and in bfloat16 a different reduction order can move a
+        logit enough to flip a token where the top two were tied. Measured on Qwen3.6, turn one
+        of one conversation chose `The` where the one-piece run chose `"the`; turn two matched
+        exactly. Every later turn of any conversation already read its prompt in pieces (the
+        cached prefix, then the new tail), so this puts turn one in the same regime, no worse.
+        """
+        from mlx_lm.models.cache import can_trim_prompt_cache
+        self._pre_prefill = 0
+        self._snapshot_bytes = 0
+        if not messages or pc is None or full_ids is None or self._prompt_cache is None:
+            return prompt_in
+        try:
+            if can_trim_prompt_cache(pc):
+                return prompt_in
+            hist_ids = self.tokenizer.encode(
+                self._prompt(messages, prompt, think=think, tools=tools, history_only=True))
+        except Exception:                        # noqa: BLE001 -- an accelerator, never a failure
+            return prompt_in
+        n = min(len(hist_ids), len(full_ids) - 1)
+        b = 0
+        while b < n and hist_ids[b] == full_ids[b]:
+            b += 1
+        start = len(full_ids) - len(prompt_in)
+        if b <= start or b - start < 1 or b < MIN_REUSE_TOKENS:
+            return prompt_in
+        from mlx_lm.generate import maybe_quantize_kv_cache
+        seg = list(full_ids[start:b])
+        cb = gen_kw.get("prompt_progress_callback")
+        done, total = 0, len(prompt_in)
+        # A failure here is a failure of the same forward pass generation was about to run, and
+        # it propagates as one; the half-advanced cache is never stored or handed on.
+        for i in range(0, len(seg), self.prefill_step):
+            chunk = mx.array(seg[i:i + self.prefill_step])
+            self.model(chunk[None], cache=pc)
+            if self.kv_bits:
+                maybe_quantize_kv_cache(pc, quantized_kv_start=self.kv_quant_start,
+                                        kv_group_size=KV_GROUP_SIZE, kv_bits=self.kv_bits)
+            mx.eval([c.state for c in pc])
+            done += int(chunk.shape[0])
+            if cb is not None:
+                cb(done, total)
+            mx.clear_cache()
+        segment = self._prompt_cache.protected if self._cache_proven else self._prompt_cache.probation
+        nbytes = sum(int(c.nbytes) for c in pc)
+        if nbytes <= int(segment.max_bytes):
+            import copy
+            self._prompt_cache.insert_cache(self._cache_key, list(full_ids[:b]), copy.deepcopy(pc),
+                                            proven=self._cache_proven)
+            self.history_snapshots += 1
+            self._snapshot_bytes = nbytes
+        if cb is not None:
+            gen_kw["prompt_progress_callback"] = lambda d, t, _o=cb, _p=done: _o(d + _p, t + _p)
+        self._pre_prefill = len(seg)
+        return list(full_ids[b:])
 
     def stream_text(self, messages=None, prompt: str = "", max_tokens: int = 512,
                     temperature: float = 0.7, top_p: float = 0.95, seed: int | None = None,
@@ -1942,6 +2082,12 @@ class Session:
             except Exception:            # noqa: BLE001 -- an accelerator must never fail a reply
                 pc, full_ids, prompt_in = None, None, text
                 gen_kw.pop("prompt_cache", None)
+        # The state at the history boundary, stored for the next turn, on caches that cannot be
+        # rolled back to it. See _snapshot_at_history for the miss this fixes.
+        self._pre_prefill = 0
+        if pc is not None and not continue_last:
+            prompt_in = self._snapshot_at_history(pc, full_ids, prompt_in, messages, prompt,
+                                                  think, tools, gen_kw)
         # GUESSING THE NEXT FEW TOKENS FROM TEXT ALREADY WRITTEN, WHEN THE CALLER ASKS FOR IT.
         #     Off unless asked, per request rather than per server, because whether it is worth
         #     anything is a property of the WORK and not of the machine. Quoting a document back:
@@ -2056,7 +2202,8 @@ class Session:
                                             mx.get_peak_memory() / 1e9 - self._wm_baseline)
                     except Exception:           # noqa: BLE001
                         pass
-                    self._wm_max_prefill = max(self._wm_max_prefill, int(r.prompt_tokens or 0))
+                    self._wm_max_prefill = max(self._wm_max_prefill,
+                                               int(r.prompt_tokens or 0) + int(self._pre_prefill))
                     self._wm_decode += 1
                 self._last_prompt_tokens = int(self._this_prompt_full
                                                if self._this_prompt_full is not None
@@ -2152,9 +2299,24 @@ class Session:
             # were read either way, and the next turn is just as likely to want them.
             if pc is not None and full_ids is not None:
                 try:
-                    self._prompt_cache.insert_cache(
-                        self._cache_key, list(full_ids) + list(self._generated_ids), pc,
-                        proven=getattr(self, "_cache_proven", False))
+                    # THE SNAPSHOT OUTRANKS THIS ENTRY WHEN THE SEGMENT CANNOT HOLD BOTH. On a cache
+                    # that cannot be trimmed, the entry stored here serves only an exact repeat of
+                    # this request; the boundary snapshot is what the next turn actually begins
+                    # with. The LRU would evict the older of the two -- the snapshot -- so on a
+                    # segment too small for the pair (a 16 GB Mac's ~100 MB probation against two
+                    # 70 MB Qwen3.6 states) every turn would miss again. Then this one is skipped.
+                    _keep = True
+                    if getattr(self, "_snapshot_bytes", 0):
+                        from mlx_lm.models.cache import can_trim_prompt_cache as _can_trim
+                        if not _can_trim(pc):
+                            _seg = (self._prompt_cache.protected if getattr(self, "_cache_proven", False)
+                                    else self._prompt_cache.probation)
+                            _keep = (sum(int(c.nbytes) for c in pc) + self._snapshot_bytes
+                                     <= int(_seg.max_bytes))
+                    if _keep:
+                        self._prompt_cache.insert_cache(
+                            self._cache_key, list(full_ids) + list(self._generated_ids), pc,
+                            proven=getattr(self, "_cache_proven", False))
                 except Exception:        # noqa: BLE001 -- never fail a reply over a cache write
                     pass
 
@@ -2368,8 +2530,21 @@ class Session:
                 "stats": self.stats()}
 
     # ------------------------------------------------------------------ reporting
+    def flush_sessions(self) -> dict:
+        """Write the conversations the cache holds to disk, so a restart resumes them. Called
+        when nothing is in flight (the server's idle tick, between terminal turns) and on close;
+        never from the reply path. Cheap when nothing changed."""
+        if not getattr(self, "persist", False) or getattr(self, "_prompt_cache", None) is None:
+            return {"written": 0, "removed": 0, "bytes": 0, "on_disk": 0}
+        try:
+            from . import persist as _persist
+            return _persist.flush(self)
+        except Exception:                       # noqa: BLE001 -- a save must never hurt serving
+            return {"written": 0, "removed": 0, "bytes": 0, "on_disk": 0}
+
     def close(self) -> None:
         """Give back everything this session holds. Safe to call more than once."""
+        self.flush_sessions()
         try:
             if self._wm_peak > 0:
                 _workmem.record(self.name, self.pool_budget_gb, self._wm_peak,
@@ -2455,6 +2630,9 @@ class Session:
                                   if self.draft_name and self.total_tokens else None),
              "serving_reserve_gb": self.serving_reserve_gb,
              "prompt_cache_gb": round(self.prompt_cache_gb, 2),
+             "persist": bool(getattr(self, "persist", False)),
+             "history_snapshots": int(getattr(self, "history_snapshots", 0)),
+             "resumed_conversations": int((getattr(self, "resumed", None) or {}).get("restored", 0)),
              "prompt_cache_bytes": (int(self._prompt_cache.nbytes)
                                     if self._prompt_cache is not None else 0),
              "prompt_cache_hits": self.prompt_cache_hits,

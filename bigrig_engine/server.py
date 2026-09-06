@@ -430,6 +430,10 @@ class _State:
                 # a whole poll, which is the one moment no reply is in flight -- a rebuild any
                 # other time would resize the pool underneath a running generation.
                 self._maybe_shrink()
+                # The same moment is when the conversation cache goes to disk (persist.py): the
+                # copy that lets a restart resume. Nothing to do when nothing changed.
+                if self.session is not None:
+                    self.session.flush_sessions()
                 continue
             with self.count_lock:
                 self.waiting -= 1
@@ -1829,6 +1833,10 @@ def serve(session, host: str = "127.0.0.1", port: int = 8080, verbose: bool = Tr
                f"  {s['serving']}"]
         if s.get("streamed") and s.get("resident_gb"):
             out.append(f"  {s['resident_gb']:.1f} GB of expert weights held in memory")
+        if s.get("resumed_conversations"):
+            _n = s["resumed_conversations"]
+            out.append(f"  {_n} conversation{'s' if _n != 1 else ''} resumed from the last run; "
+                       f"a follow-up to any of them skips the re-read")
         hw = getattr(state, "hot_warm", None) or {}
         if hw.get("bytes"):
             out.append(f"  {hw['bytes'] / 1e9:.1f} GB of the most-used experts read into the page "
@@ -1844,12 +1852,29 @@ def serve(session, host: str = "127.0.0.1", port: int = 8080, verbose: bool = Tr
         out.append(f"  agent bigrig launch {s['model']}        (wires Claude Code to this)")
         out.append("")
         print("\n".join(out), flush=True)
+    # A `kill` IS A STOP, NOT A CRASH. Python's default on SIGTERM is to die on the spot, skipping
+    # the `finally` below -- so `kill <pid>`, a process manager, or a supervisor stopping this
+    # server lost the last conversation's save and the usage record, while Ctrl-C kept them. The
+    # handler turns SIGTERM into the same orderly exit. Main thread only, which pump() already is.
+    import signal as _signal
+
+    def _term(*_a):
+        raise KeyboardInterrupt
+    try:
+        _prev_term = _signal.signal(_signal.SIGTERM, _term)
+    except (ValueError, OSError):                 # not the main thread: keep the default
+        _prev_term = None
     try:
         state.pump()
     except KeyboardInterrupt:
         print("\n  stopping")
     finally:
         state.stopping = True
+        if _prev_term is not None:
+            try:
+                _signal.signal(_signal.SIGTERM, _prev_term)
+            except (ValueError, OSError):
+                pass
         httpd.shutdown()
         httpd.server_close()
         session.close()

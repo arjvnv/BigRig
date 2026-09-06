@@ -6,6 +6,8 @@ models/
 # (`bigrig prepare`, or a streamed model's first run). The packed copy is what
 # the zero-copy path needs; without it the engine still runs, on the copy path.
 data/blobs/
+# conversation caches written so a restart resumes -- private, and mirrored in memory anyway
+data/sessions/
 # ...except one manifest, which is 230 KB of byte offsets and no weights. The pool-sizing and
 # CLI tests read it, so tracking it is the difference between a fresh clone running 1,800
 # assertions and running none of that file's.

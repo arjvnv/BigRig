@@ -61,6 +61,10 @@ any setting, it says that too, before you download 40 GB to find out.
 - **It asks before it changes anything.** Shrinking a model is the only path that alters weights,
   so it is the only one that needs your agreement — and every run prints which mode it is
   serving, so the precision you are getting is never a surprise.
+- **It picks up where you left off.** The conversation cache is written to disk while the
+  server is idle, so a restart, an update or a pool rebuild resumes every conversation it held
+  and the next turn reads only its own new tokens. Your machine, your data directory:
+  `bigrig sessions` shows and clears it, `--no-persist` turns it off.
 - **It speaks to the tools you already use.** OpenAI, Anthropic and Responses APIs on one port,
   a one-command hook into Claude Code and Codex, and a self-contained web interface that makes
   no external requests.

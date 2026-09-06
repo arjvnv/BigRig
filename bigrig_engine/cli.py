@@ -328,6 +328,33 @@ def _prepared() -> list:
     return out
 
 
+def cmd_sessions(a) -> int:
+    from . import persist
+    if a.clear:
+        r = persist.clear(a.model)
+        print(f"\n  removed {r['conversations']} saved conversation"
+              f"{'s' if r['conversations'] != 1 else ''} ({r['bytes'] / 1e6:.0f} MB)"
+              f"{' for ' + a.model if a.model else ''}\n")
+        return 0
+    rows = persist.summary()
+    if a.model:
+        rows = [r for r in rows if r["model"] == a.model]
+    if not rows:
+        print("\n  no saved conversations. They are written while a server is idle and between "
+              "terminal turns,\n  under " + persist.root() + "\n")
+        return 0
+    print(f"\n  saved conversations, under {persist.root()}\n")
+    print(f"  {'model':<44} {'conversations':>13} {'on disk':>9}   newest")
+    for r in rows:
+        age = time.time() - r["newest"]
+        when = (f"{age / 60:.0f} min ago" if age < 3600 else f"{age / 3600:.1f} h ago"
+                if age < 86400 else f"{age / 86400:.0f} days ago")
+        print(f"  {r['model']:<44} {r['conversations']:>13} {r['bytes'] / 1e6:>7.0f} MB   {when}")
+    print("\n  A follow-up to any of these skips re-reading it. `bigrig sessions --clear [model]` "
+          "deletes them;\n  `--no-persist` on run or serve keeps the cache in memory only.\n")
+    return 0
+
+
 def cmd_list(a) -> int:
     rows = _prepared()
     if not rows:
@@ -587,6 +614,7 @@ def _session(a):
                 monitor=not getattr(a, "no_monitor", False),
                 budget_gb=getattr(a, "memory", None), kv_bits=getattr(a, "kv_bits", None),
                 kv_quant_start=getattr(a, "kv_quant_start", None), verbose=True,
+                persist=not getattr(a, "no_persist", False),
                 force_stream=getattr(a, "force_stream", False),
                 min_bits=getattr(a, "min_bits", None),
                 preference=pref, interactive=True,
@@ -662,6 +690,9 @@ def cmd_run(a) -> int:
             if hw.get("bytes"):
                 print(f"  {hw['bytes'] / 1e9:.1f} GB of the most-used experts read into the page "
                       f"cache ({hw['seconds']:.2f}s)", flush=True)
+    if st.get("resumed_conversations"):
+        _n = st["resumed_conversations"]
+        print(f"  {_n} conversation{'s' if _n != 1 else ''} resumed from the last run", flush=True)
     print(f"  quality monitor {'on' if st['monitor'] else 'off'}. Ctrl-C to stop, "
           f"'/stats' for numbers, '/quit' to exit.\n")
     history = []
@@ -705,6 +736,7 @@ def cmd_run(a) -> int:
             print(f"\n       [{n} tokens, {n/dt if dt else 0:.1f} tok/s"
                   f"{', miss ' + format(s.stats().get('miss_rate', 0)*100, '.1f') + '%' if st.get('streamed') else ''}"
                   f"{note}]\n")
+            s.flush_sessions()                  # between turns, while the user is typing
     except KeyboardInterrupt:
         print()
     finally:
@@ -1142,6 +1174,10 @@ def build_parser():
                    help="plan against this many GB instead of what is free now")
     d.set_defaults(fn=cmd_doctor)
 
+    ss = sub.add_parser("sessions", help="conversations kept on disk so a restart resumes them")
+    ss.add_argument("model", nargs="?", default=None)
+    ss.add_argument("--clear", action="store_true", help="delete them (for one model, or all)")
+    ss.set_defaults(fn=cmd_sessions)
     l = sub.add_parser("list", help="models already prepared")
     l.set_defaults(fn=cmd_list)
 
@@ -1253,6 +1289,10 @@ def build_parser():
     r.add_argument("--no-warm", action="store_true",
                    help="do not read this model's most-used experts into the page cache before "
                         "the first prompt.")
+    r.add_argument("--no-persist", action="store_true",
+                   help="keep the conversation cache in memory only. By default it is also "
+                        "written to disk between turns so a restart resumes where you were; "
+                        "`bigrig sessions` shows and clears what is kept.")
     r.set_defaults(fn=cmd_run)
 
     cp = sub.add_parser("compress", help="shrink a model so every expert fits in RAM")
@@ -1338,6 +1378,10 @@ def build_parser():
                     help="do not read this model's experts into the OS page cache after "
                          "starting. Warming runs in the background and only helps a machine "
                          "that has just booted.")
+    sv.add_argument("--no-persist", action="store_true",
+                    help="keep the conversation cache in memory only. By default it is also "
+                         "written to disk while the server is idle so a restart resumes every "
+                         "conversation it held; `bigrig sessions` shows and clears what is kept.")
     # ON BY DEFAULT, AND THE DEFAULT IS THE WHOLE POINT.
     #     Off, the failure is not a slow server, it is a dead one: Metal kills the process with
     #     'Insufficient Memory' when something else on the machine wants memory the pool is
