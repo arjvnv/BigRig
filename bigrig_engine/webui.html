@@ -540,6 +540,15 @@ tr.flag td{color:var(--warn)}
       <label id="l-think" style="display:none"
              title="The model thinks in the open before answering. Better on hard questions, but the reasoning is drawn from the same reply limit as the answer.">
         <input type="checkbox" id="c-think"> think first</label>
+      <label id="l-think-limit" style="display:none"
+             title="How much of the reply limit the model may spend thinking before it has to answer. Thinking and the answer come out of the same limit; with no cap a hard question can spend all of it thinking and be cut off before a word of the answer. The cap closes the thinking cleanly at the limit and the model answers from what it has.">
+        thinking limit <select id="c-think-limit">
+          <option value="half">½ of reply</option>
+          <option value="quarter">¼ of reply</option>
+          <option value="256">256 tokens</option>
+          <option value="1024">1024 tokens</option>
+          <option value="none">none</option>
+        </select></label>
       <label title="Guesses the next few words from text already in the conversation and checks the guess in one pass. Large gain when the answer repeats something already written -- quoting a document, continuing a list -- and a small loss when it does not, so it is off unless asked for.">
         <input type="checkbox" id="c-ahead"> guess ahead</label>
       <label>reply limit <select id="c-max"></select></label>
@@ -649,7 +658,7 @@ const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
 const thread = $("#thread"), qEl = $("#q"), sendEl = $("#send");
 const history = [];
-let busy = false, health = {}, lastCut = false;
+let busy = false, health = {}, lastCut = false, thinkCut = null;   // thinkCut: reasoning tokens when the cap closed the thinking
 // A running request, so it can be stopped. `stopped` separates "the user pressed stop" from
 // "the connection broke" -- they look identical to fetch() and must not read the same to a user.
 let ctrl = null, reqId = null, stopped = false;
@@ -918,6 +927,25 @@ function withInstructions(msgs){
   return (on && txt) ? [{role:"system",content:txt}, ...msgs] : msgs;
 }
 function paintTemp(){ $("#c-temp-v").textContent=currentTemp().toFixed(2); }
+// THE THINKING LIMIT. The reasoning and the answer share one reply limit; measured on Qwen3.6, an
+// open question spent 900+ tokens thinking and a 1,000-token reply had no answer in it. The cap
+// is sent as `thinking_budget`; the engine closes the block at the cap and the model answers.
+// Default: half the reply limit, so an answer always has room. Shown only when the model thinks.
+function paintThinkLimit(){
+  const on = !!health.can_toggle_thinking && $("#c-think").checked;
+  $("#l-think-limit").style.display = on ? "" : "none";
+}
+function thinkBudget(){
+  if(!$("#c-think").checked) return null;
+  const v=$("#c-think-limit").value, lim=parseInt($("#c-max").value,10)||0;
+  if(v==="none") return null;
+  if(v==="half") return Math.max(64, Math.floor(lim/2));
+  if(v==="quarter") return Math.max(64, Math.floor(lim/4));
+  return parseInt(v,10);
+}
+$("#c-think").addEventListener("change", ()=>{ paintThinkLimit(); });
+$("#c-think-limit").onchange=()=>{ try{ localStorage.setItem("tg-think-limit",$("#c-think-limit").value);}catch(e){} };
+try{ const tl=localStorage.getItem("tg-think-limit"); if(tl!=null) $("#c-think-limit").value=tl; }catch(e){}
 $("#c-temp").oninput=()=>{ paintTemp(); try{ localStorage.setItem("tg-temp",$("#c-temp").value);}catch(e){} };
 $("#c-sys-on").onchange=()=>{ $("#sys").hidden=!$("#c-sys-on").checked;
   try{ localStorage.setItem("tg-sys-on",$("#c-sys-on").checked?"1":"0"); }catch(e){} };
@@ -1388,6 +1416,7 @@ async function refresh(){
     ["Reloads", String(h.reloads||0)],
   ]);
   $("#l-think").style.display = h.can_toggle_thinking?"":"none";
+  paintThinkLimit();
   $("#l-attach").hidden = !h.vision; $("#attach-row").hidden = !h.vision;
   buildLimits();
 }
@@ -1459,7 +1488,7 @@ function showUser(el, content){
 }
 
 async function ask(text, cont=false){
-  busy=true; stopped=false;
+  busy=true; stopped=false; thinkCut=null;
   ctrl=new AbortController();
   reqId=(crypto.randomUUID?crypto.randomUUID():String(Math.random()).slice(2))+"";
   sendEl.textContent="Stop"; sendEl.classList.add("stop"); sendEl.disabled=false;
@@ -1501,6 +1530,7 @@ async function ask(text, cont=false){
       signal:ctrl.signal,
       body:JSON.stringify({messages:withInstructions(history),temperature:currentTemp(),stream:true,
         max_tokens:parseInt($("#c-max").value,10), think:$("#c-think").checked,
+        thinking_budget:thinkBudget(),
         lookahead:$("#c-ahead").checked,
         continue_last:cont, bigrig_id:reqId})});
     if(!r.ok){ body.textContent="Error "+r.status+": "+(await r.text()).slice(0,300); throw 0; }
@@ -1531,7 +1561,8 @@ async function ask(text, cont=false){
         if(t&&t.prefill_total){ pre=[t.prefill_done,t.prefill_total]; scroll(); }
         if(t){ if(t.tok_s>0&&t.tok_s<=2000){tps=t.tok_s; set("#c-tps",tps.toFixed(1)); set("#r-tps",tps.toFixed(1));}
                if("degraded" in t){seen++; if(t.degraded)flagged++; quality(flagged/seen,seen);}
-               if(t.degraded_tokens!==undefined) flagged=t.degraded_tokens; }
+               if(t.degraded_tokens!==undefined) flagged=t.degraded_tokens;
+               if(t.thinking_cut) thinkCut=t.reasoning_tokens||0; }
       }
     }
   }catch(e){
@@ -1568,7 +1599,8 @@ async function ask(text, cont=false){
   const meta=document.createElement("div");
   lastCut = finish==="length" || stopped;
   let tail="";
-  if(stopped){ tail=" · stopped by you"; }
+  if(thinkCut!=null){ tail+=` · thinking capped at ${thinkCut} tokens (your limit)`; }
+  if(stopped){ tail+=" · stopped by you"; }
   else if(finish==="length"){
     tail=` · CUT OFF at the ${$("#c-max").value}-token limit`;
     // The thinking is its own field now, so its share is a straight comparison. This is the

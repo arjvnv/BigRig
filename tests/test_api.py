@@ -1132,6 +1132,20 @@ check("...and it is one or the other, never both",
       '"continue_final_message" if continue_last else "add_generation_prompt"' in _pr)
 check("the reason is recorded", "carries on the sentence it was cut off in" in _pr)
 with fake_server() as (_url, _state, _fs):
+    _st, _b, _ = _fpost(_url, "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 3, "thinking_budget": 500})
+    check("a thinking budget reaches the engine as an integer cap",
+          _fs.calls and _fs.calls[-1].get("thinking_budget") == 500, str(_fs.calls and _fs.calls[-1].get("thinking_budget")))
+    check("...and the reply says the cap acted and how much thinking it allowed (blocking)",
+          _st == 200 and _b.get("bigrig", {}).get("thinking_cut") is True and _b["bigrig"].get("reasoning_tokens") == 500, str(_b.get("bigrig")))
+    _st, _payload, _ = _fpost(_url, "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 3,
+                                                            "thinking_budget": 500, "stream": True}, raw=True)
+    _fin = [e for e in _sse(_payload) if isinstance(e, dict) and e.get("choices") and e["choices"][0].get("finish_reason")]
+    check("...and on the final streaming frame", _fin and _fin[-1].get("bigrig", {}).get("thinking_cut") is True
+          and _fin[-1]["bigrig"].get("reasoning_tokens") == 500, str(_fin and _fin[-1].get("bigrig")))
+    _st, _b, _ = _fpost(_url, "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 3})
+    check("without a budget nothing was cut and the field says so", _b.get("bigrig", {}).get("thinking_cut") is False
+          and _b["bigrig"].get("reasoning_tokens") is None)
+with fake_server() as (_url, _state, _fs):
     _hist = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "The answer is"}]
     _fpost(_url, "/v1/chat/completions", {"messages": _hist, "max_tokens": 2, "continue_last": True})
     _fpost(_url, "/v1/chat/completions", {"messages": _hist, "max_tokens": 2})

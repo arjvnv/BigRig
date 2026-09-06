@@ -327,6 +327,12 @@ Pick the budget for the task -- 40 tokens is too few to finish arithmetic, and a
 answer must fit inside `max_tokens`. The cap takes the standard generation path; `--mtp` and
 lookahead yield to it.
 
+The page has the same cap as a control -- "thinking limit", shown when the model thinks --
+set to half the reply limit by default. Measured on Qwen3.6 with a 1,000-token reply limit and
+an open question: uncapped, all 1,000 tokens went to thinking and no answer came; capped at
+half, thinking stopped at 500 and the answer had the other 500. Both APIs report what the cap
+did on the reply (`bigrig.thinking_cut`, `bigrig.reasoning_tokens`).
+
 ## Models that think before answering
 
 Qwen3.5/3.6, GLM-4.x, Nemotron and their kin produce a block of reasoning before the answer; the

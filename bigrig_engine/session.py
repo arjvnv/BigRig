@@ -2355,7 +2355,12 @@ class Session:
                         "from_draft": bool(getattr(r, "from_draft", False)),
                         "tok_s": _sane_tps(r.generation_tps, r.generation_tokens),
                         "prompt_tokens": r.prompt_tokens,
-                        "generation_tokens": r.generation_tokens, "degraded": flagged}
+                        "generation_tokens": r.generation_tokens, "degraded": flagged,
+                        # The thinking budget's account: how many reasoning tokens were spent and
+                        # whether the cap, not the model, ended the block. A client can then say
+                        # "thinking was cut at 500" instead of leaving a shorter answer unexplained.
+                        "reasoning_tokens": (think_proc.reasoning_tokens if think_proc is not None else None),
+                        "thinking_cut": bool(think_proc is not None and think_proc.forced)}
                 counted = info
                 cut = min((full.find(x) for x in stops if full.find(x) >= 0), default=-1)
                 if cut >= 0:

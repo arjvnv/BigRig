@@ -378,6 +378,18 @@ check("an attached image is sent as an OpenAI image_url part before the text, an
 check("the page reads the image locally and never uploads it anywhere but this server",
       "readAsDataURL" in script and "nothing is uploaded anywhere" in html)
 
+print("\n" + "=" * 84); print("7c. THE THINKING LIMIT: HALF THE REPLY BY DEFAULT, SENT AS thinking_budget"); print("=" * 84)
+check("the control exists with 'half the reply' as its first (default) option",
+      'id="c-think-limit"' in html and html.index('value="half"') < html.index('value="none"'))
+check("it is shown only for a model whose thinking can be toggled, and only when thinking is on",
+      "health.can_toggle_thinking" in script and '$("#c-think").checked' in script and "paintThinkLimit" in script)
+check("the budget is derived from the reply limit for the fractional choices, never below 64 tokens",
+      "Math.floor(lim/2)" in script and "Math.floor(lim/4)" in script and "Math.max(64," in script)
+check("...and sent to the server as thinking_budget", "thinking_budget:thinkBudget()" in script)
+check("'none' sends no cap, and thinking off sends none", 'if(v==="none") return null;' in script and 'if(!$("#c-think").checked) return null;' in script)
+check("when the cap acted, the reply's meta line says so with the count", "thinking capped at ${thinkCut} tokens" in script and "t.thinking_cut" in script)
+check("the choice is remembered", '"tg-think-limit"' in script)
+
 print("\n" + "=" * 84); print("8. THE CONTEXT METER READS THE SERVER, NEVER RE-DERIVES THE LIMIT"); print("=" * 84)
 check("the page has a Context meter", 'id="m-ctx"' in html and 'id="m-bar-ctx"' in html)
 check("...filled from context_used and context_remaining as the server reports them",

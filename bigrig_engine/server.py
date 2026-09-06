@@ -1611,7 +1611,9 @@ def make_handler(state: _State):
                                  "degraded_tokens": degraded,
                                  "degraded_share": round(degraded / max(1, n_out), 4),
                                  "residency": state.session.stats().get("residency"),
-                                 "miss_rate": state.session.stats().get("miss_rate")}}
+                                 "miss_rate": state.session.stats().get("miss_rate"),
+                                 "reasoning_tokens": last.get("reasoning_tokens"),
+                                 "thinking_cut": bool(last.get("thinking_cut"))}}
             _json(self, 200, body)
 
         def _stream(self, msgs, prompt, kw, chat):
@@ -1703,7 +1705,9 @@ def make_handler(state: _State):
                                (last.get("finish_reason") or "stop")),
                           {"tok_s": round(last.get("tok_s") or 0.0, 2),
                            "degraded_tokens": degraded,
-                           "miss_rate": state.session.stats().get("miss_rate")}))
+                           "miss_rate": state.session.stats().get("miss_rate"),
+                           "reasoning_tokens": last.get("reasoning_tokens"),
+                           "thinking_cut": bool(last.get("thinking_cut"))}))
                 self._log(last, degraded, time.time() - _t0, _ttft,
                           last.get("generation_tokens", 0))
                 self.wfile.write(b"data: [DONE]\n\n")

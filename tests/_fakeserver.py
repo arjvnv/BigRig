@@ -116,9 +116,12 @@ class FakeSession:
             last = i == limit - 1
             self.total_tokens += 1
             self._used = n_prompt + i + 1
+            budget = kw.get("thinking_budget")
             yield chunk, {"token": i + 1, "finish_reason": ("stop" if len(words) <= max_tokens else "length")
                           if last else None, "tok_s": 50.0, "from_draft": False, "reasoning_delta": "",
-                          "prompt_tokens": n_prompt, "generation_tokens": i + 1, "degraded": False}
+                          "prompt_tokens": n_prompt, "generation_tokens": i + 1, "degraded": False,
+                          # a budget, if given, is reported as spent exactly (the engine's shape)
+                          "reasoning_tokens": (int(budget) if budget else None), "thinking_cut": bool(budget)}
 
     def stream_batch(self, *a, **kw):
         raise NotImplementedError("the fake serves one request at a time")

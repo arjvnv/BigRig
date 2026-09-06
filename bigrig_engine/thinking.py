@@ -43,6 +43,7 @@ class ThinkingBudget:
         self.text = ""
         self.closed = False                              # the block has ended (naturally or forced)
         self.forcing: list = []                          # close-tag ids still to emit
+        self.forced = False                              # the budget, not the model, ended the block
         # The close tag, as this tokenizer's ids. A leading newline is included so the tag lands
         # on its own line the way the templates write it; if the tag is a single id (it is on
         # every model here) that is all that is forced.
@@ -117,6 +118,7 @@ class ThinkingBudget:
         if not self.in_reasoning or self.reasoning_tokens < self.budget or not self.close_ids:
             return logits
         # Budget spent and still thinking: begin forcing the close tag this step.
+        self.forced = True
         self.forcing = list(self.close_ids)
         tid = self.forcing.pop(0)
         if not self.forcing:
