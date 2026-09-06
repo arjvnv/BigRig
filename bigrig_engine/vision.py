@@ -371,3 +371,113 @@ class MRope:
         c, s = cos[None, None, :, :], sin[None, None, :, :]
         out = (r32 * c + _rotate_half(r32) * s).astype(x.dtype)
         return mx.concatenate([out, rest], axis=-1) if rest.shape[-1] else out
+
+
+# ------------------------------------------------------------------------------ the engine's side
+class RopeSwitch:
+    """Stands in for a full-attention layer's rotary. Plain rotary until a multimodal request is
+    in flight; then the multimodal positions inside the prompt, and the plain rotary at
+    `offset + delta` for everything generated after it -- the reference's `rope_deltas` rule.
+    Text-only requests never arm it, so their arithmetic is exactly what it was."""
+
+    def __init__(self, inner, mrope: MRope):
+        self.inner, self.mrope = inner, mrope
+        self.positions = None
+        self.cos = self.sin = None
+        self.delta = 0
+
+    def arm(self, positions: np.ndarray, delta: int) -> None:
+        self.positions = positions
+        self.cos, self.sin = self.mrope.cos_sin(positions)
+        self.delta = int(delta)
+
+    def disarm(self) -> None:
+        self.positions = None
+        self.cos = self.sin = None
+        self.delta = 0
+
+    def __call__(self, x, offset: int = 0):
+        if self.positions is None:
+            return self.inner(x, offset=offset)
+        L, Lp = int(x.shape[-2]), int(self.positions.shape[1])
+        if offset >= Lp:                                   # generated tokens: one stream, shifted
+            return self.inner(x, offset=offset + self.delta)
+        if offset + L <= Lp:                               # inside the prompt
+            return self.mrope.apply(x, self.cos[offset:offset + L], self.sin[offset:offset + L])
+        # A pass straddling the prompt's end: prompt positions, then shifted plain ones.
+        tail = np.tile(np.arange(Lp, offset + L, dtype=np.int32) + self.delta, (3, 1))
+        pos = np.concatenate([self.positions[:, offset:Lp], tail], axis=1)
+        c, s = self.mrope.cos_sin(pos)
+        return self.mrope.apply(x, c, s)
+
+
+def full_attention_layers(model) -> list:
+    """The attention modules that carry a rotary, in layer order."""
+    tm = getattr(model, "language_model", None) or model
+    inner = getattr(tm, "model", None)
+    out = []
+    for layer in getattr(inner, "layers", []) or []:
+        attn = getattr(layer, "self_attn", None)
+        if attn is not None and hasattr(attn, "rope") and not getattr(layer, "is_linear", False):
+            out.append(attn)
+    return out
+
+
+def _image_items(content) -> list:
+    if not isinstance(content, list):
+        return []
+    return [it for it in content if isinstance(it, dict)
+            and ("image_url" in it or "image" in it or it.get("type") == "image")]
+
+
+def count_images(messages) -> int:
+    return sum(len(_image_items(m.get("content"))) for m in (messages or []) if isinstance(m, dict))
+
+
+def extract_images(messages) -> list:
+    """The bytes of every image in the messages, in the order the template renders them.
+    OpenAI: {"type": "image_url", "image_url": {"url": <data URL>}} (or a string url).
+    Anthropic: {"type": "image", "source": {"type": "base64", "data": ...}}.
+    Raises ValueError with a sentence for anything that cannot be decoded."""
+    out = []
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        for it in _image_items(m.get("content")):
+            if "image_url" in it:
+                u = it["image_url"]
+                u = u.get("url") if isinstance(u, dict) else u
+                if not isinstance(u, str):
+                    raise ValueError("`image_url` must be a string or {\"url\": ...}")
+                out.append(decode_image_ref(u))
+            elif isinstance(it.get("source"), dict):
+                src = it["source"]
+                if src.get("type") != "base64" or not isinstance(src.get("data"), str):
+                    raise ValueError("an image `source` must be {\"type\": \"base64\", \"data\": ...}; "
+                                     "URLs are not fetched by this server")
+                out.append(decode_image_ref(src["data"]))
+            elif isinstance(it.get("image"), str):
+                out.append(decode_image_ref(it["image"]))
+            else:
+                raise ValueError("an image item needs `image_url` (a data URL) or a base64 `source`")
+    if len(out) > MAX_IMAGES:
+        raise ValueError(f"{len(out)} images in one request; at most {MAX_IMAGES}")
+    return out
+
+
+def expand_placeholders(ids: list, grids: list, image_token_id: int, merge: int) -> list:
+    """Each single `<|image_pad|>` the template wrote becomes the image's run of placeholders,
+    one per 2x2 block -- the processor's expansion."""
+    out, gi = [], 0
+    for t in ids:
+        if t == image_token_id:
+            if gi >= len(grids):
+                raise ValueError("more image placeholders in the prompt than images")
+            t_, gh, gw = grids[gi]
+            gi += 1
+            out.extend([image_token_id] * (t_ * gh * gw // (merge * merge)))
+        else:
+            out.append(t)
+    if gi != len(grids):
+        raise ValueError("fewer image placeholders in the prompt than images")
+    return out

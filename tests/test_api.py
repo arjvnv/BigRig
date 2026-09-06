@@ -60,9 +60,15 @@ b = anth.parse({**OK, "messages": [{"role": "user", "content": [
     {"type": "text", "text": "one "}, {"type": "text", "text": "two"}]}]})
 check("content blocks are flattened in order", b["messages"][0]["content"] == "one two")
 img = anth.parse({**OK, "messages": [{"role": "user", "content": [
-    {"type": "image", "source": {}}, {"type": "text", "text": "describe"}]}]})
-check("a block this engine cannot render is skipped, not rejected",
-      img["messages"][0]["content"] == "describe")
+    {"type": "image", "source": {"type": "base64", "data": "QUJD"}}, {"type": "text", "text": "describe"}]}]})
+_c = img["messages"][0]["content"]
+check("an image block is KEPT as a block, in order, with the text beside it (vision.py reads it; the "
+      "server answers 400 when it was started without --vision)",
+      isinstance(_c, list) and [pt["type"] for pt in _c] == ["image", "text"] and _c[1]["text"] == "describe", str(_c))
+unk = anth.parse({**OK, "messages": [{"role": "user", "content": [
+    {"type": "document", "source": {}}, {"type": "text", "text": "describe"}]}]})
+check("a block this engine cannot render (a document) is still skipped, not rejected",
+      unk["messages"][0]["content"] == "describe")
 tr = anth.parse({**OK, "messages": [{"role": "user", "content": [
     {"type": "tool_result", "content": [{"type": "text", "text": "42"}]}]}]})
 check("tool_result content is flattened rather than dropped",

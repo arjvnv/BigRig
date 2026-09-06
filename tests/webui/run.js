@@ -149,8 +149,10 @@ process.on("unhandledRejection", e => problems.push("unhandled rejection: " + (e
   for (const [f] of timers) { try { await f(); } catch (e) { problems.push("interval threw: " + (e && e.message || e)); } }
   await new Promise(r => setImmediate(r));
 
+  const hidden = {};
+  for (const [id, el] of pool) hidden[id] = !!el.hidden;
   console.log(JSON.stringify({
-    problems, writes, fetched,
+    problems, writes, fetched, hidden,
     feedRows: (pool.get("feed-body") || { childElementCount: 0 }).childElementCount,
     timers: timers.length,
   }, null, 1));

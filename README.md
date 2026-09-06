@@ -65,6 +65,9 @@ any setting, it says that too, before you download 40 GB to find out.
   server is idle, so a restart, an update or a pool rebuild resumes every conversation it held
   and the next turn reads only its own new tokens. Your machine, your data directory:
   `bigrig sessions` shows and clears it, `--no-persist` turns it off.
+- **It reads your screenshot.** Qwen3.6 ships a vision encoder inside the checkpoint; `--vision`
+  loads it beside the pool and the same model that could not fit your Mac reads an image on it —
+  the encoder and its positions are BigRig's own MLX port, checked against the reference.
 - **It speaks to the tools you already use.** OpenAI, Anthropic and Responses APIs on one port,
   `/v1/embeddings` beside them (`--embeddings`, a 133 MB encoder that matches its PyTorch
   reference), a one-command hook into Claude Code and Codex, and a self-contained web interface

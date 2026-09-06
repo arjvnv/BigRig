@@ -119,6 +119,81 @@ else:
     check("encoding a 640x400 image needs under 0.5 GB above the resident tower",
           (mx.get_peak_memory() - base) / 1e9 < 0.5, f"{(mx.get_peak_memory() - base) / 1e9:.2f} GB")
 
+print("\n" + "=" * 84); print("5. SERVED: THE GUARDS AND THE MESSAGE SHAPES, THROUGH THE REAL SERVER"); print("=" * 84)
+import base64                                                           # noqa: E402
+sys.path.insert(0, os.path.join(ROOT, "tests"))
+from _fakeserver import fake_server, post, FakeSession                  # noqa: E402
+from bigrig_engine import anthropic as anth                             # noqa: E402
+PNG = open(os.path.join(FIX, "screenshot.png"), "rb").read()
+URL = "data:image/png;base64," + base64.b64encode(PNG).decode()
+with fake_server() as (url, state, fs):
+    st, b, _ = post(url, "/v1/chat/completions", {"messages": [{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": URL}}, {"type": "text", "text": "what is this?"}]}], "max_tokens": 4})
+    check("an image to a server without --vision is a 400 that names the flag", st == 400 and "--vision" in json.dumps(b), f"{st} {b}")
+    st, b, _ = post(url, "/v1/messages", {"model": "m", "max_tokens": 4, "messages": [{"role": "user", "content": [
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": base64.b64encode(PNG).decode()}},
+        {"type": "text", "text": "what is this?"}]}]})
+    check("...on the Anthropic API too, in its error envelope", st == 400 and b.get("type") == "error" and "--vision" in json.dumps(b), f"{st} {b}")
+    check("a text-only request is untouched", post(url, "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 2})[0] == 200)
+with fake_server(FakeSession(tower=object())) as (url, state, fs):
+    st, b, _ = post(url, "/v1/chat/completions", {"messages": [{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": URL}}, {"type": "text", "text": "what is this?"}]}], "max_tokens": 4})
+    check("with a tower, an OpenAI image part reaches the engine intact, in order",
+          st == 200 and fs.calls and isinstance(fs.calls[-1]["messages"][0]["content"], list)
+          and fs.calls[-1]["messages"][0]["content"][0].get("type") == "image_url", f"{st}")
+    st, b, _ = post(url, "/v1/messages", {"model": "m", "max_tokens": 4, "messages": [{"role": "user", "content": [
+        {"type": "text", "text": "look:"}, {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": base64.b64encode(PNG).decode()}},
+        {"type": "text", "text": "what is this?"}]}]})
+    parts = fs.calls[-1]["messages"][0]["content"] if fs.calls else None
+    check("an Anthropic image block is kept as a block the template renders, text around it in order",
+          st == 200 and isinstance(parts, list) and [pt["type"] for pt in parts] == ["text", "image", "text"]
+          and parts[1]["source"]["data"] == base64.b64encode(PNG).decode(), f"{st} {parts and [pt['type'] for pt in parts]}")
+    st, b, _ = post(url, "/v1/chat/completions", {"messages": [{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}}, {"type": "text", "text": "?"}]}], "max_tokens": 4})
+    check("a remote URL is refused: this server fetches nothing", st == 400 and "not fetched" in json.dumps(b), f"{st} {b}")
+    st, b, _ = post(url, "/v1/chat/completions", {"messages": [{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,@@@not-base64@@@"}}, {"type": "text", "text": "?"}]}], "max_tokens": 4})
+    check("undecodable image bytes are a 400 with a reason, not a 500 from the model thread", st == 400, f"{st} {b}")
+    st, b, _ = post(url, "/v1/chat/completions", {"messages": [{"role": "user", "content":
+        [{"type": "image_url", "image_url": {"url": URL}}] * (vision.MAX_IMAGES + 1) + [{"type": "text", "text": "?"}]}], "max_tokens": 4})
+    check(f"more than {vision.MAX_IMAGES} images in one request is refused", st == 400 and "at most" in json.dumps(b), f"{st}")
+# The conversion itself, without a server.
+parsed = anth.parse({"model": "m", "max_tokens": 5, "messages": [{"role": "user", "content": [
+    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}}, {"type": "text", "text": "hi"}]}]})
+m = anth.to_engine_messages(parsed)
+check("to_engine_messages keeps image blocks for the template and drops nothing",
+      len(m) == 1 and isinstance(m[0]["content"], list) and m[0]["content"][0]["type"] == "image" and m[0]["content"][1]["text"] == "hi")
+check("count_images and extract_images agree with the template's notion of an image item",
+      vision.count_images(m) == 1 and vision.extract_images(m) == [b"ABC"])
+
+print("\n" + "=" * 84); print("6. THE WHOLE ROAD, ON QWEN3.6"); print("=" * 84)
+if not os.path.isdir(MD):
+    print("  SKIPPED - Qwen3.6-35B-A3B-4bit is not on disk")
+else:
+    import subprocess
+    _p = subprocess.run([sys.executable, os.path.join(ROOT, "tests", "_snapshot_child.py"), "vision", "Qwen3.6-35B-A3B-4bit"],
+                        capture_output=True, text=True, timeout=1200, env=dict(os.environ, BIGRIG_MAX_GB=os.environ.get("BIGRIG_MAX_GB", "9")))
+    _line = next((ln for ln in _p.stdout.splitlines() if ln.startswith("RESULT ")), None)
+    if _line is None:
+        check("the live vision scenario ran", False, (_p.stdout + _p.stderr)[-1500:])
+    else:
+        R = json.loads(_line[7:])
+        print(f"      first token {R['first_token_s']}s, reply in {R['seconds']}s, prompt {R['prompt_tokens']} tokens (240 of them image)")
+        print(f"      reply: {R['reply'][:160]!r}")
+        print(f"      two images, 'what colour is the second': {R['two_image_reply']!r}")
+        check("the tower is charged to the ceiling before the pool is planned",
+              R["reserved_gb"] and abs(R["reserved_gb"] - R["vision_stats"]["tower_gb"]) < 1e-6, str(R["reserved_gb"]))
+        check("the prompt carries the image's 240 tokens plus the text", R["prompt_tokens"] and 240 < R["prompt_tokens"] < 320, str(R["prompt_tokens"]))
+        rep = R["reply"]
+        check("the model READ the screenshot: the headline is transcribed", "BigRig" in rep and "Qwen3.6" in rep and "screenshot" in rep, rep[:120])
+        check("...and the code in it", "add(a, b)" in rep and "return a + b" in rep and "print(add(2, 3))" in rep)
+        check("...and it saw the red circle", "red" in rep.lower() and "circle" in rep.lower())
+        check("with two images it answers about the SECOND one (a plain blue square): 'blue'",
+              "blue" in R["two_image_reply"].lower(), R["two_image_reply"])
+        check("nothing from an image request is kept in the conversation cache", R["cache_entries_after_image"] == 0, str(R["cache_entries_after_image"]))
+        check("the rotary switches are disarmed afterwards and a text-only turn still answers",
+              R["disarmed"] and len(R["text_after"].strip()) > 3, R["text_after"])
+
 print()
 print("=" * 84)
 print("ALL TESTS PASSED" if not FAIL else f"{len(FAIL)} FAILURES: " + ", ".join(FAIL))

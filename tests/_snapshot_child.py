@@ -6,6 +6,7 @@ plans a smaller cache (or refuses outright), so every scenario here gets a fresh
 import json
 import os
 import sys
+import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -179,6 +180,36 @@ def main():
         res["accepted_arrays_identical"] = sum(1 for r in rel if r[0] == 0.0)
         res["accepted_arrays_total"] = len(rel)
         res["accepted_stats"] = st2.as_dict()
+        s.close()
+    elif mode == "vision":
+        # The whole road: image bytes -> tower -> embeddings -> multimodal positions -> a reply
+        # that reads the screenshot; then a text-only turn on the same session, untouched.
+        import base64
+        s = Session(model, persist=False, vision=True)
+        st = s.stats()
+        res["vision_stats"] = st["vision"]; res["reserved_gb"] = st["reserved_gb"]
+        png = open(os.path.join(ROOT, "tests", "fixtures", "vision", "screenshot.png"), "rb").read()
+        url = "data:image/png;base64," + base64.b64encode(png).decode()
+        msgs = [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": url}},
+                                              {"type": "text", "text": "Transcribe all the text in this image exactly, then describe the shapes."}]}]
+        t0 = time.perf_counter(); first = None; out = []
+        for c, _ in s.stream_text(msgs, max_tokens=160, temperature=0.0, think=False):
+            if first is None:
+                first = time.perf_counter() - t0
+            out.append(c)
+        res["reply"] = "".join(out); res["first_token_s"] = round(first or 0, 2); res["seconds"] = round(time.perf_counter() - t0, 2)
+        res["prompt_tokens"] = s._this_prompt_full; res["disarmed"] = all(sw.positions is None for sw in s._rope_switches)
+        res["cache_entries_after_image"] = len(s._prompt_cache.held()) if s._prompt_cache else 0
+        # two images in one message: the second is a plain colour so the answer is checkable
+        from PIL import Image
+        import io
+        im = Image.new("RGB", (256, 256), (20, 40, 200)); buf = io.BytesIO(); im.save(buf, "PNG")
+        url2 = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+        msgs2 = [{"role": "user", "content": [{"type": "text", "text": "First image:"}, {"type": "image_url", "image_url": {"url": url}},
+                                               {"type": "text", "text": "Second image:"}, {"type": "image_url", "image_url": {"url": url2}},
+                                               {"type": "text", "text": "What colour is the second image? Answer in one word."}]}]
+        res["two_image_reply"] = "".join(c for c, _ in s.stream_text(msgs2, max_tokens=12, temperature=0.0, think=False))
+        res["text_after"] = "".join(c for c, _ in s.stream_text([{"role": "user", "content": "Say hello in five words."}], max_tokens=20, temperature=0.0, think=False))
         s.close()
     print("RESULT " + json.dumps(res))
 

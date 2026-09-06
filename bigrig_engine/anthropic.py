@@ -112,7 +112,22 @@ def parse(body: dict, require_max_tokens: bool = True,
             for r in results:
                 out_msgs.append({"role": "tool", "content": _text_of(r.get("content"))})
         else:
-            out_msgs.append({"role": role, "content": text})
+            images = [b for b in blocks if isinstance(b, dict) and b.get("type") == "image"]
+            if images and role == "user":
+                # KEPT AS BLOCKS, IN ORDER. The chat template renders an image block as the
+                # placeholder the vision tower fills (vision.py); flattened to text the picture
+                # would vanish and the model would answer as if it had never been sent.
+                parts = []
+                for b in blocks:
+                    if not isinstance(b, dict):
+                        continue
+                    if b.get("type") == "text" and isinstance(b.get("text"), str):
+                        parts.append({"type": "text", "text": b["text"]})
+                    elif b.get("type") == "image":
+                        parts.append({"type": "image", "source": b.get("source") or {}})
+                out_msgs.append({"role": role, "content": parts})
+            else:
+                out_msgs.append({"role": role, "content": text})
 
     # max_tokens is REQUIRED by /v1/messages. Defaulting it would make us accept requests a real
     # Anthropic endpoint rejects, so a client tested against us would break against them.
@@ -338,7 +353,9 @@ def end_frames(out_tok: int, finish: str | None, extra: dict | None = None,
 
 def count_tokens(tokenizer, parsed: dict) -> int:
     """Best-effort input token count for /v1/messages/count_tokens."""
-    text = "\n".join(m["content"] for m in to_engine_messages(parsed))
+    text = "\n".join(m["content"] if isinstance(m["content"], str)
+                     else "".join(pt.get("text", "") for pt in m["content"] if isinstance(pt, dict))
+                     for m in to_engine_messages(parsed))
     try:
         return len(tokenizer.encode(text))
     except Exception:

@@ -51,6 +51,7 @@ These apply to `run`, `serve` and `launch`:
 | `--prefetch N` | 0 (off) | Name N experts a layer ahead from the hidden state. Off: measured not to pay (0.84× prose, 0.98× code on Qwen3.6). Needs `bigrig predict <model>` first; `BIGRIG_STAGE=1` copies the named experts to the GPU during the layer's attention |
 | `--no-monitor` | — | Turn off quality monitoring |
 | `--no-persist` | — | `run`/`serve`: keep the conversation cache in memory only; by default it is also written to disk so a restart resumes (see below) |
+| `--vision` | — | `run`/`serve`: load the checkpoint's vision encoder and read images (see below) |
 | `--threads N` | 8 | Reader threads for expert fetches |
 | `--trust-remote-code` | — | Also download the model's custom Python |
 
@@ -193,6 +194,35 @@ rig serve <model> --kv-quant-start 16384   # stay full precision for longer befo
 
 `--kv-bits 0` (or `16`) turns compression off. It is a serve-time setting, not per-request: the
 cache is shared across a conversation, so its precision is fixed for the session.
+
+## Seeing: `--vision`
+
+```bash
+rig serve Qwen3.6-35B-A3B-4bit --vision                  # read images on both chat APIs
+rig run   Qwen3.6-35B-A3B-4bit --vision                  # then `/image <path>` before a question
+```
+
+Qwen3.5 and 3.6 ship a vision encoder inside the checkpoint -- 0.89 GB of bf16 weights the text
+engine otherwise discards. `--vision` loads it beside the expert pool (charged to the ceiling
+before the pool is planned; `/health` shows it under `vision` and `reserved_gb`) and accepts
+images on `/v1/chat/completions` (OpenAI `image_url` parts) and `/v1/messages` (Anthropic
+`image` blocks), as base64 data URLs only -- this server fetches nothing. The web page shows an
+attach button when the server can see. Measured on Qwen3.6 at the 9 GB ceiling: a 640x400
+screenshot is 240 image tokens, encodes in half a second, and its text and code came back
+transcribed exactly; the first token arrived after 7 s, the whole reply in 17 s.
+
+The encoder, the preprocessing and the multimodal positions are BigRig's own MLX
+implementations, checked against transformers' on the same inputs: features to a relative error
+of 1e-4 (cosine 1.000000), positions equal for one image and for three images across two turns.
+Activations run in float32 over the bf16 weights because a bf16 residual stream ends far from
+the reference (0.78 cosine) -- the stream reaches a scale where bf16 resolves to 64.
+
+Images are scaled to at most 1.05 megapixels (about 1,000 image tokens); `--vision-pixels N`
+raises it. At most 8 images per request. A request with images does not use or fill the
+conversation cache -- two different images of the same size share identical placeholder
+tokens, so a cache keyed on tokens would hand one picture's state to another -- and guess-ahead
+and the MTP head sit out for it. Video is not read. A checkpoint without an encoder refuses
+`--vision` with a sentence.
 
 ## Embeddings: `--embeddings`
 

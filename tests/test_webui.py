@@ -349,6 +349,35 @@ check("the creativity control explains what the number does, in words",
       "0 always picks the likeliest next word" in _page)
 check("the instructions control says the text stays in this browser", "Kept in this browser only" in _page)
 
+print("\n" + "=" * 84); print("7b. THE ATTACH-IMAGE CONTROL APPEARS ONLY WHEN THE SERVER CAN SEE"); print("=" * 84)
+if node:
+    import copy as _cp
+    _h = json.load(open(os.path.join(FIXDIR, "health.json")))
+    _tmp = os.path.join(ROOT, ".webui-vision")
+    try:
+        os.makedirs(_tmp, exist_ok=True)
+        for _n in ("events.json", "stats.json"):
+            with open(os.path.join(_tmp, _n), "w") as f:
+                f.write(open(os.path.join(FIXDIR, _n)).read())
+        _on = _cp.deepcopy(_h); _on["vision"] = {"tower_gb": 0.893, "max_pixels": 1050000, "max_images": 8}
+        with open(os.path.join(_tmp, "health.json"), "w") as f:
+            json.dump(_on, f)
+        _r = json.loads(subprocess.run([node, RUNNER, _tmp], capture_output=True, text=True).stdout)
+        check("with vision on, the attach control is shown", _r["hidden"].get("l-attach") is False, str(_r["hidden"].get("l-attach")))
+        check("...without throwing", not _r["problems"], str(_r["problems"][:2]))
+        _off = _cp.deepcopy(_h); _off["vision"] = None
+        with open(os.path.join(_tmp, "health.json"), "w") as f:
+            json.dump(_off, f)
+        _r2 = json.loads(subprocess.run([node, RUNNER, _tmp], capture_output=True, text=True).stdout)
+        check("with vision off, it is hidden", _r2["hidden"].get("l-attach") is True, str(_r2["hidden"].get("l-attach")))
+    finally:
+        import shutil as _sh2
+        _sh2.rmtree(_tmp, ignore_errors=True)
+check("an attached image is sent as an OpenAI image_url part before the text, and stays in the history",
+      'image_url:{url:attached.url}' in script and "history.push({role:\"user\",content})" in script)
+check("the page reads the image locally and never uploads it anywhere but this server",
+      "readAsDataURL" in script and "nothing is uploaded anywhere" in html)
+
 print("\n" + "=" * 84); print("8. THE CONTEXT METER READS THE SERVER, NEVER RE-DERIVES THE LIMIT"); print("=" * 84)
 check("the page has a Context meter", 'id="m-ctx"' in html and 'id="m-bar-ctx"' in html)
 check("...filled from context_used and context_remaining as the server reports them",

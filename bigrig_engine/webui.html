@@ -76,6 +76,11 @@ body{background:var(--bg);color:var(--ink);font:15px/1.55 var(--sans);display:fl
 .track i.warn{background:var(--warn)}
 /* nothing measured yet must not read as a full bar of good news */
 .track.idle i{background:var(--line)}
+#l-attach{display:inline-flex;align-items:center;justify-content:center;padding:0 10px;cursor:pointer;user-select:none}
+#attach-row{padding:0 0 6px}
+#attach-chip{display:inline-flex;align-items:center;gap:8px;font-size:12px;color:var(--muted)}
+#attach-thumb{height:36px;width:auto;border-radius:6px;border:1px solid var(--line)}
+.msg.me .txt img.sent{display:block;max-height:160px;max-width:100%;border-radius:8px;margin-bottom:6px;border:1px solid var(--line)}
 .rail .foot{display:flex;align-items:center;justify-content:space-between;gap:.5rem;
             padding:.15rem .35rem 0;font:11px var(--mono);color:var(--faint)}
 .rail .foot span{display:flex;align-items:center;gap:.4rem;overflow:hidden;
@@ -549,7 +554,13 @@ tr.flag td{color:var(--warn)}
       <textarea id="c-sys" rows="2" placeholder="e.g. You are a terse senior engineer. Answer in code first, prose second. Never apologise."></textarea>
       <div class="sys-note">Read before every message you send from now on. To apply a change to a whole conversation, start a new one.</div>
     </div>
+    <div id="attach-row" hidden>
+      <span id="attach-chip" hidden><img id="attach-thumb" alt=""><span id="attach-name"></span>
+        <button type="button" class="ghost sm" id="attach-clear" title="Remove this image">×</button></span>
+    </div>
     <form id="f">
+      <label id="l-attach" class="ghost sm" hidden title="Attach an image to your next message. It is read by the model's own vision encoder, on this Mac; nothing is uploaded anywhere.">
+        <input type="file" id="c-image" accept="image/png,image/jpeg,image/webp,image/gif" hidden>📎</label>
       <textarea id="q" rows="1" placeholder="Message the model…" autofocus></textarea>
       <button id="send" type="submit">Send</button>
     </form>
@@ -1377,6 +1388,7 @@ async function refresh(){
     ["Reloads", String(h.reloads||0)],
   ]);
   $("#l-think").style.display = h.can_toggle_thinking?"":"none";
+  $("#l-attach").hidden = !h.vision; $("#attach-row").hidden = !h.vision;
   buildLimits();
 }
 
@@ -1421,6 +1433,31 @@ const add=(who,cls)=>{ const _b=$("#blank"); if(_b) _b.hidden=true;   // hidden,
   thread.appendChild(m); return m; };
 const scroll=()=>{const p=thread.parentElement;p.scrollTop=p.scrollHeight;};
 
+// AN IMAGE FOR THE NEXT MESSAGE. Read here into a data URL and sent inline as an OpenAI
+// `image_url` part -- the server fetches nothing, so this is the only form it takes. It stays in
+// `history` with the message, so a follow-up question still has the picture in front of the model.
+let attached=null;                      // {url, name}
+const attachChip=$("#attach-chip"), attachThumb=$("#attach-thumb"), attachName=$("#attach-name");
+function clearAttach(){ attached=null; attachChip.hidden=true; attachThumb.removeAttribute("src"); $("#c-image").value=""; }
+$("#c-image").addEventListener("change", e=>{
+  const f=e.target.files&&e.target.files[0]; if(!f) return;
+  const r=new FileReader();
+  r.onload=()=>{ attached={url:String(r.result), name:f.name}; attachThumb.src=attached.url; attachName.textContent=f.name; attachChip.hidden=false; qEl.focus(); };
+  r.readAsDataURL(f);
+});
+$("#attach-clear").addEventListener("click", clearAttach);
+function userContent(text){
+  if(!attached) return text;
+  return [{type:"image_url", image_url:{url:attached.url}}, {type:"text", text}];
+}
+function showUser(el, content){
+  if(typeof content==="string"){ el.textContent=content; return; }
+  for(const part of content){
+    if(part.type==="image_url"){ const im=document.createElement("img"); im.className="sent"; im.src=part.image_url.url; im.alt="attached image"; el.appendChild(im); }
+    else if(part.type==="text"){ el.appendChild(document.createTextNode(part.text)); }
+  }
+}
+
 async function ask(text, cont=false){
   busy=true; stopped=false;
   ctrl=new AbortController();
@@ -1431,8 +1468,10 @@ async function ask(text, cont=false){
     bot=thread.lastElementChild; body=bot.querySelector(".txt");
     bot.querySelector(".cont")?.remove();
   } else {
-    add("you","me").querySelector(".txt").textContent=text;
-    history.push({role:"user",content:text});
+    const content=userContent(text);
+    showUser(add("you","me").querySelector(".txt"), content);
+    history.push({role:"user",content});
+    clearAttach();
     bot=add("model","bot"); body=bot.querySelector(".txt");
   }
   let base=cont?history[history.length-1].content:"";

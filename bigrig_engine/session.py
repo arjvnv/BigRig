@@ -14,6 +14,7 @@ rather than taken on faith.
 """
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
@@ -111,6 +112,11 @@ WORKING_MEMORY_GB = 3.0
 #     threshold now runs fully resident rather than being pushed into streaming -- and resident
 #     is the faster path, so this makes models faster rather than merely smaller.
 RESIDENT_WORKING_MEMORY_GB = 1.5
+
+
+def _vision_max_images() -> int:
+    from . import vision as _v
+    return _v.MAX_IMAGES
 
 
 def serving_reserve_gb(working_memory_gb: float = None,
@@ -820,7 +826,7 @@ class Session:
                  persist: bool = True,
                  kv_quant_start: int | None = None,
                  mtp: str | None = None, mtp_bits: int | None = 4, announce: bool = True,
-                 reserved_gb: float = 0.0,
+                 reserved_gb: float = 0.0, vision: bool = False, vision_pixels: int | None = None,
                  stream_embedding: bool = True):
         # Everything this session was built from, so it can be rebuilt with one setting changed
         # without the caller having to remember the other twenty.
@@ -831,6 +837,7 @@ class Session:
             "interactive": False, "remember": remember, "warm": warm,
             "full_layers": full_layers, "no_full_layers": no_full_layers,
             "draft": draft, "draft_tokens": draft_tokens, "reserved_gb": reserved_gb,
+            "vision": vision, "vision_pixels": vision_pixels,
             "prefetch_width": prefetch_width, "reroute": reroute, "nocache": nocache,
             "prompt_cache_gb": prompt_cache_gb, "kv_bits": kv_bits, "persist": persist,
             "kv_quant_start": kv_quant_start, "mtp": mtp, "mtp_bits": mtp_bits,
@@ -889,6 +896,17 @@ class Session:
         # ANYTHING ELSE THAT LIVES BESIDE THE POOL -- the embedding encoder `--embeddings` loads
         # -- is charged the same way, before the pool is planned, so the ceiling still holds.
         self.reserved_gb = max(0.0, float(reserved_gb or 0.0))
+        # THE VISION TOWER, LOADED FIRST AND CHARGED TO THE CEILING BEFORE THE POOL IS PLANNED.
+        #     0.89 GB of bf16 weights that live beside the pool for the life of the session
+        #     (vision.py). Refused, with a sentence, on a checkpoint that has none.
+        self.tower = None
+        self.preprocessor = None
+        self._rope_switches: list = []
+        if vision:
+            from . import vision as _vision
+            self.tower = _vision.load_tower(self.config_dir)
+            self.preprocessor = _vision.Preprocessor(self.config_dir, max_pixels=vision_pixels)
+            self.reserved_gb += self.tower.nbytes / 1e9
         if self.reserved_gb:
             budget_gb = max(budget_gb * 0.5, budget_gb - self.reserved_gb)
         # THE MODEL'S OWN NEXT-TOKEN HEAD, CHARGED TO THE BUDGET BEFORE THE POOL IS PLANNED.
@@ -1218,6 +1236,8 @@ class Session:
             for line in self.plan_lines:
                 print(line, flush=True)
         self.meter = AdaptiveMeter() if (monitor and _HAVE_METER) else None
+        if self.tower is not None:
+            self._wire_vision()
         self.vocab_size = int(getattr(self.tokenizer, "vocab_size", 0) or
                               len(getattr(self.tokenizer, "get_vocab", dict)()) or 0)
         self.flagged_tokens = 0
@@ -1841,6 +1861,56 @@ class Session:
                 "\n".join(f"{m.get('role','user')}: {m.get('content','')}"
                           for m in messages) + "\nassistant:")
 
+    def _wire_vision(self) -> None:
+        """Swap each full-attention layer's rotary for a RopeSwitch (vision.py). Unarmed, a switch
+        calls the original rotary with the original offset: text requests are untouched."""
+        from . import vision as _vision
+        with open(os.path.join(self.config_dir, "config.json")) as f:
+            cfg = json.load(f)
+        tc = {**cfg.get("text_config", {}), **{k: v for k, v in cfg.items() if k != "text_config"}}
+        rp = tc.get("rope_parameters") or tc.get("rope_scaling") or {}
+        self.image_token_id = int(cfg.get("image_token_id") or tc.get("image_token_id"))
+        self.vision_merge = int((cfg.get("vision_config") or {}).get("spatial_merge_size", 2))
+        head_dim = int(tc.get("head_dim") or tc["hidden_size"] // tc["num_attention_heads"])
+        dims = int(head_dim * float(rp.get("partial_rotary_factor", 1.0)))
+        mrope = _vision.MRope(dims, float(rp.get("rope_theta", 10000.0)), list(rp.get("mrope_section") or [dims // 6] * 3))
+        attns = _vision.full_attention_layers(self.model)
+        if not attns:
+            raise ValueError("--vision: this model has no full-attention layers whose rotary could carry image positions")
+        for attn in attns:
+            sw = _vision.RopeSwitch(attn.rope, mrope)
+            attn.rope = sw
+            self._rope_switches.append(sw)
+
+    def _see(self, ids: list, images: list) -> tuple:
+        """(input embeddings (1, L, D), expanded ids, positions, delta) for a prompt with images.
+
+        Each image goes through the tower once; its tokens replace the template's single
+        placeholder; the text embeddings come from the model's own table and the image rows are
+        scattered in; the positions are the reference's get_rope_index. Float32 image tokens are
+        cast to the language model's dtype at the join, as the reference does.
+        """
+        from . import vision as _vision
+        grids, feats = [], []
+        for data in images:
+            pv, grid = self.preprocessor(data)
+            f = self.tower(mx.array(pv), [grid])
+            mx.eval(f)
+            grids.append(grid)
+            feats.append(f)
+        ids = _vision.expand_placeholders(ids, grids, self.image_token_id, self.vision_merge)
+        tm = getattr(self.model, "language_model", None) or self.model
+        embed = tm.model.embed_tokens
+        emb = embed(mx.array(ids)[None])                                # (1, L, D)
+        rows = mx.array([i for i, t in enumerate(ids) if t == self.image_token_id])
+        img = mx.concatenate(feats, axis=0).astype(emb.dtype)             # (n_image_tokens, D)
+        if int(rows.shape[0]) != int(img.shape[0]):
+            raise ValueError("image tokens and placeholders disagree")
+        emb = emb.at[0, rows].add(img - emb[0, rows])                    # replace, in one scatter
+        pos, delta = _vision.rope_positions(ids, self.image_token_id, grids, self.vision_merge)
+        mx.eval(emb)
+        return emb, ids, pos, delta
+
     def _snapshot_at_history(self, pc, full_ids, prompt_in, messages, prompt, think, tools, gen_kw):
         """Store the cache state at the history boundary, for caches that cannot be rolled back.
 
@@ -1994,6 +2064,9 @@ class Session:
         _orig_call = _mcls.__call__
         _self = self
 
+        # `wraps` keeps the model's own signature visible: mlx_lm decides whether a model takes
+        # `input_embeddings` (the image path) by inspecting __call__, and a bare (*a, **kw) said no.
+        @functools.wraps(_orig_call)
         def _capture(mself, *a, **kw):
             out = _orig_call(mself, *a, **kw)
             try:
@@ -2044,7 +2117,31 @@ class Session:
         # only the UNREAD tail as prompt_tokens, so the size the next turn starts from has to be
         # taken from the full token list when there is one. None -> fall back to what mlx_lm says.
         self._this_prompt_full = None
-        if self._prompt_cache is not None:
+        # A REQUEST WITH IMAGES TAKES ITS OWN ROAD (vision.py). The tower turns each image into
+        # tokens, they are scattered into the prompt's embeddings, and the full-attention layers
+        # are armed with the multimodal positions for this request. No prompt-cache lookup or
+        # store: an image's placeholders are identical for every image of that size, so a key on
+        # token ids would hand one picture's state to another; and no guess-ahead or MTP head.
+        self._images_seen = 0
+        from . import vision as _vision
+        _n_images = _vision.count_images(messages) if messages else 0
+        if _n_images:
+            if self.tower is None:
+                raise ValueError("this request carries an image, but the server was started without "
+                                 "--vision; restart with `--vision` to read images")
+            _imgs = _vision.extract_images(messages)
+            from mlx_lm.models.cache import make_prompt_cache
+            _ids = self.tokenizer.encode(text)
+            _emb, full_ids, _pos, _delta = self._see(_ids, _imgs)
+            self._this_prompt_full = len(full_ids)
+            pc = make_prompt_cache(self.model)
+            gen_kw["prompt_cache"], prompt_in = pc, full_ids
+            gen_kw["input_embeddings"] = _emb[0]
+            for _sw in self._rope_switches:
+                _sw.arm(_pos, _delta)
+            self._images_seen = _n_images
+            lookahead, mtp = False, False
+        elif self._prompt_cache is not None:
             try:
                 full_ids = self.tokenizer.encode(text)
                 self._this_prompt_full = len(full_ids)
@@ -2091,7 +2188,7 @@ class Session:
         # The state at the history boundary, stored for the next turn, on caches that cannot be
         # rolled back to it. See _snapshot_at_history for the miss this fixes.
         self._pre_prefill = 0
-        if pc is not None and not continue_last:
+        if pc is not None and not continue_last and not self._images_seen:
             prompt_in = self._snapshot_at_history(pc, full_ids, prompt_in, messages, prompt,
                                                   think, tools, gen_kw)
         # GUESSING THE NEXT FEW TOKENS FROM TEXT ALREADY WRITTEN, WHEN THE CALLER ASKS FOR IT.
@@ -2300,6 +2397,8 @@ class Session:
             # mid-stream by a client that hung up. Leaving the class patched would
             # outlive the request.
             _mcls.__call__ = _orig_call
+            for _sw in getattr(self, "_rope_switches", ()):
+                _sw.disarm()
             self._last_logits = None
             # What the head bought on this reply, added to the running total the page shows.
             # In `finally` so an abandoned reply still counts what it did.
@@ -2312,7 +2411,7 @@ class Session:
             #
             # In `finally`, so a reply the client abandoned half way is still kept -- the tokens
             # were read either way, and the next turn is just as likely to want them.
-            if pc is not None and full_ids is not None:
+            if pc is not None and full_ids is not None and not getattr(self, "_images_seen", 0):
                 try:
                     # THE SNAPSHOT OUTRANKS THIS ENTRY WHEN THE SEGMENT CANNOT HOLD BOTH. On a cache
                     # that cannot be trimmed, the entry stored here serves only an exact repeat of
@@ -2649,6 +2748,8 @@ class Session:
              "persist": bool(getattr(self, "persist", False)),
              "history_snapshots": int(getattr(self, "history_snapshots", 0)),
              "lookahead_unavailable": getattr(self, "lookahead_unavailable", "") or None,
+             "vision": ({"tower_gb": round(self.tower.nbytes / 1e9, 3), "max_pixels": self.preprocessor.max_pixels,
+                         "max_images": _vision_max_images()} if getattr(self, "tower", None) is not None else None),
              "resumed_conversations": int((getattr(self, "resumed", None) or {}).get("restored", 0)),
              "prompt_cache_bytes": (int(self._prompt_cache.nbytes)
                                     if self._prompt_cache is not None else 0),

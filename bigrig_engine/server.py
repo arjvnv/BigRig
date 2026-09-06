@@ -991,6 +991,9 @@ def make_handler(state: _State):
                 for m in msgs:
                     if not isinstance(m, dict) or "content" not in m:
                         return self._bad("each message needs a `content` field")
+                bad = self._check_images(msgs)
+                if bad:
+                    return self._bad(bad)
 
             try:
                 kw = self._sampling(body, state.session.max_completion_tokens,
@@ -1003,6 +1006,24 @@ def make_handler(state: _State):
             return self._blocking(msgs, prompt, kw, chat)
 
         # ---------------------------------------------------------------- helpers
+        @staticmethod
+        def _check_images(msgs) -> str:
+            """"" if the messages' images can be served, else the sentence to send back as a 400:
+            no tower loaded, too many, or bytes that do not decode. Decoded here so a client's
+            mistake is a 400 with a reason, not a 500 from the model thread."""
+            from . import vision as _vision
+            n = _vision.count_images(msgs)
+            if not n:
+                return ""
+            if getattr(state.session, "tower", None) is None:
+                return ("this request carries an image, but the server was started without --vision; "
+                        "restart with `bigrig serve <model> --vision` to read images")
+            try:
+                _vision.extract_images(msgs)
+            except ValueError as e:
+                return str(e)
+            return ""
+
         def _bad(self, msg):
             _json(self, 400, {"error": {"message": msg, "type": "invalid_request_error"}})
 
@@ -1220,6 +1241,10 @@ def make_handler(state: _State):
             if count_only:
                 n = anth.count_tokens(state.session.tokenizer, parsed)
                 return _json(self, 200, {"input_tokens": n})
+            bad = self._check_images(msgs)
+            if bad:
+                return _json(self, 400, {"type": "error",
+                                         "error": {"type": "invalid_request_error", "message": bad}})
             if parsed.get("tools") and not state.session.supports_tools():
                 return self._bad(
                     f"{state.session.name} has no tool-call format, so it cannot be asked to "
@@ -1904,6 +1929,10 @@ def serve(session, host: str = "127.0.0.1", port: int = 8080, verbose: bool = Tr
             _n = s["resumed_conversations"]
             out.append(f"  {_n} conversation{'s' if _n != 1 else ''} resumed from the last run; "
                        f"a follow-up to any of them skips the re-read")
+        if s.get("vision"):
+            out.append(f"  vision on: image parts accepted on both chat APIs "
+                       f"({s['vision']['tower_gb']:.2f} GB encoder beside the pool, images up to "
+                       f"{s['vision']['max_pixels'] / 1e6:.2f} megapixels)")
         hw = getattr(state, "hot_warm", None) or {}
         if hw.get("bytes"):
             out.append(f"  {hw['bytes'] / 1e9:.1f} GB of the most-used experts read into the page "

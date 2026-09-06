@@ -616,6 +616,8 @@ def _session(a):
                 kv_quant_start=getattr(a, "kv_quant_start", None), verbose=True,
                 persist=not getattr(a, "no_persist", False),
                 reserved_gb=getattr(a, "_reserved_gb", 0.0),
+                vision=bool(getattr(a, "vision", False)),
+                vision_pixels=getattr(a, "vision_pixels", None),
                 force_stream=getattr(a, "force_stream", False),
                 min_bits=getattr(a, "min_bits", None),
                 preference=pref, interactive=True,
@@ -694,9 +696,13 @@ def cmd_run(a) -> int:
     if st.get("resumed_conversations"):
         _n = st["resumed_conversations"]
         print(f"  {_n} conversation{'s' if _n != 1 else ''} resumed from the last run", flush=True)
+    if st.get("vision"):
+        print(f"  vision on: `/image <path>` attaches a picture to your next message "
+              f"({st['vision']['tower_gb']:.2f} GB encoder beside the pool)", flush=True)
     print(f"  quality monitor {'on' if st['monitor'] else 'off'}. Ctrl-C to stop, "
           f"'/stats' for numbers, '/quit' to exit.\n")
     history = []
+    pending_images: list = []
     try:
         while True:
             try:
@@ -711,7 +717,33 @@ def cmd_run(a) -> int:
                 for k, v in s.stats().items():
                     print(f"    {k:<16} {v}")
                 continue
-            history.append({"role": "user", "content": q})
+            if q.startswith("/image "):
+                # A picture for the NEXT message: read now, sent with the text that follows.
+                if s.tower is None:
+                    print("  start with --vision to attach images\n")
+                    continue
+                path = os.path.expanduser(q[len("/image "):].strip().strip("'\""))
+                try:
+                    with open(path, "rb") as f:
+                        data = f.read()
+                    from PIL import Image as _Image
+                    import io as _io
+                    im = _Image.open(_io.BytesIO(data)); im.load()
+                    n_tok = s.preprocessor.tokens_for(im.size[1], im.size[0])
+                except Exception as e:                  # noqa: BLE001
+                    print(f"  could not read {path}: {e}\n")
+                    continue
+                import base64 as _b64
+                pending_images.append({"type": "image_url", "image_url": {
+                    "url": "data:image/png;base64," + _b64.b64encode(data).decode()}})
+                print(f"  attached {os.path.basename(path)} ({im.size[0]}x{im.size[1]}, {n_tok} image tokens); "
+                      f"type your question\n")
+                continue
+            if pending_images:
+                history.append({"role": "user", "content": pending_images + [{"type": "text", "text": q}]})
+                pending_images = []
+            else:
+                history.append({"role": "user", "content": q})
             print("  bot > ", end="", flush=True)
             parts, flagged, t0 = [], 0, time.perf_counter()
             run, longest = 0, 0
@@ -1303,6 +1335,9 @@ def build_parser():
                    help="keep the conversation cache in memory only. By default it is also "
                         "written to disk between turns so a restart resumes where you were; "
                         "`bigrig sessions` shows and clears what is kept.")
+    r.add_argument("--vision", action="store_true",
+                   help="load the vision encoder so `/image <path>` in the chat attaches a picture "
+                        "to your next message.")
     r.set_defaults(fn=cmd_run)
 
     cp = sub.add_parser("compress", help="shrink a model so every expert fits in RAM")
@@ -1392,6 +1427,15 @@ def build_parser():
                     help="keep the conversation cache in memory only. By default it is also "
                          "written to disk while the server is idle so a restart resumes every "
                          "conversation it held; `bigrig sessions` shows and clears what is kept.")
+    sv.add_argument("--vision", action="store_true",
+                    help="also read images: load the vision encoder the checkpoint ships (Qwen3.5/3.6: "
+                         "0.89 GB, charged to the ceiling before the pool is planned) and accept "
+                         "image parts on /v1/chat/completions and /v1/messages as base64 data URLs. "
+                         "Refused on a checkpoint without one.")
+    sv.add_argument("--vision-pixels", type=int, default=None, metavar="N",
+                    help="largest image the encoder reads, in pixels (default 1,050,000: about 1,000 "
+                         "image tokens; bigger images are scaled down to it). Raise it on a Mac with "
+                         "memory to spare.")
     sv.add_argument("--embeddings", nargs="?", const=True, default=None, metavar="REPO",
                     help="also serve /v1/embeddings with a small sentence encoder, downloaded on "
                          "first use (default BAAI/bge-small-en-v1.5: 133 MB, 384 dimensions, "
