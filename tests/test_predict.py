@@ -221,8 +221,8 @@ check("every substitution is counted, and what it cost is recorded",
       "self.reroutes += 1" in _rr and "self.reroute_lost +=" in _rr)
 check("...and reported, so the trade is visible rather than silent",
       '"reroutes"' in inspect.getsource(stream.StreamHandle.stats))
-check("the session reports the tolerance it is running at",
-      '"reroute": self.reroute_tol or None' in inspect.getsource(session.Session.stats))
+# The session reports the tolerance it is running at (`reroute`, None when off): asserted on a
+# live server's /health in tests/test_product.py.
 check("the flag says plainly that the output changes",
       "THIS CHANGES THE OUTPUT" in open(
           os.path.join(ROOT, "bigrig_engine/cli.py")).read())

@@ -133,10 +133,27 @@ for term in ("MIN_HEADROOM_GB", "OS_AND_RUNTIME_GB", "WORKING_MEMORY_GB"):
     check(f"{term} is never used here -- the planner owns it", term not in _names,
           f"used as a name in preflight.py")
 check("...and it is named in the docstring only to say why", "MIN_HEADROOM_GB" in src)
-check("the planner is called rather than imitated",
-      "choose_capacity" in src and src.count("choose_capacity") >= 2)
+# Observed, not read: the planner is patched with a counter and the search run through it.
+from bigrig_engine import autoconfig as _ac
+_calls = []
+_real_cc = _ac.choose_capacity
+
+
+def _counting(*a, **kw):
+    _calls.append(kw.get("budget_gb"))
+    return _real_cc(*a, **kw)
+_ac.choose_capacity = _counting
+try:
+    _need, _plan = preflight.smallest_ceiling(shape(), RESERVE, hi=1024.0)
+finally:
+    _ac.choose_capacity = _real_cc
+check("the planner is called rather than imitated", len(_calls) > 0 and _plan is not None, str(len(_calls)))
+# A bisection over [0, 1024] to the precision the answer is given at takes on the order of
+# log2(1024 / 0.1) ~ 13 probes, not one (a formula) and not hundreds (a linear scan).
 check("...and the search is a bisection over it, not a formula",
-      "def accepts" in src and "hi) / 2" in src)
+      4 <= len(_calls) <= 40 and _need is not None
+      and all(_calls[i] != _calls[i + 1] for i in range(len(_calls) - 1)),
+      f"{len(_calls)} probes: {[round(c, 2) for c in _calls][:12]}")
 
 print()
 print("=" * 84)

@@ -231,8 +231,20 @@ print("=" * 82)
 # decode step or on a chunk that wants only a few experts.
 import inspect as _ins2
 _src3 = _ins2.getsource(stream.StreamingSwitchGLU.__call__)
-check("off unless asked", stream.VIEWS_PREFILL is False and "BIGRIG_VIEWS_PREFILL" in
-      open(os.path.join(ROOT, "bigrig_engine", "stream.py")).read())
+import subprocess as _sp3
+import sys as _sys3
+
+
+def _flag(name, env_value, var):
+    env = dict(os.environ)
+    env.pop(var, None)
+    if env_value is not None:
+        env[var] = env_value
+    return _sp3.run([_sys3.executable, "-c", "import sys; sys.path.insert(0, %r); "
+                     "from bigrig_engine import stream; print(stream.%s)" % (ROOT, name)],
+                    capture_output=True, text=True, env=env).stdout.strip()
+check("off unless asked", stream.VIEWS_PREFILL is False and _flag("VIEWS_PREFILL", None, "BIGRIG_VIEWS_PREFILL") == "False"
+      and _flag("VIEWS_PREFILL", "1", "BIGRIG_VIEWS_PREFILL") == "True")
 check("only a real prefill chunk that wants most of the layer takes it",
       "flat.shape[0] >= VIEWS_MIN_TOKENS" in _src3 and "VIEWS_MIN_SHARE * self._pool.n_experts" in _src3
       and stream.VIEWS_MIN_TOKENS >= 4)
@@ -425,8 +437,9 @@ try:
 finally:
     stream.ZERO_COPY = _prev
     del _aligned; _mm.close(); os.close(_fd); os.unlink(_f.name)
-check("zero-copy is on by default and switchable", 'os.environ.get("BIGRIG_ZERO_COPY", "1") != "0"' in
-      open(os.path.join(ROOT, "bigrig_engine", "stream.py"), encoding="utf-8").read())
+check("zero-copy is on by default and switchable",
+      _flag("ZERO_COPY", None, "BIGRIG_ZERO_COPY") == "True" and _flag("ZERO_COPY", "0", "BIGRIG_ZERO_COPY") == "False"
+      and _flag("ZERO_COPY", "1", "BIGRIG_ZERO_COPY") == "True")
 check("...and the whole-map variant that wires the file is written down as rejected",
       "wired 316 MB" in open(os.path.join(ROOT, "bigrig_engine", "stream.py"), encoding="utf-8").read())
 

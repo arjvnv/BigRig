@@ -176,10 +176,13 @@ check("with the cache compressed the ceiling rises",
       _c(_S(kv_bits=4))[0] > _c(_S())[0], f"{_c(_S())[0]} -> {_c(_S(kv_bits=4))[0]}")
 check("...and stops at the model's own window rather than exceeding it",
       _c(_S(kv_bits=4))[0] <= 40960 and _c(_S(kv_bits=4))[1] == "context")
-check("an impossible bit width is refused at construction",
-      "kv_bits must be one of" in _mod_src)
-check("the setting is reported, so a client can tell whether it is on",
-      '"kv_bits": self.kv_bits' in _mod_src)
+try:
+    S.resolve_kv_bits(7)
+    _refused = False
+except ValueError as e:
+    _refused = "kv_bits" in str(e)
+check("an impossible bit width is refused at construction", _refused and S.resolve_kv_bits(4) == 4)
+# The setting is reported (`kv_bits` on /health): asserted on a live server in tests/test_product.py.
 
 print()
 print("=" * 84)

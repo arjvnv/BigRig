@@ -290,10 +290,25 @@ check("asking about an address that is not mapped does not raise, it declines to
       _fx.pages_resident(0x10, 64) in (True, False))
 check("the warm-read count is kept, so a run can say how often the cache was cold",
       isinstance(_store.warm_reads, int) and _store.warm_reads >= 0)
+# The mode is read from the environment at import: re-import the module under each setting.
+import importlib as _il
+import subprocess as _sp
+import sys as _sys
+
+
+def _mode(env_value):
+    env = dict(os.environ)
+    env.pop("BIGRIG_WARM_READ", None)
+    if env_value is not None:
+        env["BIGRIG_WARM_READ"] = env_value
+    return _sp.run([_sys.executable, "-c", "import sys; sys.path.insert(0, %r); "
+                    "from bigrig_engine import fetch; print(fetch.WARM_MODE)" % ROOT],
+                   capture_output=True, text=True, env=env).stdout.strip()
 check("the mode is read from the environment and is adaptive unless asked: one admit in eight "
       "probed, every admit for 64 after a cold one",
-      "BIGRIG_WARM_READ" in open(os.path.join(ROOT, "bigrig_engine", "fetch.py")).read()
-      and _fx.WARM_MODE == "auto" and _fx.PROBE_EVERY == 8 and _fx.FULL_AFTER_COLD == 64)
+      _mode(None) == "auto" and _mode("1") == "on" and _mode("0") == "off"
+      and _fx.PROBE_EVERY == 8 and _fx.FULL_AFTER_COLD == 64,
+      f"{_mode(None)} / {_mode('1')} / {_mode('0')}")
 # Warm, the probe must be rare: 800 views of resident regions probe about one in eight.
 _st2 = _fx.WeightStore(_fp, {(0, 0): _fx.Region(0, _fx._PAGE)})
 for _i in range(800):

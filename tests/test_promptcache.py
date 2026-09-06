@@ -35,9 +35,10 @@ print("=" * 84)
 # were allocated outside it, every byte the cache holds would be a byte over the ceiling the user
 # set -- and the ceiling is the entire promise this product makes.
 import inspect                                                          # noqa: E402
+check("the cache budget is added to the serving reserve, gigabyte for gigabyte",
+      abs((S.serving_reserve_gb(prompt_cache_gb=0.7) - S.serving_reserve_gb(prompt_cache_gb=0.2)) - 0.5) < 1e-9
+      and S.serving_reserve_gb(prompt_cache_gb=0.0) < S.serving_reserve_gb())
 _src = inspect.getsource(S.Session.__init__)
-check("the cache budget is added to the serving reserve",
-      "prompt_cache_gb" in _src and "serving_reserve_gb" in _src)
 check("...before choose_capacity is asked anything",
       _src.index("self.prompt_cache_gb") < _src.index("choose_capacity"))
 check("a session can turn it off entirely", "prompt_cache_gb" in
@@ -203,8 +204,8 @@ check("a match shorter than the floor is discarded rather than served",
       "_matched < MIN_REUSE_TOKENS" in _src)
 check("promotion is decided by the SHARE reused, not by the fact of a match",
       "PROVEN_REUSE_FRACTION * len(full_ids)" in _src)
-check("how much was actually reused is reported, so a weak hit is visible from outside",
-      "prompt_cache_matched" in inspect.getsource(S.Session.stats))
+# How much was actually reused is reported (`prompt_cache_matched`): asserted live, per turn, in
+# tests/test_persist.py and tests/test_snapshot.py, where the numbers are what the checks rest on.
 # The engine does NOT pretend a changed prefix can be reused. Attention state is positional: if a
 # token near the front differs, every key and value after it is genuinely different, and serving
 # them would be wrong rather than merely stale.

@@ -166,12 +166,31 @@ s, d = R(interactive=True, reader=lambda _: next(it), writer=w, remember=False)
 check("a one-off answer is not remembered", consent.load_choice(BLOB) is None)
 
 print("\n" + "=" * 82); print("7. THE TERMINAL TEST ITSELF"); print("=" * 82)
-import inspect
-src = inspect.getsource(consent.is_interactive)
+# Driven with stand-in streams, not read: each combination of ends is tried through the function.
+import sys as _sys
+
+
+class _Tty:
+    def __init__(self, tty): self._t = tty
+    def isatty(self): return self._t
+
+
+class _Gone:
+    def isatty(self): raise ValueError("I/O operation on closed file")
+
+
+def _with(stdin, stderr):
+    _i, _e = _sys.stdin, _sys.stderr
+    _sys.stdin, _sys.stderr = stdin, stderr
+    try:
+        return consent.is_interactive()
+    finally:
+        _sys.stdin, _sys.stderr = _i, _e
 check("a terminal means BOTH ends, not just stdout",
-      "stdin.isatty" in src and "stderr.isatty" in src)
+      _with(_Tty(True), _Tty(True)) is True and _with(_Tty(True), _Tty(False)) is False
+      and _with(_Tty(False), _Tty(True)) is False)
 check("...and a missing stream is not mistaken for a terminal",
-      "except" in src and "return False" in src)
+      _with(_Gone(), _Tty(True)) is False and _with(_Tty(True), None) is False)
 # interactive=True is a REQUEST, not an assertion; the real check still has to pass.
 try:
     R(interactive=True)     # no tty under a test runner

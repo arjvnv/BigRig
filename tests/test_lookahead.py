@@ -155,8 +155,17 @@ check("the module says plainly that an accepted token is not always the token gr
       "not always" in _src)
 check("...and records where the technique pays and where it does not",
       "does not translate" in _src or "open prose" in _src.lower())
+sys.path.insert(0, os.path.join(ROOT, "tests"))
+from _fakeserver import fake_server, post as _fpost                    # noqa: E402
+import inspect as _insp                                                 # noqa: E402
+from bigrig_engine import session as _sess                              # noqa: E402
+with fake_server() as (_url, _state, _fs):
+    _fpost(_url, "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 2})
+    _fpost(_url, "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 2, "lookahead": True})
 check("it is wired into the serving path, and OFF unless a request asks",
-      "lookahead: bool = False" in open(os.path.join(ROOT, "bigrig_engine", "session.py")).read())
+      _insp.signature(_sess.Session.stream_text).parameters["lookahead"].default is False
+      and len(_fs.calls) == 2 and not _fs.calls[0].get("lookahead") and _fs.calls[1].get("lookahead") is True,
+      str([c.get("lookahead") for c in _fs.calls]))
 check("the break-even table is recorded next to the code it justifies", "break-even" in _src)
 
 print()

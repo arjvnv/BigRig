@@ -111,9 +111,29 @@ check("an unterminated string is closed before brackets are",
       isinstance(r('{"name":"f","arguments":{"t":"abc'), dict))
 check("something that is not JSON at all returns nothing", r("not json") is None)
 check("...and so does an empty payload", r("") is None and r("   ") is None)
+# Observed: a parser that accepts everything is never followed by a repair; one that refuses is.
+class _CountingSess(_Sess):
+    def __init__(self, accept):
+        self.repairs = 0
+        self._accept = accept
+        tok = _Tok()
+        me = self
+
+        def parser(body, tools):
+            if me._accept:
+                return {"name": "ok", "arguments": {}}
+            raise ValueError("refused")
+        tok._tool_parser = staticmethod(parser)
+        self.tokenizer = tok
+
+    def _repair_json(self, body):
+        self.repairs += 1
+        return S.Session._repair_json(body)
+_acc, _ref = _CountingSess(True), _CountingSess(False)
+_acc.extract_tool_calls('<tool_call>{"name":"f","arguments":{"a":1}</tool_call>', None)
+_ref.extract_tool_calls('<tool_call>{"name":"f","arguments":{"a":1}</tool_call>', None)
 check("repair runs only after the model's own parser has refused",
-      inspect.getsource(S.Session.extract_tool_calls).index("parser(") <
-      inspect.getsource(S.Session.extract_tool_calls).index("_repair_json"))
+      _acc.repairs == 0 and _ref.repairs == 1, f"{_acc.repairs} / {_ref.repairs}")
 
 print()
 print("=" * 84)
@@ -207,8 +227,13 @@ check("the measured numbers live next to the code they justify",
       "3-bit" in inspect.getsource(S.Session._repair_json))
 check("the honest limit is stated: repair fixes syntax, never meaning",
       "invent" in inspect.getsource(S.Session._repair_json))
-check("a malformed call is dropped rather than passed on as text", "not passed on" in _sess_src
-      or "removed and the reply" in _sess_src)
+_t, _c = sx.extract_tool_calls('Before <tool_call>call the thing please</tool_call> after', None)
+check("a malformed call that cannot be repaired is dropped rather than passed on as text",
+      _c == [] and "<tool_call>" not in _t and "call the thing" not in _t and "Before" in _t and "after" in _t,
+      repr((_t, _c)))
+_t, _c = sx.extract_tool_calls('Before <tool_call>{"name": "f", "arguments": {"a": [1, 2</tool_call> after', None)
+check("...while one whose only fault is syntax is repaired and lifted out",
+      _c == [{"name": "f", "arguments": {"a": [1, 2]}}] and "<tool_call>" not in _t, repr((_t, _c)))
 
 print()
 print("=" * 84)

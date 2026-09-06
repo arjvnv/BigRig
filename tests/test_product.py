@@ -476,7 +476,8 @@ check("...while a partly-resident one does say what it streams",
 check("the untouched case says untouched", "untouched" in _nat, _nat)
 # Piped to a file, Python block-buffers stdout. An unflushed disclosure is lost if the process
 # is killed -- measured: the banner was absent from a killed server's log until this was fixed.
-check("the server flushes its disclosure", "flush=True" in _i3.getsource(_sv.serve))
+# The server's flush is checked live below: the disclosure must be readable in the piped log
+# WHILE the server is still running, not only after it exits.
 check("the terminal path flushes its disclosure too",
       "flush=True" in _i3.getsource(cli.cmd_run))
 # A decision the user has to make is not a crash.
@@ -488,8 +489,7 @@ _cs = _i3.getsource(cli._session)
 check("--exact and --compress cannot both be given", "contradict each other" in _cs)
 check("--forget-choice is wired to the consent store", "forget_choice" in _cs)
 check("consent is requested with interactive=True from the CLI", "interactive=True" in _cs)
-check("stats expose whether the weights were altered",
-      "weights_altered" in _i3.getsource(_ss.Session.stats))
+# `weights_altered` is asserted on the live server's /health below.
 
 print("\n" + "=" * 80); print("5. THE SERVER, AGAINST A LIVE MODEL"); print("=" * 80)
 # As the heading says: a live model. Without one there is no server to bring up, and the forty
@@ -751,6 +751,14 @@ if up:
     _missing = [k for k, t in _want.items() if not isinstance(hc2.get(k, object()), t)]
     check("a live session reports every field the page and the docs rely on, with the right type",
           not _missing, str({k: hc2.get(k) for k in _missing}))
+    check("stats expose whether the weights were altered, and for a streamed model they were not",
+          hc2.get("weights_altered") is False, str(hc2.get("weights_altered")))
+    check("the KV precision in force is reported", hc2.get("kv_bits") == 4, str(hc2.get("kv_bits")))
+    check("rerouting is off unless a tolerance is given, and the report says so",
+          hc2.get("reroute") is None, str(hc2.get("reroute")))
+    _live_log = open(LOG).read()
+    check("the server flushes its disclosure: the serving line is in the piped log while it still runs",
+          "serving" in _live_log and hc2.get("serving", "")[:20] in _live_log, _live_log[-300:])
     check("no draft means no draft fields pretending to be measurements",
           hc2.get("draft") is None and hc2.get("draft_acceptance") is None,
           f"{hc2.get('draft')!r} / {hc2.get('draft_acceptance')!r}")

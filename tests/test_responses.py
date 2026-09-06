@@ -129,8 +129,21 @@ check("...with a permissive schema, since they carry none",
       == "object")
 check("an already-wrapped function tool is passed through untouched",
       f([{"type": "function", "function": {"name": "g"}}])[0]["function"]["name"] == "g")
-check("nesting is bounded, so a malicious payload cannot recurse forever",
-      "_depth > 3" in inspect.getsource(R.tools_to_openai))
+_deep = {"type": "function", "function": {"name": "leaf"}}
+for _ in range(50):
+    _deep = {"type": "namespace", "name": "n", "tools": [_deep]}
+try:
+    f([_deep])
+    _bounded = False
+except R.BadRequest as e:
+    _bounded = "nested" in str(e)
+except RecursionError:
+    _bounded = False
+check("nesting is bounded, so a malicious payload cannot recurse forever", _bounded)
+_three = {"type": "function", "function": {"name": "leaf"}}
+for _ in range(3):
+    _three = {"type": "namespace", "name": "n", "tools": [_three]}
+check("...while a reasonable depth is still followed", f([_three])[0]["function"]["name"].endswith("leaf"))
 check("no tools at all is None rather than an empty list, which the template treats differently",
       f([]) is None and f(None) is None)
 
