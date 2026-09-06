@@ -139,6 +139,22 @@ ordinary decoding; an accepted guess and the token after it come from a two-toke
 arithmetic through different kernels. How often that flips a near-tie is measured in
 measurement. It is a choice, not a default.
 
+## Guessing a few tokens ahead from the text: `lookahead`
+
+Per request (`"lookahead": true`; the page's "guess ahead"), no extra model: when the last few
+tokens have appeared earlier in the conversation, whatever followed them last time is proposed as
+the next few tokens and checked in one pass. It pays when the reply repeats something already
+written -- quoting a document, continuing a list (measured 1.48x on a verbatim passage) -- and
+costs a little when it does not (0.87x on an ordinary question on Qwen3-30B, 0.93x with thinking
+on Qwen3.6). Every token that comes out is one the model chose; the rejection path is bit-identical
+to ordinary decoding.
+
+On a model with recurrent state (Qwen3.6, Nemotron) the state at an intermediate position is
+never materialised, so after a rejected guess the engine puts every layer back and re-reads the
+tokens it kept -- one extra pass, reported as `rereads`. That is why acceptance has to be high
+for it to pay on those models. A build before this re-read left rejected guesses in the state,
+which showed up as a reply repeating the user's own sentence; if you saw that, update.
+
 ## The file as the pool: `--file-pool`
 
 ```bash

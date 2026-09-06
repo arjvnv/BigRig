@@ -72,6 +72,7 @@ class Stats:
     def __init__(self):
         self.drafted = self.accepted = self.rounds = self.passes = 0
         self.backed_off = 0
+        self.rereads = 0            # passes spent re-reading kept tokens on a cache that cannot trim
 
     @property
     def acceptance(self) -> float:
@@ -80,7 +81,8 @@ class Stats:
     def as_dict(self) -> dict:
         return {"drafted": self.drafted, "accepted": self.accepted,
                 "acceptance": round(self.acceptance, 4), "rounds": self.rounds,
-                "verify_passes": self.passes, "backed_off": self.backed_off}
+                "verify_passes": self.passes, "backed_off": self.backed_off,
+                "rereads": self.rereads}
 
 
 def propose(context: list, n_gram: int = 3, k: int = 4, min_gram: int = 2) -> list:
@@ -138,8 +140,21 @@ def verify(model, cache, last_token: int, draft: list, sampler=None,
         The cache is left holding exactly the accepted tokens. Anything drafted and rejected was
         written into it by this pass and is trimmed off, or the next step attends to tokens the
         model never emitted.
+
+    A CACHE THAT CANNOT BE TRIMMED IS PUT BACK AND RE-READ. mlx_lm's trim does nothing at all
+        when any layer holds recurrent state (Qwen3.6, Nemotron) -- it returns 0 and every layer
+        keeps the rejected tokens. That was the bug behind a reply that repeated the user's own
+        sentence dozens of times with "guess ahead" on: each rejected guess stayed in the model's
+        state as if written. Now the state is snapshotted before the pass (references; free) and
+        on any rejection every layer goes back to it and the tokens that WERE kept are read again
+        in one pass. A recurrent layer's state at an intermediate position was never materialised,
+        so that re-read is the only exact way to land on it; it costs one more pass on a
+        rejection, which is why acceptance has to be high for this to pay on such a model.
     """
     from mlx_lm.models.cache import trim_prompt_cache
+    from . import rollback as _rb
+    trimmable = _rb.all_trimmable(cache)
+    snap = None if trimmable else _rb.snapshot(cache)      # raises TypeError: refuse, never corrupt
     ids = [int(last_token)] + [int(t) for t in draft]
     logits = model(mx.array(ids)[None], cache=cache)
     if sampler is None:
@@ -161,7 +176,15 @@ def verify(model, cache, last_token: int, draft: list, sampler=None,
     # token that produced `picks[len(keep)]`; it stays, the rest go.
     extra = len(ids) - (len(keep) + 1)
     if extra > 0:
-        trim_prompt_cache(cache, extra)
+        if trimmable:
+            trim_prompt_cache(cache, extra)
+        else:
+            _rb.restore(cache, snap)
+            model(mx.array(ids[:len(keep) + 1])[None], cache=cache)
+            mx.eval([c.state for c in cache if hasattr(c, "state")])
+            if stats is not None:
+                stats.passes += 1
+                stats.rereads += 1
     if stats is not None:
         stats.rounds += 1
         stats.passes += 1
@@ -247,6 +270,10 @@ def stream(model, tokenizer, prompt, max_tokens: int = 256, prompt_cache=None, s
     ids = [int(t) for t in ids]
     if prompt_cache is None:
         prompt_cache = make_prompt_cache(model)
+    from . import rollback as _rb
+    _why = _rb.supported(prompt_cache)
+    if _why:
+        raise TypeError(f"guess-ahead cannot run on this model: {_why}")
     st = stats if stats is not None else Stats()
     detok = tokenizer.detokenizer
     detok.reset()

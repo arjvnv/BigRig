@@ -59,20 +59,28 @@ print()
 print("=" * 84)
 print("2. VERIFICATION MUST STOP AT THE FIRST WRONG GUESS, AND LEAVE THE CACHE EXACT")
 print("=" * 84)
-# A fake model and a fake cache, so acceptance and trimming are checked against a known answer
-# rather than against whatever a real model happens to do.
+# Fake caches of the two kinds a real model has, and a fake model that records what it was fed,
+# so acceptance and rollback are checked against a known answer through the REAL verify, the
+# real mlx_lm trim and the real rollback -- nothing patched.
 import mlx.core as mx                                                   # noqa: E402
 import bigrig_engine.lookahead as LA                                    # noqa: E402
 
 
-class _Cache:
-    def __init__(self):
-        self.n = 0
+class _KV:
+    """An attention cache: a write position that trims."""
+    def __init__(self): self.offset = 0
+    def is_trimmable(self): return True
+    def trim(self, n):
+        n = min(n, self.offset); self.offset -= n; return n
 
 
-def _fake_trim(cache, k):
-    cache[0].n -= k
-    return k
+class _Recurrent:
+    """A recurrent-state cache, the ArraysCache shape: `cache` is a list the model REBINDS. The
+    state here is the tuple of every token id it has processed, so a phantom token is visible."""
+    def __init__(self): self.cache = [()]
+    def is_trimmable(self): return False
+    def __getitem__(self, i): return self.cache[i]
+    def __setitem__(self, i, v): self.cache[i] = v
 
 
 class _Model:
@@ -81,51 +89,87 @@ class _Model:
 
     def __init__(self):
         self.vocab = 200
+        self.calls = []
 
     def __call__(self, ids, cache=None):
-        n = ids.shape[1]
-        cache[0].n += n
+        toks = [int(t) for t in ids[0]]
+        self.calls.append(toks)
+        for c in cache:
+            if isinstance(c, _KV):
+                c.offset += len(toks)
+            else:
+                c[0] = tuple(c[0]) + tuple(toks)             # rebinding, as the real layer does
         rows = []
-        for j in range(n):
+        for j in range(len(toks)):
             row = [0.0] * self.vocab
             row[self.TRUTH[j]] = 10.0
             rows.append(row)
         return mx.array([rows])
 
 
-_real_trim = None
-try:
-    import mlx_lm.models.cache as _C
-    _real_trim = _C.trim_prompt_cache
-    _C.trim_prompt_cache = _fake_trim
+def _fresh(mixed):
+    return [_KV(), _Recurrent(), _KV()] if mixed else [_KV(), _KV()]
 
+
+for mixed in (False, True):
+    kind = "a cache with recurrent state (Qwen3.6, Nemotron)" if mixed else "a cache that trims (KV only)"
+    print(f"  -- {kind}")
     # Every guess right: all kept, plus the free token after them.
-    c, st = [_Cache()], Stats()
-    got, _lg, _row = LA.verify(_Model(), c, 99, [100, 101, 102], None, st)
+    c, st, m = _fresh(mixed), Stats(), _Model()
+    got, _lg, _row = LA.verify(m, c, 99, [100, 101, 102], None, st)
     check("a fully correct draft keeps every token and takes the free one after it",
           got == [100, 101, 102, 103], str(got))
-    check("...and the cache holds exactly those, no more", c[0].n == 4, str(c[0].n))
-    check("...and the stats say so", st.accepted == 3 and st.drafted == 3)
+    check("...and the cache holds exactly those, no more",
+          all(k.offset == 4 for k in c if isinstance(k, _KV))
+          and all(r[0] == (99, 100, 101, 102) for r in c if isinstance(r, _Recurrent)),
+          str([(k.offset if isinstance(k, _KV) else k[0]) for k in c]))
+    check("...and the stats say so", st.accepted == 3 and st.drafted == 3 and st.rereads == 0)
 
     # Wrong in the middle: everything after it is invalid and must be dropped.
-    c, st = [_Cache()], Stats()
-    got, _lg, _row = LA.verify(_Model(), c, 99, [100, 999, 102], None, st)
+    c, st, m = _fresh(mixed), Stats(), _Model()
+    got, _lg, _row = LA.verify(m, c, 99, [100, 999, 102], None, st)
     check("a draft wrong in the middle stops there rather than keeping later guesses",
           got == [100, 101], str(got))
-    check("...and the cache is trimmed back to exactly what was kept", c[0].n == 2, str(c[0].n))
+    check("...and every layer is left holding exactly what was kept -- no phantom tokens",
+          all(k.offset == 2 for k in c if isinstance(k, _KV))
+          and all(r[0] == (99, 100) for r in c if isinstance(r, _Recurrent)),
+          str([(k.offset if isinstance(k, _KV) else k[0]) for k in c]))
     check("...and acceptance is counted honestly", st.accepted == 1 and st.drafted == 3)
+    if mixed:
+        check("...a recurrent model re-reads the kept tokens in one extra pass, and says so",
+              st.rereads == 1 and st.passes == 2 and m.calls[-1] == [99, 100], str(m.calls))
+    else:
+        check("...a trimmable model needs no extra pass", st.rereads == 0 and st.passes == 1 and len(m.calls) == 1)
 
     # Entirely wrong: still yields one real token, which is what makes the worst case break even.
-    c, st = [_Cache()], Stats()
-    got, _lg, _row = LA.verify(_Model(), c, 99, [999, 998, 997], None, st)
+    c, st, m = _fresh(mixed), Stats(), _Model()
+    got, _lg, _row = LA.verify(m, c, 99, [999, 998, 997], None, st)
     check("a wholly wrong draft still returns the token an ordinary step would have",
           got == [100], str(got))
-    check("...and leaves the cache holding one token, not four", c[0].n == 1, str(c[0].n))
+    check("...and leaves the cache holding one token, not four",
+          all(k.offset == 1 for k in c if isinstance(k, _KV))
+          and all(r[0] == (99,) for r in c if isinstance(r, _Recurrent)),
+          str([(k.offset if isinstance(k, _KV) else k[0]) for k in c]))
     check("...so a wrong guess costs a pass, never a wrong token", st.accepted == 0)
     check("acceptance rate is reported, and is zero here", st.acceptance == 0.0)
-finally:
-    if _real_trim is not None:
-        _C.trim_prompt_cache = _real_trim
+
+# THE BUG, REPRODUCED ON THE FAKE: mlx_lm's trim alone leaves the rejected guess in every layer.
+from mlx_lm.models.cache import trim_prompt_cache as _trim                # noqa: E402
+c, m = _fresh(True), _Model()
+m(mx.array([[99, 999, 998]]), cache=c)
+_trim(c, 2)
+check("mlx_lm's trim does nothing on a cache with a recurrent layer (the defect this guards)",
+      c[0].offset == 3 and c[1][0] == (99, 999, 998), str([c[0].offset, c[1][0]]))
+
+
+class _Opaque:
+    def is_trimmable(self): return False
+try:
+    LA.verify(_Model(), [_KV(), _Opaque()], 99, [100], None, Stats())
+    check("a layer that can be neither trimmed nor put back is refused, never corrupted", False)
+except TypeError as e:
+    check("a layer that can be neither trimmed nor put back is refused, never corrupted",
+          "Opaque" in str(e) and "put back" in str(e), str(e))
 
 print()
 print("=" * 84)
@@ -323,6 +367,40 @@ check("the bisect and its numbers are recorded, not just the conclusion",
 # ceiling within three accepted guesses and never pays for a wide miss on the way.
 check("the honest conclusion is stated rather than a fix implied",
       "honest price" in src)
+
+print()
+print("=" * 84)
+print("6. ON A REAL MODEL WITH RECURRENT STATE, A REJECTED GUESS LEAVES NO TRACE")
+print("=" * 84)
+_real = next((m for m in ("Qwen3.6-35B-A3B-4bit", "NVIDIA-Nemotron-3-Nano-30B-A3B-4bit")
+              if os.path.isdir(os.path.join(ROOT, "models", m))), None)
+if _real is None:
+    print("  SKIPPED - no Qwen3.6 / Nemotron locally")
+else:
+    import json as _json
+    import subprocess as _sp
+    _p = _sp.run([sys.executable, os.path.join(ROOT, "tests", "_snapshot_child.py"), "lookahead_rollback", _real],
+                 capture_output=True, text=True, timeout=900,
+                 env=dict(os.environ, BIGRIG_MAX_GB=os.environ.get("BIGRIG_MAX_GB", "9")))
+    _line = next((ln for ln in _p.stdout.splitlines() if ln.startswith("RESULT ")), None)
+    if _line is None:
+        check("the real-model scenario ran", False, (_p.stdout + _p.stderr)[-1200:])
+    else:
+        R = _json.loads(_line[7:])
+        check("this model's cache really cannot be trimmed", not R["trimmable"])
+        check("after a wholly rejected guess the token is the plain step's",
+              R["rejected_token_same"])
+        check("...and every layer -- attention offsets AND recurrent arrays -- is bit-identical to a plain step",
+              R["rejected_offsets_same"] and R["rejected_arrays_same_count"] and R["rejected_bit_identical"])
+        check("...at the cost of one re-read pass, reported", R["rejected_stats"]["rereads"] == 1
+              and R["rejected_stats"]["verify_passes"] == 2, str(R["rejected_stats"]))
+        check("mlx_lm's trim alone leaves the state different (the defect, reproduced live)",
+              R["bug_offsets_differ"] and R["bug_arrays_differ"])
+        check("an accepted guess advances every layer by exactly the tokens kept",
+              R["accepted_got"] and R["accepted_offsets_same"] and R["accepted_stats"]["rereads"] == 0)
+        check("...with the state within bfloat16 prefill-width noise of two plain steps (not exact, and not wrong)",
+              R["accepted_max_rel_diff"] is not None and R["accepted_max_rel_diff"] < 0.10,
+              f"max rel diff {R['accepted_max_rel_diff']:.3f}; worst {R['accepted_worst'][:1]}")
 
 print()
 print("=" * 84)

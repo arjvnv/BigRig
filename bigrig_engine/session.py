@@ -2144,6 +2144,15 @@ class Session:
         if json_proc is not None or think_proc is not None:
             lookahead = False
             mtp = False
+        # A speculative pass must be able to put the cache back after a rejected guess. A layer
+        # that cannot be (see rollback.py) means plain decoding, said in stats, never a corrupted
+        # reply.
+        self.lookahead_unavailable = ""
+        if lookahead and pc is not None:
+            from . import rollback as _rb
+            self.lookahead_unavailable = _rb.supported(pc)
+            if self.lookahead_unavailable:
+                lookahead = False
         if self.mtp_head is not None and mtp is not False and not lookahead:
             from . import mtp as _mtp
             self.mtp_last = _mtp.Stats()
@@ -2632,6 +2641,7 @@ class Session:
              "prompt_cache_gb": round(self.prompt_cache_gb, 2),
              "persist": bool(getattr(self, "persist", False)),
              "history_snapshots": int(getattr(self, "history_snapshots", 0)),
+             "lookahead_unavailable": getattr(self, "lookahead_unavailable", "") or None,
              "resumed_conversations": int((getattr(self, "resumed", None) or {}).get("restored", 0)),
              "prompt_cache_bytes": (int(self._prompt_cache.nbytes)
                                     if self._prompt_cache is not None else 0),

@@ -12,6 +12,7 @@ sys.path.insert(0, ROOT)
 os.environ.setdefault("BIGRIG_MAX_GB", "9")
 
 from bigrig_engine.session import Session, MIN_REUSE_TOKENS          # noqa: E402
+import mlx.core as mx                                                  # noqa: E402
 
 LONG = ("You are a careful assistant. Context: the Pacific Ocean is the largest and deepest of Earth's "
         "five oceanic divisions. It extends from the Arctic Ocean in the north to the Southern Ocean in "
@@ -108,6 +109,76 @@ def main():
         res["cache_gb"] = s.prompt_cache_gb
         res["probation_mb"] = round(s._prompt_cache.probation.max_bytes / 1e6)
         res["turns"], _ = turns(s, 3, max_tokens=30)
+        s.close()
+    elif mode == "lookahead_rollback":
+        # After a rejected guess on a model with recurrent state, every layer must be exactly what a
+        # plain single step leaves: the same 1-row pass is re-run, so the arrays are bit-identical.
+        from mlx_lm.models.cache import make_prompt_cache, can_trim_prompt_cache
+        from bigrig_engine import lookahead as LA, rollback as RB
+        s = Session(model, persist=False)
+        ids = s.tokenizer.encode(s._prompt([{"role": "user", "content": LONG}], "", think=True))
+        head, last = ids[:-1], ids[-1]
+
+        def prefilled():
+            c = make_prompt_cache(s.model)
+            for i in range(0, len(head), 64):
+                s.model(mx.array(head[i:i + 64])[None], cache=c)
+            mx.eval([x.state for x in c])
+            return c
+
+        def arrays(c):
+            out = []
+            for x in c:
+                st = x.state
+                out.extend([a for a in (st if isinstance(st, (list, tuple)) else [st]) if isinstance(a, mx.array)])
+            return out
+
+        def offsets(c):
+            return [int(getattr(x, "offset", -1)) for x in c]
+        res["trimmable"] = bool(can_trim_prompt_cache(make_prompt_cache(s.model)))
+        # plain step
+        c_plain = prefilled()
+        lg = s.model(mx.array([last])[None], cache=c_plain)
+        t_plain = int(mx.argmax(lg[0, -1])); mx.eval([x.state for x in c_plain])
+        # a wholly wrong draft through verify (greedy)
+        c_la = prefilled()
+        wrong = [(t_plain + 7) % 1000 + 1000, (t_plain + 8) % 1000 + 1000]
+        st = LA.Stats()
+        got, _, _ = LA.verify(s.model, c_la, last, wrong, None, st)
+        mx.eval([x.state for x in c_la])
+        a, b = arrays(c_plain), arrays(c_la)
+        res["rejected_token_same"] = got == [t_plain]
+        res["rejected_offsets_same"] = offsets(c_plain) == offsets(c_la)
+        res["rejected_arrays_same_count"] = len(a) == len(b)
+        res["rejected_bit_identical"] = all(x.shape == y.shape and x.dtype == y.dtype and bool(mx.array_equal(x, y))
+                                            for x, y in zip(a, b))
+        res["rejected_stats"] = st.as_dict()
+        # WITHOUT the rollback (mlx_lm trim alone): the state must differ -- the defect, reproduced live
+        c_bug = prefilled()
+        from mlx_lm.models.cache import trim_prompt_cache
+        s.model(mx.array([last] + wrong)[None], cache=c_bug); trim_prompt_cache(c_bug, 2); mx.eval([x.state for x in c_bug])
+        res["bug_offsets_differ"] = offsets(c_bug) != offsets(c_plain)
+        res["bug_arrays_differ"] = not all(x.shape == y.shape and bool(mx.array_equal(x, y)) for x, y in zip(arrays(c_plain), arrays(c_bug)))
+        # a fully accepted draft: state must equal two plain steps within numerical noise, offsets exactly
+        c_two = prefilled()
+        s.model(mx.array([last])[None], cache=c_two); lg2 = s.model(mx.array([t_plain])[None], cache=c_two); mx.eval([x.state for x in c_two])
+        c_acc = prefilled(); st2 = LA.Stats()
+        got2, _, _ = LA.verify(s.model, c_acc, last, [t_plain], None, st2); mx.eval([x.state for x in c_acc])
+        res["accepted_got"] = got2 == [t_plain, int(mx.argmax(lg2[0, -1]))]
+        res["accepted_offsets_same"] = offsets(c_two) == offsets(c_acc)
+        rel = []
+        for x, y in zip(arrays(c_two), arrays(c_acc)):
+            if x.shape != y.shape:
+                continue
+            d = float(mx.max(mx.abs(x.astype(mx.float32) - y.astype(mx.float32))))
+            scale = float(mx.max(mx.abs(x.astype(mx.float32)))) or 1.0
+            rel.append((d, scale, d / scale, str(x.dtype), list(x.shape)))
+        res["accepted_max_abs_diff"] = max(r[0] for r in rel) if rel else None
+        res["accepted_max_rel_diff"] = max(r[2] for r in rel) if rel else None
+        res["accepted_worst"] = sorted(rel, key=lambda r: -r[2])[:3]
+        res["accepted_arrays_identical"] = sum(1 for r in rel if r[0] == 0.0)
+        res["accepted_arrays_total"] = len(rel)
+        res["accepted_stats"] = st2.as_dict()
         s.close()
     print("RESULT " + json.dumps(res))
 

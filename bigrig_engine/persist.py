@@ -39,6 +39,10 @@ import time
 from . import home
 
 SUFFIX = ".safetensors"
+# Bumped whenever a state an earlier build could have saved might be wrong. 1: the first release.
+# 2: guess-ahead on a recurrent-state model left rejected guesses in the cache (rollback.py), so
+# anything saved by a build with that bug is discarded rather than resumed.
+EPOCH = 2
 # An in-progress write. It keeps the .safetensors ending because mx.save_safetensors appends one
 # to any name without it -- the first version wrote to `x.safetensors.tmp`, got
 # `x.safetensors.tmp.safetensors` back, and then swept its own file up as a stranger.
@@ -92,6 +96,7 @@ def fingerprint(session) -> str:
         "source_precision": getattr(session, "source_precision", None),
         "reroute": getattr(session, "reroute_tol", None) or None,
         "mlx_lm": getattr(mlx_lm, "__version__", "?"),
+        "epoch": EPOCH,
     }
     return hashlib.sha1(json.dumps(parts, sort_keys=True, default=str).encode()).hexdigest()[:16]
 

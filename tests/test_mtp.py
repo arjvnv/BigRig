@@ -84,8 +84,9 @@ try:
     mtp.snapshot([rc, Opaque()])
     check("an opaque cache is refused", False)
 except TypeError as e:
-    check("an opaque cache is refused", "cannot snapshot" in str(e), str(e))
-check("...and supports() says so in words", "cannot snapshot" in mtp.supports(object(), [Opaque()])
+    check("an opaque cache is refused, with the layer named and the consequence stated",
+          "Opaque" in str(e) and "put back" in str(e), str(e))
+check("...and supports() says so in words", "put back" in mtp.supports(object(), [Opaque()])
       or "not a Qwen3.5" in mtp.supports(object(), [Opaque()]))
 check("a model that is not a Qwen3.5-family text model is refused by name",
       "Qwen3.5" in mtp.supports(object()))

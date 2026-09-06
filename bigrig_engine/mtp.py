@@ -165,27 +165,9 @@ def forward(tm, ids: mx.array, cache) -> tuple:
 
 
 # ------------------------------------------------------------------- snapshot and restore
-def snapshot(cache) -> list:
-    """Enough to put every cache entry back exactly as it is now. Immutable arrays are held
-    by reference, so this costs nothing; a KV cache is a write position."""
-    out = []
-    for c in cache:
-        if hasattr(c, "cache") and isinstance(getattr(c, "cache"), list):
-            out.append(("arrays", list(c.cache)))
-        elif hasattr(c, "offset") and hasattr(c, "trim") and c.is_trimmable():
-            out.append(("offset", int(c.offset)))
-        else:
-            raise TypeError(f"cannot snapshot a {type(c).__name__}; MTP needs caches it can "
-                            f"put back after a rejected guess")
-    return out
-
-
-def restore(cache, snap: list) -> None:
-    for c, (kind, v) in zip(cache, snap):
-        if kind == "arrays":
-            c.cache = list(v)
-        else:
-            c.trim(max(0, int(c.offset) - int(v)))
+# Shared with prompt-lookup drafting (lookahead.py), which had the same problem and had not
+# solved it: see rollback.py for the bug that made it shared.
+from .rollback import snapshot, restore                                  # noqa: E402,F401
 
 
 def supports(model, cache=None) -> str:
