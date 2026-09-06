@@ -297,6 +297,28 @@ KV_BITS = 4
 KV_GROUP_SIZE = 64
 KV_QUANT_START = 4096
 
+
+def resolve_kv_bits(kv_bits) -> int | None:
+    """The KV-cache precision to use, from what the caller asked for.
+
+    THE CONVERSATION CACHE IS 4-BIT PAST kv_quant_start BY DEFAULT, and until now there was no
+    way off it. None means the default (KV_BITS, 4); 0 or 16 mean "keep it full precision, spend
+    the memory" -- the switch a user who would rather not compress their context now has -- and
+    resolve to None internally, which the generation path reads as "do not quantize"; 2..8 pick a
+    precision. Measured cost of the 4-bit default on a ~2,000-token needle-retrieval task with
+    DeepSeek-Coder-V2-Lite: 7 of 12 answers correct against 8 of 12 at full precision -- one
+    answer, and the replies differ throughout, which is why it is a documented choice.
+    """
+    if kv_bits is None:
+        return KV_BITS
+    if int(kv_bits) in (0, 16):
+        return None                             # no quantization; the cache stays fp16
+    b = int(kv_bits)
+    if b not in (2, 3, 4, 5, 6, 8):
+        raise ValueError(f"kv_bits must be one of 2,3,4,5,6,8, or 0/16 for full precision, "
+                         f"got {kv_bits}")
+    return b
+
 PROMPT_CACHE_GB = 0.50
 
 # The smallest prefix worth serving from the cache at all. Serving one copies the whole stored
@@ -892,9 +914,7 @@ class Session:
                                              max(0.0, float(budget_gb) * 0.06)), 2)
         else:
             self.prompt_cache_gb = max(0.0, float(prompt_cache_gb))
-        self.kv_bits = (int(kv_bits) if kv_bits else None) or KV_BITS
-        if self.kv_bits not in (None, 2, 3, 4, 5, 6, 8):
-            raise ValueError(f"kv_bits must be one of 2,3,4,5,6,8 or None, got {self.kv_bits}")
+        self.kv_bits = resolve_kv_bits(kv_bits)
         self.kv_quant_start = int(KV_QUANT_START if kv_quant_start is None else kv_quant_start)
         self.serving_reserve_gb = serving_reserve_gb(self.working_memory_gb,
                                                      self.prompt_cache_gb)

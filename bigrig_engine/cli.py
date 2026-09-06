@@ -1169,11 +1169,12 @@ def build_parser():
                        help="GB the engine may use (default: what is actually free)")
         x.add_argument("--threads", type=int, default=8)
         x.add_argument("--kv-bits", type=int, default=None, dest="kv_bits",
-                       choices=(2, 3, 4, 5, 6, 8),
-                       help="compress the conversation cache once it passes --kv-quant-start "
-                            "tokens. 3.56x less memory at 4 bits, which on this model is the "
+                       choices=(0, 2, 3, 4, 5, 6, 8, 16),
+                       help="precision of the conversation cache once it passes --kv-quant-start "
+                            "tokens. Default 4: 3.56x less memory, which on this model is the "
                             "difference between reaching 45%% of its context window and all of "
-                            "it. It is a compression: replies past the threshold will differ.")
+                            "it, at a measured cost past the threshold. Pass 0 (or 16) to keep "
+                            "the cache full precision and spend the memory instead.")
         x.add_argument("--kv-quant-start", type=int, default=None, dest="kv_quant_start",
                        help="tokens that stay uncompressed before --kv-bits engages "
                             "(default 4096), so short conversations are untouched")

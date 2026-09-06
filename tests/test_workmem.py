@@ -128,6 +128,18 @@ if QW is not None:
 else:
     print("  SKIPPED - Qwen3-30B manifest fixture absent")
 
+print("\n" + "=" * 84); print("6. KV-CACHE PRECISION IS A DOCUMENTED CHOICE, OFF BY 0 OR 16"); print("=" * 84)
+from bigrig_engine.session import resolve_kv_bits, KV_BITS                # noqa: E402
+check("no request keeps the 4-bit default", resolve_kv_bits(None) == KV_BITS == 4)
+check("0 means full precision (no quantization)", resolve_kv_bits(0) is None)
+check("16 also means full precision", resolve_kv_bits(16) is None)
+check("an explicit precision is honoured", resolve_kv_bits(8) == 8 and resolve_kv_bits(2) == 2)
+for bad in (7, 1, 9, 12):
+    try:
+        resolve_kv_bits(bad); check(f"rejects kv_bits={bad}", False)
+    except ValueError:
+        check(f"rejects kv_bits={bad} with a sentence", True)
+
 print()
 print("=" * 84)
 print("ALL TESTS PASSED" if not FAIL else f"{len(FAIL)} FAILURES: " + ", ".join(FAIL))

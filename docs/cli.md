@@ -156,6 +156,26 @@ differs somewhere in a near-tie. Off by default for that reason. The numbers are
 measurement; this is the software form of the design that a native Metal kernel
 would make exact.
 
+## The conversation cache: `--kv-bits`
+
+Past `--kv-quant-start` tokens (4,096 by default) the conversation cache is compressed to 4 bits,
+which is what lets a long context fit -- 3.56x less memory, on the flagship the difference between
+reaching 45% of the context window and all of it. It is a compression, so replies past the
+threshold differ from what full precision would produce.
+
+Measured cost, DeepSeek-Coder-V2-Lite on a ~2,000-token needle-retrieval task: 7 of 12 answers
+correct at 4-bit against 8 of 12 at full precision -- one answer, on one model. Small, real, and
+now optional:
+
+```bash
+rig serve <model> --kv-bits 0     # keep the cache full precision; spend the memory instead
+rig serve <model> --kv-bits 8     # halfway: 8-bit
+rig serve <model> --kv-quant-start 16384   # stay full precision for longer before it engages
+```
+
+`--kv-bits 0` (or `16`) turns compression off. It is a serve-time setting, not per-request: the
+cache is shared across a conversation, so its precision is fixed for the session.
+
 ## Structured output: `response_format`
 
 The OpenAI field, on `/v1/chat/completions`:
