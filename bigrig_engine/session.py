@@ -787,7 +787,8 @@ class Session:
                  prefetch_width: int = 0, reroute: float = 0.0, nocache: bool = False,
                  prompt_cache_gb: float | None = None, kv_bits: int | None = None,
                  kv_quant_start: int | None = None,
-                 mtp: str | None = None, mtp_bits: int | None = 4, announce: bool = True):
+                 mtp: str | None = None, mtp_bits: int | None = 4, announce: bool = True,
+                 stream_embedding: bool = True):
         # Everything this session was built from, so it can be rebuilt with one setting changed
         # without the caller having to remember the other twenty.
         self.init_kwargs = {
@@ -902,6 +903,25 @@ class Session:
         # that is 0.67 GB unreserved against a 9 GB ceiling. The CLI happened to be safe because
         # it downloads to a real directory first; anything using the Python API was not.
         self.non_expert_gb = precision.non_expert_gb(self.config_dir, manifest=man)
+        # THE INPUT EMBEDDING NEED NOT BE RESIDENT. It is looked up one row at a time and can be
+        # gathered from the page cache instead of held in wired memory (embed_stream.py) -- but
+        # only when it is untied from the output head and quantised in a shape the gather handles.
+        # `streamable_gb` returns >0 only when attach is then certain to succeed, so the pool is
+        # never sized for a saving that fails to arrive. Streamed models only: a resident model
+        # has the room and gains nothing from the extra host gather on every token.
+        self.embed_stream_gb = 0.0
+        self._stream_embedding = bool(stream_embedding)
+        if self._stream_embedding:
+            try:
+                from . import embed_stream as _es
+                self.embed_stream_gb = _es.streamable_gb(self.config_dir)
+            except Exception:                       # noqa: BLE001 -- never worth a failed load
+                self.embed_stream_gb = 0.0
+        # Applied ONLY to the streamed pool sizing below, never to the native/compress
+        # decision: if a model runs resident the embedding is resident too, and
+        # judging "does it fit whole" against a saving that only exists when streaming would be
+        # the one way this over-commits. self.non_expert_gb stays the full resident figure.
+        self.streamed_non_expert_gb = max(0.0, self.non_expert_gb - self.embed_stream_gb)
         self.working_memory_gb = self._working_memory(man, top_k, budget_gb)
         # Charged to the reserve BEFORE the pool is planned, so the pool is one that leaves room
         # for it. Adding it afterwards would mean the ceiling the user set is not the ceiling.
@@ -924,7 +944,7 @@ class Session:
         try:
             self.plan = autoconfig.choose_capacity(man, budget_gb=budget_gb, top_k=top_k,
                                                    reserve_gb=self.serving_reserve_gb,
-                                                   non_expert_gb=self.non_expert_gb,
+                                                   non_expert_gb=self.streamed_non_expert_gb,
                                                    headroom_gb=self.headroom_gb)
         except MemoryError:
             # The planner refuses a model it cannot fit, which is right when it is the one
@@ -1125,6 +1145,18 @@ class Session:
                 predictors=self.predictor, reroute=reroute, nocache=nocache)
             self.reroute_tol = float(reroute or 0.0)
             self.streamed = True
+            # KEEP THE INPUT EMBEDDING ON DISK. Bit-identical -- a row gather plus the model's own
+            # dequantise -- and the pool above was already sized as though it were not resident.
+            # If it ever declined to attach after the plan reserved the saving, the plan would be
+            # 0.29 GB optimistic, so the reduction is UNDONE in that case to stay within budget.
+            if self.embed_stream_gb > 0:
+                from . import embed_stream as _es
+                if not _es.attach(self.model, self.config_dir):
+                    self.embed_stream_gb = 0.0     # it stayed resident; do not claim the saving
+                elif verbose and announce:
+                    self.plan_lines.append(
+                        f"  input embedding streamed from disk (-{self.embed_stream_gb:.2f} GB "
+                        f"resident); bit-identical, one row gathered per token")
             hs = self.handle.stats()
             self.plan["capacity"] = hs["capacity"]
             self.plan["residency"] = (self.plan["capacity"] / hs["n_experts"])

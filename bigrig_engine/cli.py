@@ -594,7 +594,8 @@ def _session(a):
                 mtp=mtp, mtp_bits=(getattr(a, "mtp_bits", 4) or None),
                 prefetch_width=getattr(a, "prefetch", 0),
                 reroute=getattr(a, "reroute", 0.0),
-                no_full_layers=getattr(a, "no_full_layers", False), announce=False)
+                no_full_layers=getattr(a, "no_full_layers", False), announce=False,
+                stream_embedding=not getattr(a, "no_stream_embedding", False))
     s = _auto_tune(a, _auto_pack(a, s0))
     if not s.init_kwargs.get("announce", True) and s.plan_lines:
         print(s.plan_summary(), flush=True)      # a session built quietly is the one being served
@@ -1163,6 +1164,10 @@ def build_parser():
         x.add_argument("--no-pack", action="store_true",
                        help="do not make the packed copy of the experts on first run; keep the "
                             "disk and take the slower copy path")
+        x.add_argument("--no-stream-embedding", action="store_true",
+                       help="keep the input-embedding table in memory instead of gathering its "
+                            "rows from disk. Streaming it is bit-identical and frees 0.1-0.3 GB; "
+                            "this turns it off.")
         x.add_argument("--residency", type=float, default=None,
                        help="fraction of experts to keep resident (default: from free memory)")
         x.add_argument("--memory", type=float, default=None,
