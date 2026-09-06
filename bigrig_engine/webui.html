@@ -659,6 +659,7 @@ const $$ = s => [...document.querySelectorAll(s)];
 const thread = $("#thread"), qEl = $("#q"), sendEl = $("#send");
 const history = [];
 let busy = false, health = {}, lastCut = false, thinkCut = null;   // thinkCut: reasoning tokens when the cap closed the thinking
+let qualityStop = null;              // {reason, run, remedy} when the meter ended the reply
 // A running request, so it can be stopped. `stopped` separates "the user pressed stop" from
 // "the connection broke" -- they look identical to fetch() and must not read the same to a user.
 let ctrl = null, reqId = null, stopped = false;
@@ -1488,7 +1489,7 @@ function showUser(el, content){
 }
 
 async function ask(text, cont=false){
-  busy=true; stopped=false; thinkCut=null;
+  busy=true; stopped=false; thinkCut=null; qualityStop=null;
   ctrl=new AbortController();
   reqId=(crypto.randomUUID?crypto.randomUUID():String(Math.random()).slice(2))+"";
   sendEl.textContent="Stop"; sendEl.classList.add("stop"); sendEl.disabled=false;
@@ -1562,7 +1563,8 @@ async function ask(text, cont=false){
         if(t){ if(t.tok_s>0&&t.tok_s<=2000){tps=t.tok_s; set("#c-tps",tps.toFixed(1)); set("#r-tps",tps.toFixed(1));}
                if("degraded" in t){seen++; if(t.degraded)flagged++; quality(flagged/seen,seen);}
                if(t.degraded_tokens!==undefined) flagged=t.degraded_tokens;
-               if(t.thinking_cut) thinkCut=t.reasoning_tokens||0; }
+               if(t.thinking_cut) thinkCut=t.reasoning_tokens||0;
+               if(t.stopped_for==="quality") qualityStop={reason:t.quality_reason, run:t.quality_run, remedy:t.remedy}; }
       }
     }
   }catch(e){
@@ -1608,7 +1610,13 @@ async function ask(text, cont=false){
     if(reason){ const pct=Math.round(100*reason.length/Math.max(reason.length+out.length,1));
                 tail+=` — reasoning took ${pct}% of it`; }
   }
-  if(flagged>0){ bot.classList.add("flagged"); meta.className="meta warn";
+  if(qualityStop){ bot.classList.add("flagged"); meta.className="meta warn";
+    // THE METER ENDED IT, AND SAYS WHY. Not "the model stopped": the reply was degrading -- a run
+    // of flagged tokens past the measured threshold -- and letting it run would have scrolled a
+    // loop to the token limit. The remedy is the server's, ranked by what usually causes it.
+    meta.textContent=bits.join(" · ")+` · STOPPED by the quality meter: ${qualityStop.reason}`
+      +(qualityStop.run?` (${qualityStop.run} flagged in a row)`:"")+` — ${qualityStop.remedy||"ask again"}`; }
+  else if(flagged>0){ bot.classList.add("flagged"); meta.className="meta warn";
     meta.textContent=bits.join(" · ")+` · flagged ${flagged} token${flagged===1?"":"s"}`
       +` — usually looping or losing coherence`+tail; }
   // Stopping is something the user chose, so it is not coloured as a problem. Hitting the token

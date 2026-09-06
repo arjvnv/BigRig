@@ -255,6 +255,21 @@ the ceiling before the expert pool is planned, so the ceiling still holds; `/hea
 under `embeddings` and `reserved_gb`. Embedding requests share the model's queue with replies --
 one thing on the device at a time.
 
+## The quality meter acts
+
+The live meter already told a healthy reply from a damaged one. It now ends a reply that is
+degrading -- once flagged tokens run 16 in a row, or make up 35% of the reply after 64 tokens --
+and says why (`looping`, `weights drifted`, `incoherent`) and what to try, ranked by what usually
+causes it: turn off guess ahead if it was on, serve `--exact` if the weights are compressed,
+lower the creativity if it is above 1.0, otherwise ask again. The thresholds were measured, not
+guessed: sixteen healthy replies on four models had a longest run of 2 and a share of at most
+6.1%; a reply from a corrupted state ran 65 flagged in a row and is now stopped 16 tokens in.
+
+`finish_reason` stays `stop`; the verdict is in `bigrig.stopped_for`, `bigrig.quality_reason`,
+`bigrig.quality_run`, `bigrig.remedy` on both OpenAI paths, and the page's reply line says
+"STOPPED by the quality meter". Text already streamed stays -- a stream cannot retract. A request
+can send `"quality_stop": false`; `--no-quality-stop` turns it off for the server.
+
 ## Conversations survive a restart
 
 The conversation cache is what makes a follow-up fast: the state for everything already said is

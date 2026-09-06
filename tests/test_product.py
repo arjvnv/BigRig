@@ -245,6 +245,7 @@ check("defaults are sane when nothing is supplied",
                 "tools": None,
                 "response_format": None,         # OpenAI's field; None means unconstrained
                 "thinking_budget": None,         # no cap on reasoning unless asked
+                "quality_stop": True,            # the meter may end a degrading reply
                 "_rid": ""}, str(S({})))
 # Tools are absent unless sent, and a request that sends them gets them forwarded rather than
 # quietly dropped -- which is what both endpoints did before, returning HTTP 200 and an essay

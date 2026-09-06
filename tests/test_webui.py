@@ -390,6 +390,12 @@ check("'none' sends no cap, and thinking off sends none", 'if(v==="none") return
 check("when the cap acted, the reply's meta line says so with the count", "thinking capped at ${thinkCut} tokens" in script and "t.thinking_cut" in script)
 check("the choice is remembered", '"tg-think-limit"' in script)
 
+print("\n" + "=" * 84); print("7d. WHEN THE METER ENDS A REPLY, THE PAGE SAYS SO, WHY, AND WHAT TO TRY"); print("=" * 84)
+check("the page reads the meter's verdict from the final frame", 't.stopped_for==="quality"' in script and "t.remedy" in script)
+check("...and the reply's meta line says it was STOPPED by the meter, with the reason and the remedy",
+      "STOPPED by the quality meter" in script and "qualityStop.reason" in script and "qualityStop.remedy" in script)
+check("...coloured as a problem, since the user did not choose it", "qualityStop){ bot.classList.add(\"flagged\"); meta.className=\"meta warn\"" in script)
+
 print("\n" + "=" * 84); print("8. THE CONTEXT METER READS THE SERVER, NEVER RE-DERIVES THE LIMIT"); print("=" * 84)
 check("the page has a Context meter", 'id="m-ctx"' in html and 'id="m-bar-ctx"' in html)
 check("...filled from context_used and context_remaining as the server reports them",

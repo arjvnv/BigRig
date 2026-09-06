@@ -1189,6 +1189,8 @@ def cmd_serve(a) -> int:
         print(f"  embeddings: {embedder.name}, {embedder.dimensions} dimensions, up to "
               f"{embedder.max_tokens} tokens, {embedder.gb * 1000:.0f} MB beside the pool", flush=True)
     s = _session(a)          # any consent question is asked HERE, before the port opens
+    if getattr(a, "no_quality_stop", False):
+        s.quality_stop = False
     # A NON-LOOPBACK BIND PUTS AN UNAUTHENTICATED MODEL ON THE NETWORK. Say so, once, loudly.
     # There is no API key in this server; anyone who can reach the port can use the model and
     # read /stats. On a home or cafe network that is everyone on the Wi-Fi.
@@ -1434,6 +1436,11 @@ def build_parser():
                          "(Qwen3.5/3.6: 0.89 GB) is read per image request and given back before "
                          "the prompt is read, so the pool is planned as if it did not exist; "
                          "--vision-resident keeps it loaded. Refused on a checkpoint without one.")
+    sv.add_argument("--no-quality-stop", action="store_true",
+                    help="let a reply run to its token limit however badly it is going. By default "
+                         "the quality meter ends a reply once flagged tokens run 16 in a row or reach "
+                         "35%% of it -- 8x and 5.7x anything measured on healthy replies -- and says "
+                         "why and what to try. A request can also say `\"quality_stop\": false`.")
     sv.add_argument("--vision-resident", action="store_true",
                     help="keep the vision encoder loaded for the life of the server (0.89 GB charged "
                          "to the ceiling before the pool is planned) instead of reading it from the "

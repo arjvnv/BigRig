@@ -164,6 +164,16 @@ PREFILL_STEP = 128
 FLAG_RUN = 3
 # Below this share of flagged tokens, and with no run, a reply is reported clean.
 FLAG_NOISE_SHARE = 0.02
+# WHEN THE METER ACTS. A reply is stopped, and the reason and a remedy reported, once flagged
+# tokens run this long in a row or make up this share of the reply (after QUALITY_STOP_MIN_TOKENS).
+# Measured before choosing: sixteen healthy replies on four models (prose, code, a table, an
+# opinion) had a longest run of 2 and a share of at most 6.1%; a reply from a corrupted state (the
+# guess-ahead defect) ran 65 flagged in a row, with runs of 12 and 16 complete 11 and 15 tokens
+# after the loop began. 16 is 8x the healthy maximum and 35% is 5.7x; the cost of firing is the
+# ~16 tokens of a loop a reader would otherwise have watched scroll for a minute.
+QUALITY_STOP_RUN = 16
+QUALITY_STOP_SHARE = 0.35
+QUALITY_STOP_MIN_TOKENS = 64
 # THE PACKED PATH IS A DIFFERENT MACHINE, AND ITS PEAK RUNS THE OTHER WAY.
 #     The 128 above and the bytes-per-unit model below were measured on the copy path, where every
 #     miss in a wide pass copied an expert into host memory and the peak grew with the width.
@@ -1346,6 +1356,9 @@ class Session:
         self.history_snapshots = 0
         self._pre_prefill = 0
         self._snapshot_bytes = 0
+        self.quality_stop = True                 # the meter may end a degrading reply (QUALITY_STOP_*)
+        self.quality_stops = 0
+        self.last_stop = None
         self._prompt_cache = self._make_prompt_cache()
         # CONVERSATIONS FROM THE LAST RUN, BACK INTO THE CACHE. Within the cache's own budget,
         # which the reserve already prices, so nothing about the memory plan changes; only what
@@ -1889,6 +1902,17 @@ class Session:
                 "\n".join(f"{m.get('role','user')}: {m.get('content','')}"
                           for m in messages) + "\nassistant:")
 
+    def _quality_remedy(self, lookahead_asked: bool, temperature: float) -> str:
+        """What to try, in order of how often it is the cause: a speed path that guesses, altered
+        weights, a hot sampler, and last the honest default -- ask again."""
+        if lookahead_asked:
+            return "turn off guess ahead for this reply; it drafts from text already written and can lock a reply into repeating it"
+        if (getattr(self, "strategy", None) or {}).get("mode") == "compress":
+            return "this model is running with compressed weights; `--exact` serves the original ones at streaming speed"
+        if temperature is not None and float(temperature) > 0.9:
+            return "lower the creativity; above 1.0 the sampler takes chances this reply could not carry"
+        return "ask again, or shorten the request; the model lost the thread on this one"
+
     def _wire_vision(self) -> None:
         """Swap each full-attention layer's rotary for a RopeSwitch (vision.py). Unarmed, a switch
         calls the original rotary with the original offset: text requests are untouched."""
@@ -2059,7 +2083,7 @@ class Session:
                     prefill_step_size: int | None = None, on_prefill=None,
                     lookahead: bool = False, lookahead_tokens: int = 8, tools=None,
                     mtp: bool | None = None, hide_reasoning: bool = False,
-                    response_format=None, thinking_budget=None):
+                    response_format=None, thinking_budget=None, quality_stop: bool = True):
         """Yield (text_chunk, info) as the model generates. `info` carries live quality state.
 
         `response_format` is OpenAI's: None, {"type": "json_object"} or {"type": "json_schema",
@@ -2302,6 +2326,7 @@ class Session:
         # generators are handed their arguments by name and would drop a logits processor on the
         # floor -- a request that asked for JSON, or for a thinking budget, would get neither and
         # no error. Both are correctness features; the two opt-in speed paths yield to them.
+        lookahead_asked = bool(lookahead)
         if json_proc is not None or think_proc is not None:
             lookahead = False
             mtp = False
@@ -2354,11 +2379,38 @@ class Session:
                 **gen_kw)
         try:
             self._flag_run = 0
+            _flagged_total = 0
+            self.last_stop = None
             for r in _produce():
                 flagged = self._observe(r)
                 self._flag_run = self._flag_run + 1 if flagged else 0
+                _flagged_total += int(bool(flagged))
                 if self._flag_run == FLAG_RUN:
                     self.flag_runs += 1
+                # THE METER ACTS. A run or a share past the measured thresholds (QUALITY_STOP_*)
+                # ends the reply here, with why and what to try, instead of letting a loop scroll
+                # to the token limit. The text already streamed stays -- a stream cannot retract.
+                _n_gen = int(r.generation_tokens or 0)
+                if quality_stop and self.quality_stop and (
+                        self._flag_run >= QUALITY_STOP_RUN
+                        or (_n_gen >= QUALITY_STOP_MIN_TOKENS and _flagged_total / max(1, _n_gen) >= QUALITY_STOP_SHARE)):
+                    why = None
+                    try:
+                        why = self.meter.reason() if self.meter is not None else None
+                    except Exception:                       # noqa: BLE001
+                        why = None
+                    why = why or "degrading"
+                    self.quality_stops += 1
+                    self.last_stop = {"stopped_for": "quality", "quality_reason": why,
+                                      "quality_run": int(self._flag_run), "quality_flagged": int(_flagged_total),
+                                      "quality_tokens": _n_gen,
+                                      "remedy": self._quality_remedy(lookahead_asked, temperature)}
+                    yield "", {"token": r.token, "finish_reason": "stop", "reasoning_delta": "",
+                               "from_draft": False, "tok_s": _sane_tps(r.generation_tps, r.generation_tokens),
+                               "prompt_tokens": r.prompt_tokens, "generation_tokens": r.generation_tokens,
+                               "degraded": True, "reasoning_tokens": None, "thinking_cut": False,
+                               **self.last_stop}
+                    return
                 if pc is not None:
                     # The ids, not the text: re-encoding the reply is not guaranteed to give
                     # back the tokens the model actually emitted, and a key that does not match
@@ -2822,6 +2874,8 @@ class Session:
              "persist": bool(getattr(self, "persist", False)),
              "history_snapshots": int(getattr(self, "history_snapshots", 0)),
              "lookahead_unavailable": getattr(self, "lookahead_unavailable", "") or None,
+             "quality_stop": bool(getattr(self, "quality_stop", True)),
+             "quality_stops": int(getattr(self, "quality_stops", 0)),
              "vision": ({"tower_gb": round(self.vision_gb, 3), "max_pixels": self.preprocessor.max_pixels,
                          "max_images": _vision_max_images(),
                          "resident": bool(self.vision_resident),

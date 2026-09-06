@@ -651,6 +651,16 @@ def _aggregate(state) -> dict:
             "cut_off": sum(1 for r in hist if r.get("finish") == "length")}
 
 
+def _stop_fields(last: dict) -> dict:
+    """The meter's verdict when it ended a reply: why, how much was flagged, what to try. Absent
+    from a reply the meter did not stop, so a client can test for the key."""
+    if not last or last.get("stopped_for") != "quality":
+        return {}
+    return {"stopped_for": "quality", "quality_reason": last.get("quality_reason"),
+            "quality_run": last.get("quality_run"), "quality_flagged": last.get("quality_flagged"),
+            "remedy": last.get("remedy")}
+
+
 def _thinking_budget(body: dict):
     """A reasoning-token cap from an OpenAI-style body: our `thinking_budget`, else translate
     `reasoning_effort`. Validated here so a bad value is a 400, not a 500 mid-generation."""
@@ -1121,6 +1131,9 @@ def make_handler(state: _State):
                     # A cap on reasoning tokens. Our own `thinking_budget`, or OpenAI's coarse
                     # `reasoning_effort` translated to one (thinking.resolve_budget).
                     "thinking_budget": _thinking_budget(body),
+                    # The meter may end a degrading reply (session.QUALITY_STOP_*). A client that
+                    # would rather have every token, loop or not, says so.
+                    "quality_stop": bool(body.get("quality_stop", True)),
                     "_rid": str(rid)[:64] if isinstance(rid, (str, int)) else ""}
 
         def _client_gone(self) -> bool:
@@ -1619,7 +1632,8 @@ def make_handler(state: _State):
                                  "residency": state.session.stats().get("residency"),
                                  "miss_rate": state.session.stats().get("miss_rate"),
                                  "reasoning_tokens": last.get("reasoning_tokens"),
-                                 "thinking_cut": bool(last.get("thinking_cut"))}}
+                                 "thinking_cut": bool(last.get("thinking_cut")),
+                                 **_stop_fields(last)}}
             _json(self, 200, body)
 
         def _stream(self, msgs, prompt, kw, chat):
@@ -1713,7 +1727,8 @@ def make_handler(state: _State):
                            "degraded_tokens": degraded,
                            "miss_rate": state.session.stats().get("miss_rate"),
                            "reasoning_tokens": last.get("reasoning_tokens"),
-                           "thinking_cut": bool(last.get("thinking_cut"))}))
+                           "thinking_cut": bool(last.get("thinking_cut")),
+                           **_stop_fields(last)}))
                 self._log(last, degraded, time.time() - _t0, _ttft,
                           last.get("generation_tokens", 0))
                 self.wfile.write(b"data: [DONE]\n\n")
