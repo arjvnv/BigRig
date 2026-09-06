@@ -142,6 +142,15 @@ def parse(body: dict, require_max_tokens: bool = True,
     if not isinstance(stops, list) or any(not isinstance(x, str) for x in stops):
         raise BadRequest("`stop_sequences` must be an array of strings")
 
+    # Anthropic caps thinking with `thinking: {type: "enabled", budget_tokens: N}`. Carried
+    # through as a plain token cap the engine enforces (thinking.ThinkingBudget).
+    tb = None
+    th = body.get("thinking")
+    if isinstance(th, dict) and th.get("budget_tokens") is not None:
+        try:
+            tb = int(th["budget_tokens"])
+        except (TypeError, ValueError):
+            raise BadRequest("`thinking.budget_tokens` must be an integer")
     return {"tools": tools_to_openai(body.get("tools")) or None,
             "messages": out_msgs, "system": _text_of(body.get("system")),
             "max_tokens": mt,
@@ -149,6 +158,7 @@ def parse(body: dict, require_max_tokens: bool = True,
             "temperature": num("temperature", 0.7, 0.0, 1.0),
             "top_p": num("top_p", 0.95, 0.0, 1.0),
             "stream": bool(body.get("stream")),
+            "thinking_budget": tb,
             "stop_sequences": stops}
 
 

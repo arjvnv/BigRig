@@ -1780,7 +1780,7 @@ class Session:
                     prefill_step_size: int | None = None, on_prefill=None,
                     lookahead: bool = False, lookahead_tokens: int = 8, tools=None,
                     mtp: bool | None = None, hide_reasoning: bool = False,
-                    response_format=None):
+                    response_format=None, thinking_budget=None):
         """Yield (text_chunk, info) as the model generates. `info` carries live quality state.
 
         `response_format` is OpenAI's: None, {"type": "json_object"} or {"type": "json_schema",
@@ -1816,6 +1816,15 @@ class Session:
                 messages = msgs
         text = self._prompt(messages, prompt, think=think, continue_last=continue_last,
                             tools=tools)
+        # A thinking budget forces the reasoning block closed once its tokens run out
+        # (thinking.py). Built here, after the prompt has set whether the block is already open.
+        # Skipped when thinking is off or the model does not reason.
+        think_proc = None
+        if think and thinking_budget:
+            from . import thinking as _thk
+            cap = _thk.resolve_budget(thinking_budget)
+            if cap:
+                think_proc = _thk.ThinkingBudget(self.tokenizer, cap, self._starts_in_reasoning)
         if self.handle:
             self.handle.reset_stats()
         stops = list(stop or ())
@@ -1852,8 +1861,9 @@ class Session:
                 mx.reset_peak_memory()
             except Exception:                   # noqa: BLE001 -- a measurement, never a failure
                 self._wm_baseline = 0.0
-        if json_proc is not None:
-            gen_kw["logits_processors"] = [json_proc]
+        _procs = [pr for pr in (think_proc, json_proc) if pr is not None]
+        if _procs:
+            gen_kw["logits_processors"] = _procs
         if on_prefill is not None:
             # Reading the prompt is not instant here and the user is looking at a blank window
             # while it happens. On gpt-oss at 3% residency a 68-token prompt -- which is what
@@ -1971,11 +1981,11 @@ class Session:
                    "reasoning_delta": "", "prompt_tokens": 0, "generation_tokens": 0,
                    "degraded": False}
         rsent = 0                      # reasoning characters already handed to the caller
-        # A constrained reply takes the standard path. The MTP and lookahead generators are
-        # handed their arguments by name and would drop a logits processor on the floor -- a
-        # request that asked for JSON would get unconstrained text and no error. Structured
-        # output is a correctness feature; the two opt-in speed paths yield to it.
-        if json_proc is not None:
+        # A constrained OR budgeted reply takes the standard path. The MTP and lookahead
+        # generators are handed their arguments by name and would drop a logits processor on the
+        # floor -- a request that asked for JSON, or for a thinking budget, would get neither and
+        # no error. Both are correctness features; the two opt-in speed paths yield to them.
+        if json_proc is not None or think_proc is not None:
             lookahead = False
             mtp = False
         if self.mtp_head is not None and mtp is not False and not lookahead:

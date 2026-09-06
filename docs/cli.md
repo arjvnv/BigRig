@@ -203,6 +203,30 @@ mode. `response_format` and `tools` cannot be combined — a tool call is not a 
 sending both is a `400` that says so. The two opt-in speed paths (`--mtp`, lookahead) yield to a
 constrained request, which takes the standard path.
 
+## Capping how long a model thinks: `thinking_budget`
+
+A reasoning model on a slow machine can spend its whole reply budget thinking. Measured on
+Qwen3.6 with `max_tokens: 400` and no cap: 183 words of reasoning and **an empty answer**. A
+thinking budget caps the reasoning tokens; when it runs out the block is closed and the model
+answers with what it has.
+
+```json
+{"thinking_budget": 150}                                   // OpenAI-style bodies, ours
+{"reasoning_effort": "low"}                                // OpenAI's dial: low 256, medium 1024, high 4096
+{"thinking": {"type": "enabled", "budget_tokens": 150}}    // Anthropic's shape, on /v1/messages
+```
+
+Under budget the model is untouched -- same tokens, same order. At the budget, while still
+thinking, the closing tag is forced and the model continues into its answer, exactly as if it had
+chosen to stop there; after that the think tags are refused so a cut-off thought cannot leak one
+into the reply. A model that finishes thinking under budget never notices the cap exists, and one
+that is already answering is never interrupted. Measured at 150 tokens on the same question: 77
+words of reasoning, then `17 × 23 = 391`.
+
+Pick the budget for the task -- 40 tokens is too few to finish arithmetic, and a budget plus the
+answer must fit inside `max_tokens`. The cap takes the standard generation path; `--mtp` and
+lookahead yield to it.
+
 ## Models that think before answering
 
 Qwen3.5/3.6, GLM-4.x, Nemotron and their kin produce a block of reasoning before the answer; the

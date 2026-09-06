@@ -628,6 +628,17 @@ def _aggregate(state) -> dict:
             "cut_off": sum(1 for r in hist if r.get("finish") == "length")}
 
 
+def _thinking_budget(body: dict):
+    """A reasoning-token cap from an OpenAI-style body: our `thinking_budget`, else translate
+    `reasoning_effort`. Validated here so a bad value is a 400, not a 500 mid-generation."""
+    from .thinking import resolve_budget
+    tb = body.get("thinking_budget")
+    eff = body.get("reasoning_effort")
+    if tb is None and eff is None:
+        return None
+    return resolve_budget(tb, eff)
+
+
 def make_handler(state: _State):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -1051,6 +1062,9 @@ def make_handler(state: _State):
                     "mtp": (None if "mtp" not in body else bool(body.get("mtp"))),
                     "tools": tools or None,
                     "response_format": rf,
+                    # A cap on reasoning tokens. Our own `thinking_budget`, or OpenAI's coarse
+                    # `reasoning_effort` translated to one (thinking.resolve_budget).
+                    "thinking_budget": _thinking_budget(body),
                     "_rid": str(rid)[:64] if isinstance(rid, (str, int)) else ""}
 
         def _client_gone(self) -> bool:
@@ -1141,7 +1155,8 @@ def make_handler(state: _State):
                     f"{state.session.name} has no tool-call format, so it cannot be asked to "
                     f"call one. Serve a model whose chat template defines tool calling.")
             kw = {"max_tokens": parsed["max_tokens"], "temperature": parsed["temperature"],
-                  "top_p": parsed["top_p"], "tools": parsed.get("tools")}
+                  "top_p": parsed["top_p"], "tools": parsed.get("tools"),
+                  "thinking_budget": parsed.get("thinking_budget")}
             if parsed["stream"]:
                 return self._anthropic_stream(msgs, kw)
             return self._anthropic_blocking(msgs, kw)

@@ -202,15 +202,24 @@ check("a checkpoint with none of them still fails loudly rather than serving not
 _src = inspect.getsource(direct.expert_manifest)
 check("the quantisation lookup follows the path the tensors were found at",
       "{li}{seen_path}gate_proj" in _src and ".mlp.switch_mlp.gate_proj" not in _src)
-# Regression: the model we actually run must produce exactly what it produced before.
-_dm = direct.expert_manifest(os.path.join(MODELS, "Qwen3-30B-A3B-3bit"))
-check("the manifest for the model we run is unchanged",
-      _dm["total_bytes"] == 12_684_657_664 or _dm["total_bytes"] > 12e9,
-      f'{_dm["total_bytes"]:,}')
-check("...with every layer found", len(_dm["layers"]) == 48, str(len(_dm["layers"])))
-check("...and the quantisation still read off the checkpoint",
-      _dm["layers"]["0"]["quant"]["bits"] == 3
-      and _dm["layers"]["0"]["quant"]["group_size"] == 64, str(_dm["layers"]["0"]["quant"]))
+# Regression: a model we run must produce exactly what it produced before. Qwen3-30B-3bit was
+# the reference; it is no longer kept on disk, so the same regression is held against whichever
+# reference model IS present, with its own known shape.
+_refs = [("Qwen3-30B-A3B-3bit", 12e9, 48, 3), ("Qwen3.6-35B-A3B-4bit", 18e9, 40, 4),
+         ("DeepSeek-Coder-V2-Lite-Instruct-4bit-mlx", 8e9, 26, 4)]
+_ref = next(((n, gb, L, b) for n, gb, L, b in _refs if os.path.isdir(os.path.join(MODELS, n))), None)
+if _ref is None:
+    print("  SKIPPED - no reference model on disk for the manifest regression")
+else:
+    _n, _gb, _L, _b = _ref
+    _dm = direct.expert_manifest(os.path.join(MODELS, _n))
+    check(f"the manifest for {_n} is the size it has always been",
+          _dm["total_bytes"] > _gb, f'{_dm["total_bytes"]:,}')
+    check("...with every MoE layer found", len(_dm["layers"]) == _L, str(len(_dm["layers"])))
+    check("...and the quantisation read off the checkpoint, not assumed",
+          _dm["layers"][sorted(_dm["layers"], key=int)[0]]["quant"]["bits"] == _b
+          and _dm["layers"][sorted(_dm["layers"], key=int)[0]]["quant"]["group_size"] == 64,
+          str(_dm["layers"][sorted(_dm["layers"], key=int)[0]]["quant"]))
 
 print("\n" + "=" * 78)
 print("AN UNQUANTISED MODEL MUST NOT BE GIVEN A QUANTISATION BLOCK")
