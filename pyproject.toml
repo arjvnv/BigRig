@@ -36,6 +36,8 @@ dependencies = [
 [project.optional-dependencies]
 # Kept so `pip install 'bigrig[engine]'` keeps working for anyone who followed older docs.
 engine = ["mlx>=0.29", "mlx-lm>=0.28", "huggingface_hub>=0.30"]
+# Decoding images for `--vision`. Everything else about seeing is in the package itself.
+vision = ["Pillow>=10"]
 dev = ["pytest"]
 
 [project.scripts]
