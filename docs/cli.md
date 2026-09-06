@@ -203,11 +203,19 @@ rig run   Qwen3.6-35B-A3B-4bit --vision                  # then `/image <path>` 
 ```
 
 Qwen3.5 and 3.6 ship a vision encoder inside the checkpoint -- 0.89 GB of bf16 weights the text
-engine otherwise discards. `--vision` loads it beside the expert pool (charged to the ceiling
-before the pool is planned; `/health` shows it under `vision` and `reserved_gb`) and accepts
-images on `/v1/chat/completions` (OpenAI `image_url` parts) and `/v1/messages` (Anthropic
-`image` blocks), as base64 data URLs only -- this server fetches nothing. The web page shows an
-attach button when the server can see. Measured on Qwen3.6 at the 9 GB ceiling: a 640x400
+engine otherwise discards. `--vision` accepts images on `/v1/chat/completions` (OpenAI
+`image_url` parts) and `/v1/messages` (Anthropic `image` blocks), as base64 data URLs only --
+this server fetches nothing. The web page shows an attach button when the server can see.
+
+The encoder is read from the checkpoint when a request carries an image and given back before
+the prompt is read, so the pool is planned as if it did not exist -- on a 16 GB Mac that is the
+difference between running and not: at a 7 GB budget, Qwen3.6 with the encoder charged to the
+ceiling is refused by the planner, while per-request it plans the same pool as without vision,
+reads the image, and peaks 1.1 GB above its footprint for the duration of the request (0.05 s
+to load when the checkpoint is in the page cache; an SSD read of 0.89 GB when cold).
+`--vision-resident` keeps it loaded instead, charged to the ceiling before the pool is planned
+(`/health` shows it under `vision` and `reserved_gb`), for a Mac with memory to spare and many
+image requests. Measured on Qwen3.6 at the 9 GB ceiling: a 640x400
 screenshot is 240 image tokens, encodes in half a second, and its text and code came back
 transcribed exactly; the first token arrived after 7 s, the whole reply in 17 s.
 

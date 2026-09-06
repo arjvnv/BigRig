@@ -50,6 +50,7 @@ class FakeSession:
                  name="fake-model", max_completion_tokens=4096, supports_tools=False, tower=None):
         self.reply, self.delay, self.name = reply, delay, name
         self.tower = tower                    # not None: the server believes it can read images
+        self.vision = tower is not None
         self.streamed, self.packed = False, False
         self.model_dir = "/nonexistent/fake-model"
         self.budget_gb, self.footprint_gb = 9.0, 1.0

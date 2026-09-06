@@ -616,8 +616,9 @@ def _session(a):
                 kv_quant_start=getattr(a, "kv_quant_start", None), verbose=True,
                 persist=not getattr(a, "no_persist", False),
                 reserved_gb=getattr(a, "_reserved_gb", 0.0),
-                vision=bool(getattr(a, "vision", False)),
+                vision=bool(getattr(a, "vision", False) or getattr(a, "vision_resident", False)),
                 vision_pixels=getattr(a, "vision_pixels", None),
+                vision_resident=bool(getattr(a, "vision_resident", False)),
                 force_stream=getattr(a, "force_stream", False),
                 min_bits=getattr(a, "min_bits", None),
                 preference=pref, interactive=True,
@@ -719,7 +720,7 @@ def cmd_run(a) -> int:
                 continue
             if q.startswith("/image "):
                 # A picture for the NEXT message: read now, sent with the text that follows.
-                if s.tower is None:
+                if not s.vision:
                     print("  start with --vision to attach images\n")
                     continue
                 path = os.path.expanduser(q[len("/image "):].strip().strip("'\""))
@@ -1428,10 +1429,16 @@ def build_parser():
                          "written to disk while the server is idle so a restart resumes every "
                          "conversation it held; `bigrig sessions` shows and clears what is kept.")
     sv.add_argument("--vision", action="store_true",
-                    help="also read images: load the vision encoder the checkpoint ships (Qwen3.5/3.6: "
-                         "0.89 GB, charged to the ceiling before the pool is planned) and accept "
-                         "image parts on /v1/chat/completions and /v1/messages as base64 data URLs. "
-                         "Refused on a checkpoint without one.")
+                    help="also read images: accept image parts on /v1/chat/completions and "
+                         "/v1/messages (base64 data URLs). The checkpoint's own vision encoder "
+                         "(Qwen3.5/3.6: 0.89 GB) is read per image request and given back before "
+                         "the prompt is read, so the pool is planned as if it did not exist; "
+                         "--vision-resident keeps it loaded. Refused on a checkpoint without one.")
+    sv.add_argument("--vision-resident", action="store_true",
+                    help="keep the vision encoder loaded for the life of the server (0.89 GB charged "
+                         "to the ceiling before the pool is planned) instead of reading it from the "
+                         "checkpoint per image request (about half a second). For a Mac with memory "
+                         "to spare and many image requests.")
     sv.add_argument("--vision-pixels", type=int, default=None, metavar="N",
                     help="largest image the encoder reads, in pixels (default 1,050,000: about 1,000 "
                          "image tokens; bigger images are scaled down to it). Raise it on a Mac with "

@@ -199,6 +199,8 @@ def main():
             out.append(c)
         res["reply"] = "".join(out); res["first_token_s"] = round(first or 0, 2); res["seconds"] = round(time.perf_counter() - t0, 2)
         res["prompt_tokens"] = s._this_prompt_full; res["disarmed"] = all(sw.positions is None for sw in s._rope_switches)
+        res["tower_held_after"] = s.tower is not None
+        res["capacity"] = s.stats().get("capacity")
         res["cache_entries_after_image"] = len(s._prompt_cache.held()) if s._prompt_cache else 0
         # two images in one message: the second is a plain colour so the answer is checkable
         from PIL import Image

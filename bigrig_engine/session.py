@@ -841,6 +841,7 @@ class Session:
                  kv_quant_start: int | None = None,
                  mtp: str | None = None, mtp_bits: int | None = 4, announce: bool = True,
                  reserved_gb: float = 0.0, vision: bool = False, vision_pixels: int | None = None,
+                 vision_resident: bool = False,
                  stream_embedding: bool = True):
         # Everything this session was built from, so it can be rebuilt with one setting changed
         # without the caller having to remember the other twenty.
@@ -851,7 +852,7 @@ class Session:
             "interactive": False, "remember": remember, "warm": warm,
             "full_layers": full_layers, "no_full_layers": no_full_layers,
             "draft": draft, "draft_tokens": draft_tokens, "reserved_gb": reserved_gb,
-            "vision": vision, "vision_pixels": vision_pixels,
+            "vision": vision, "vision_pixels": vision_pixels, "vision_resident": vision_resident,
             "prefetch_width": prefetch_width, "reroute": reroute, "nocache": nocache,
             "prompt_cache_gb": prompt_cache_gb, "kv_bits": kv_bits, "persist": persist,
             "kv_quant_start": kv_quant_start, "mtp": mtp, "mtp_bits": mtp_bits,
@@ -910,17 +911,28 @@ class Session:
         # ANYTHING ELSE THAT LIVES BESIDE THE POOL -- the embedding encoder `--embeddings` loads
         # -- is charged the same way, before the pool is planned, so the ceiling still holds.
         self.reserved_gb = max(0.0, float(reserved_gb or 0.0))
-        # THE VISION TOWER, LOADED FIRST AND CHARGED TO THE CEILING BEFORE THE POOL IS PLANNED.
-        #     0.89 GB of bf16 weights that live beside the pool for the life of the session
-        #     (vision.py). Refused, with a sentence, on a checkpoint that has none.
+        # THE VISION TOWER: PER REQUEST BY DEFAULT, RESIDENT ON REQUEST.
+        #     0.89 GB of bf16 weights (vision.py). Resident, it lives beside the pool for the life
+        #     of the session and is charged to the ceiling before the pool is planned -- on a
+        #     16 GB Mac that pushes Qwen3.6 under its floor. Per request, it is read from the
+        #     checkpoint when a request carries an image (0.06 s to map, about 0.3 s to
+        #     materialise), the images are encoded, and it is given back BEFORE the prompt is
+        #     read: encoding and prefill never overlap, so the tower and its scratch live inside
+        #     the reserve the prefill would have used, and the pool is planned as if it did not
+        #     exist. Refused, with a sentence, on a checkpoint that has none.
         self.tower = None
         self.preprocessor = None
+        self.vision = bool(vision)
+        self.vision_resident = bool(vision_resident)
+        self.vision_gb = 0.0
         self._rope_switches: list = []
         if vision:
             from . import vision as _vision
-            self.tower = _vision.load_tower(self.config_dir)
+            self.vision_gb = _vision.tower_gb(self.config_dir)        # raises if there is none
             self.preprocessor = _vision.Preprocessor(self.config_dir, max_pixels=vision_pixels)
-            self.reserved_gb += self.tower.nbytes / 1e9
+            if vision_resident:
+                self.tower = _vision.load_tower(self.config_dir)
+                self.reserved_gb += self.tower.nbytes / 1e9
         if self.reserved_gb:
             budget_gb = max(budget_gb * 0.5, budget_gb - self.reserved_gb)
         # THE MODEL'S OWN NEXT-TOKEN HEAD, CHARGED TO THE BUDGET BEFORE THE POOL IS PLANNED.
@@ -1250,8 +1262,10 @@ class Session:
             for line in self.plan_lines:
                 print(line, flush=True)
         self.meter = AdaptiveMeter() if (monitor and _HAVE_METER) else None
-        if self.tower is not None:
+        if self.vision:
             self._wire_vision()
+            if not self.vision_resident:
+                self._fit_vision_to_reserve()
         self.vocab_size = int(getattr(self.tokenizer, "vocab_size", 0) or
                               len(getattr(self.tokenizer, "get_vocab", dict)()) or 0)
         self.flagged_tokens = 0
@@ -1896,22 +1910,52 @@ class Session:
             attn.rope = sw
             self._rope_switches.append(sw)
 
+    def _fit_vision_to_reserve(self) -> None:
+        """Per-request encoding must fit in the memory the prompt's own read would have used.
+
+        The tower (0.89 GB) plus its scratch -- measured 0.21 GB for 240 image tokens and 0.66 GB
+        for 1,000, about 0.15 GB + 0.5 GB per thousand tokens -- has to fit under the serving
+        reserve, since that is the room the plan left and the pool holds the rest. Where it does
+        not, the image pixel cap is lowered so that it does, and stats say so. On the budgets
+        measured here nothing changes: even a 3.5 GB ceiling leaves room for the default cap.
+        """
+        room = serving_reserve_gb(working_memory_gb=getattr(self, "working_memory_gb", None),
+                                  prompt_cache_gb=getattr(self, "prompt_cache_gb", None),
+                                  streamed=self.streamed) - self.vision_gb - 0.15
+        max_tokens = int(room / 0.5 * 1000)
+        pixels = max_tokens * 32 * 32                        # one image token per 32x32 pixels
+        if pixels < self.preprocessor.max_pixels:
+            self.vision_pixels_lowered_from = self.preprocessor.max_pixels
+            self.preprocessor.max_pixels = max(65536, pixels)
+
     def _see(self, ids: list, images: list) -> tuple:
         """(input embeddings (1, L, D), expanded ids, positions, delta) for a prompt with images.
 
         Each image goes through the tower once; its tokens replace the template's single
         placeholder; the text embeddings come from the model's own table and the image rows are
         scattered in; the positions are the reference's get_rope_index. Float32 image tokens are
-        cast to the language model's dtype at the join, as the reference does.
+        cast to the language model's dtype at the join, as the reference does. A per-request
+        tower is loaded here and given back before returning, so it is gone before the prompt
+        is read.
         """
         from . import vision as _vision
+        tower = self.tower
+        borrowed = tower is None
+        if borrowed:
+            tower = _vision.load_tower(self.config_dir)
         grids, feats = [], []
-        for data in images:
-            pv, grid = self.preprocessor(data)
-            f = self.tower(mx.array(pv), [grid])
-            mx.eval(f)
-            grids.append(grid)
-            feats.append(f)
+        try:
+            for data in images:
+                pv, grid = self.preprocessor(data)
+                f = tower(mx.array(pv), [grid])
+                mx.eval(f)
+                grids.append(grid)
+                feats.append(f)
+        finally:
+            if borrowed:
+                del tower
+                gc.collect()
+                mx.clear_cache()
         ids = _vision.expand_placeholders(ids, grids, self.image_token_id, self.vision_merge)
         tm = getattr(self.model, "language_model", None) or self.model
         embed = tm.model.embed_tokens
@@ -2140,7 +2184,7 @@ class Session:
         from . import vision as _vision
         _n_images = _vision.count_images(messages) if messages else 0
         if _n_images:
-            if self.tower is None:
+            if not getattr(self, "vision", False):
                 raise ValueError("this request carries an image, but the server was started without "
                                  "--vision; restart with `--vision` to read images")
             _imgs = _vision.extract_images(messages)
@@ -2778,8 +2822,11 @@ class Session:
              "persist": bool(getattr(self, "persist", False)),
              "history_snapshots": int(getattr(self, "history_snapshots", 0)),
              "lookahead_unavailable": getattr(self, "lookahead_unavailable", "") or None,
-             "vision": ({"tower_gb": round(self.tower.nbytes / 1e9, 3), "max_pixels": self.preprocessor.max_pixels,
-                         "max_images": _vision_max_images()} if getattr(self, "tower", None) is not None else None),
+             "vision": ({"tower_gb": round(self.vision_gb, 3), "max_pixels": self.preprocessor.max_pixels,
+                         "max_images": _vision_max_images(),
+                         "resident": bool(self.vision_resident),
+                         "pixels_lowered_from": getattr(self, "vision_pixels_lowered_from", None)}
+                        if getattr(self, "vision", False) else None),
              "resumed_conversations": int((getattr(self, "resumed", None) or {}).get("restored", 0)),
              "prompt_cache_bytes": (int(self._prompt_cache.nbytes)
                                     if self._prompt_cache is not None else 0),

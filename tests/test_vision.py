@@ -166,6 +166,22 @@ check("to_engine_messages keeps image blocks for the template and drops nothing"
 check("count_images and extract_images agree with the template's notion of an image item",
       vision.count_images(m) == 1 and vision.extract_images(m) == [b"ABC"])
 
+print("\n" + "=" * 84); print("5b. PER REQUEST BY DEFAULT: THE POOL IS PLANNED AS IF THE TOWER DID NOT EXIST"); print("=" * 84)
+if not os.path.isdir(MD):
+    print("  SKIPPED - Qwen3.6-35B-A3B-4bit is not on disk")
+else:
+    # Pure planning, no model load: the same budget, with and without a resident tower. At 7.0 GB
+    # the resident tower (0.89 GB off the pool) is REFUSED by the planner while per-request plans
+    # the full pool -- measured live at that budget: per-request answered "add" and peaked 1.1 GB
+    # above its footprint for the duration of the request; resident could not start at all.
+    check("the tower's size is read from the checkpoint's headers without loading a weight",
+          0.88 < vision.tower_gb(MD) < 0.90, f"{vision.tower_gb(MD):.3f}")
+    try:
+        vision.tower_gb(os.path.join(ROOT, "models", "OLMoE-1B-7B-0125-4bit"))
+        check("a checkpoint without a tower is refused with a sentence", False)
+    except (ValueError, FileNotFoundError) as e:
+        check("a checkpoint without a tower is refused with a sentence", True)
+
 print("\n" + "=" * 84); print("6. THE WHOLE ROAD, ON QWEN3.6"); print("=" * 84)
 if not os.path.isdir(MD):
     print("  SKIPPED - Qwen3.6-35B-A3B-4bit is not on disk")
@@ -181,8 +197,9 @@ else:
         print(f"      first token {R['first_token_s']}s, reply in {R['seconds']}s, prompt {R['prompt_tokens']} tokens (240 of them image)")
         print(f"      reply: {R['reply'][:160]!r}")
         print(f"      two images, 'what colour is the second': {R['two_image_reply']!r}")
-        check("the tower is charged to the ceiling before the pool is planned",
-              R["reserved_gb"] and abs(R["reserved_gb"] - R["vision_stats"]["tower_gb"]) < 1e-6, str(R["reserved_gb"]))
+        check("by default the tower is NOT charged to the ceiling: it is read per request and given back",
+              not R["reserved_gb"] and R["vision_stats"]["resident"] is False and R["tower_held_after"] is False,
+              f"reserved {R['reserved_gb']} resident {R['vision_stats']['resident']} held {R['tower_held_after']}")
         check("the prompt carries the image's 240 tokens plus the text", R["prompt_tokens"] and 240 < R["prompt_tokens"] < 320, str(R["prompt_tokens"]))
         rep = R["reply"]
         check("the model READ the screenshot: the headline is transcribed", "BigRig" in rep and "Qwen3.6" in rep and "screenshot" in rep, rep[:120])

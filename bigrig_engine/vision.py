@@ -262,6 +262,30 @@ class VisionTower(nn.Module):
         return sum(v.nbytes for _, v in tree_flatten(self.parameters()))
 
 
+def tower_gb(model_dir: str) -> float:
+    """The tower's size in the checkpoint, from the safetensors headers alone (no weights read).
+    Raises ValueError, with a sentence, when the checkpoint has none."""
+    import struct
+    with open(os.path.join(model_dir, "config.json")) as f:
+        cfg = json.load(f)
+    if not cfg.get("vision_config"):
+        raise ValueError("this checkpoint has no vision tower")
+    idx = json.load(open(os.path.join(model_dir, "model.safetensors.index.json")))["weight_map"]
+    files = sorted({v for k, v in idx.items() if k.startswith("vision_tower.")})
+    if not files:
+        raise ValueError("this checkpoint's weights hold no vision tower")
+    total = 0
+    for fn in files:
+        with open(os.path.join(model_dir, fn), "rb") as fh:
+            n = struct.unpack("<Q", fh.read(8))[0]
+            hdr = json.loads(fh.read(n))
+        for k, v in hdr.items():
+            if k.startswith("vision_tower."):
+                a, b = v["data_offsets"]
+                total += b - a
+    return total / 1e9
+
+
 def load_tower(model_dir: str, dtype=mx.bfloat16) -> VisionTower:
     """The tower from the checkpoint's own shards. Only `vision_tower.*` tensors are materialised."""
     with open(os.path.join(model_dir, "config.json")) as f:

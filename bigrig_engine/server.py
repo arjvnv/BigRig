@@ -1021,7 +1021,7 @@ def make_handler(state: _State):
             n = _vision.count_images(msgs)
             if not n:
                 return ""
-            if getattr(state.session, "tower", None) is None:
+            if not getattr(state.session, "vision", False):
                 return ("this request carries an image, but the server was started without --vision; "
                         "restart with `bigrig serve <model> --vision` to read images")
             try:
