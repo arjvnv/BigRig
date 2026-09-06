@@ -15,6 +15,7 @@ rather than taken on faith.
 from __future__ import annotations
 
 import functools
+import gc
 import json
 import os
 import re
@@ -677,6 +678,12 @@ def _config_dir(model_dir: str) -> str:
         return d                      # callers already handle a config.json that is not there
 
 
+# When the last Session in this process closed (monotonic seconds), and how long macOS takes to
+# show its memory as available again. See resolve_budget.
+_LAST_CLOSE = [float("-inf")]
+SETTLE_AFTER_CLOSE_S = 0.6
+
+
 def resolve_budget(budget_gb: float | None = None, quiet: bool = False) -> float:
     """How much memory this run may use: the flag, then the environment, then what is free.
 
@@ -696,6 +703,13 @@ def resolve_budget(budget_gb: float | None = None, quiet: bool = False) -> float
             except ValueError:
                 want = None
     if want is None:
+        # A session closed in this process moments ago is still being given back by macOS: the
+        # available figure lags the release by about half a second (measured: 7.5 GB read right
+        # after a close, 10.1 GB half a second later). Wait it out ONLY in that case, so a fresh
+        # start pays nothing and a rebuild or a test does not plan against a phantom shortfall.
+        since = time.monotonic() - _LAST_CLOSE[0]
+        if since < SETTLE_AFTER_CLOSE_S:
+            time.sleep(SETTLE_AFTER_CLOSE_S - since)
         want = calibrate.available_gb()
     if want > MAX_ALLOWED_GB:
         if not quiet:                     # doctor explains the cap itself, in its MACHINE block
@@ -2686,7 +2700,18 @@ class Session:
         self.draft_model = None
         self.mtp_head = None
         self._last_logits = None
+        self.tower = None
+        self._rope_switches = []
+        self._prompt_cache = None
+        # COLLECT NOW, NOT WHENEVER PYTHON GETS ROUND TO IT. The model, its streaming handle and
+        # the modules that hold both refer to each other, so dropping the references above frees
+        # nothing until the cycle collector runs. Measured on OLMoE: 1.84 GB still resident right
+        # after close, 0.43 GB after one collect -- and a second Session built in that window
+        # planned against a machine 1.4 GB smaller than it is (once small enough to refuse the
+        # model outright). Cheap: a few milliseconds.
+        gc.collect()
         mx.clear_cache()
+        _LAST_CLOSE[0] = time.monotonic()
 
     def stats(self) -> dict:
         s = {"model": self.name, "streamed": self.streamed,

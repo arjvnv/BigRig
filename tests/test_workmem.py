@@ -128,6 +128,24 @@ if QW is not None:
 else:
     print("  SKIPPED - Qwen3-30B manifest fixture absent")
 
+print("\n" + "=" * 84); print("5b. A BUDGET RESOLVED RIGHT AFTER A CLOSE WAITS OUT THE ACCOUNTING LAG"); print("=" * 84)
+import time as _time                                                         # noqa: E402
+from bigrig_engine import session as _S                                      # noqa: E402
+_prev_env = os.environ.pop("BIGRIG_MEM_GB", None)
+try:
+    _S._LAST_CLOSE[0] = float("-inf")
+    _t0 = _time.perf_counter(); _S.resolve_budget(quiet=True); _fresh = _time.perf_counter() - _t0
+    check("with no recent close the budget is read at once", _fresh < 0.25, f"{_fresh:.2f}s")
+    _S._LAST_CLOSE[0] = _time.monotonic()
+    _t0 = _time.perf_counter(); _S.resolve_budget(quiet=True); _after = _time.perf_counter() - _t0
+    check("right after a close it waits for macOS to show the memory as free again (~0.6 s), then reads",
+          _S.SETTLE_AFTER_CLOSE_S - 0.1 <= _after <= _S.SETTLE_AFTER_CLOSE_S + 0.5, f"{_after:.2f}s")
+    check("an explicit budget never waits", (lambda t0: (_S.resolve_budget(4.0, quiet=True), _time.perf_counter() - t0)[1])(_time.perf_counter()) < 0.05)
+finally:
+    _S._LAST_CLOSE[0] = float("-inf")
+    if _prev_env is not None:
+        os.environ["BIGRIG_MEM_GB"] = _prev_env
+
 print("\n" + "=" * 84); print("6. KV-CACHE PRECISION IS A DOCUMENTED CHOICE, OFF BY 0 OR 16"); print("=" * 84)
 from bigrig_engine.session import resolve_kv_bits, KV_BITS                # noqa: E402
 check("no request keeps the 4-bit default", resolve_kv_bits(None) == KV_BITS == 4)

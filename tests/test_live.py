@@ -354,6 +354,12 @@ check("...not below the floor", low >= floor, f"{low} < {floor}")
 check("...and the reload is logged with the reason",
       any("short of memory" in e.get("why", "") for e in h_sh.get("shrink_log", [])),
       str(h_sh.get("shrink_log")))
+# A rebuild re-plans the pool; it must not re-decide how much of the Mac to use. Re-reading free
+# memory while the old pool was still being given back planned a smaller pool than the machine
+# has (session.close measured 1.4 GB behind for half a second). The budget is pinned instead.
+check("the rebuilt session keeps the budget the first one had -- a rebuild never re-reads free memory",
+      abs(float(h_sh.get("budget_gb") or 0) - float(h0.get("budget_gb") or 0)) < 1e-6,
+      f"{h0.get('budget_gb')} -> {h_sh.get('budget_gb')}")
 
 print("\n" + "=" * 84)
 print("5. WHEN THE MACHINE IS QUIET AGAIN, THE MEMORY COMES BACK -- AND STOPS AT HOME")

@@ -273,6 +273,12 @@ class _State:
             old = self.session
             kw = dict(old.init_kwargs)
             kw.update({k: v for k, v in want.items() if v is not None})
+            # THE SAME MACHINE, THE SAME BUDGET. A rebuild re-plans the pool, it does not re-decide
+            # how much of the Mac to use -- and re-reading free memory here would read it while
+            # the old pool is still being given back (session.close measured 1.4 GB behind for
+            # about half a second), planning a smaller pool than the user has for no reason.
+            if kw.get("budget_gb") is None:
+                kw["budget_gb"] = old.budget_gb
             self.tokens_before += int(getattr(old, "total_tokens", 0) or 0)
             self.flagged_before += int(getattr(old, "flagged_tokens", 0) or 0)
             self.session = None
