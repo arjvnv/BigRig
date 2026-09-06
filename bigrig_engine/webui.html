@@ -377,6 +377,10 @@ tr.flag td{color:var(--warn)}
       <div class="track"><i id="m-bar-r" style="width:0"></i></div>
     </div>
     <div class="meter">
+      <div class="lbl" title="How much of this conversation's room is used. The ceiling is whichever binds first: the model's context window, or the memory the conversation cache can grow into on this Mac. When it runs out the next turn has to start over."><span>Context</span><b id="m-ctx">—</b></div>
+      <div class="track"><i id="m-bar-ctx" style="width:0"></i></div>
+    </div>
+    <div class="meter">
       <div class="lbl" title="Flags output that looks unusual FOR THIS MODEL -- repetition it was not asked for, or confidence unlike its own normal. It is an anomaly detector, not a fact checker: it cannot tell whether an answer is true, and a confidently-stated falsehood looks perfectly healthy to it. It also has no copy of the uncompressed model to compare against, so it cannot attribute anything it sees to BigRig."><span>Anomalies</span><b id="m-q">—</b></div>
       <div class="track idle" id="m-track-q"><i id="m-bar-q" style="width:100%"></i></div>
     </div>
@@ -1165,6 +1169,17 @@ async function refresh(){
     $("#m-bar-r").style.width=(h.capacity/h.n_experts*100)+"%";
     $("#m-res").textContent=`${h.capacity} / ${h.n_experts}`;
   } else { $("#m-bar-r").style.width="100%"; $("#m-res").textContent="all"; }
+  // Context: used against the ceiling that binds, and what is left. Read straight off the
+  // server -- this page never re-derives a limit the engine already computed.
+  (function(){
+    const cap=h.max_completion_tokens||0, used=h.context_used||0, left=h.context_remaining;
+    if(!cap){ $("#m-ctx").textContent="—"; $("#m-bar-ctx").style.width="0"; return; }
+    const pct=Math.min(100, used/cap*100);
+    $("#m-bar-ctx").style.width=pct+"%";
+    $("#m-bar-ctx").className = pct>=90 ? "warn" : "";      // the existing .track i.warn colour
+    const fmt=n=>n>=1000?(n/1000).toFixed(n>=10000?0:1)+"k":String(n);
+    $("#m-ctx").textContent = used ? `${fmt(left)} left of ${fmt(cap)}` : `${fmt(cap)} ${h.token_limit_reason==="memory"?"(memory)":"(window)"}`;
+  })();
 
   paintPromptCache(h);
   paintCode(h);

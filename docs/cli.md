@@ -81,7 +81,7 @@ Serves four things on one port:
 - `GET  /` — the web interface
 - `POST /v1/chat/completions`, `/v1/completions` — OpenAI
 - `POST /v1/messages`, `/v1/messages/count_tokens` — Anthropic
-- `GET  /health` — live residency, miss rate, mode, and whether weights were altered
+- `GET  /health` — live residency, miss rate, mode, and whether weights were altered; `context_used` and `context_remaining` say how full the conversation is against the ceiling that binds on this Mac (`max_completion_tokens`), so a client can warn before the next turn has to start over
 
 Requests are served one at a time. One model, one expert pool: two generations at once would
 evict each other's experts every step and both would finish later than if they had queued.

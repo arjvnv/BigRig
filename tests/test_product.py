@@ -721,6 +721,27 @@ if up:
     check("tools and response_format together are refused rather than mangled",
           st11 == 400 and "combined" in json.dumps(d11), f"{st11}")
 
+    # ---------------------------------------------------------------- context remaining, live
+    # The page shows how full a conversation is against the ceiling that binds. `context_used`
+    # must count the WHOLE conversation -- with prompt-cache reuse mlx_lm reports only the unread
+    # tail as prompt_tokens, and an early version used that and showed turn two as smaller than
+    # turn one. used + remaining must always equal the ceiling.
+    _, hc0 = get("/health")
+    check("health carries both fields as integers",
+          isinstance(hc0.get("context_used"), int) and isinstance(hc0.get("context_remaining"), int),
+          f"{hc0.get('context_used')!r} / {hc0.get('context_remaining')!r}")
+    _m = [{"role": "user", "content": "Name three planets."}]
+    st_a, ra = post("/v1/chat/completions", {"messages": _m, "max_tokens": 20, "temperature": 0.0}, timeout=120)
+    _, hc1 = get("/health")
+    _m += [{"role": "assistant", "content": ra["choices"][0]["message"]["content"] or "x"},
+           {"role": "user", "content": "And three more."}]
+    st_b, rb = post("/v1/chat/completions", {"messages": _m, "max_tokens": 20, "temperature": 0.0}, timeout=120)
+    _, hc2 = get("/health")
+    check("context_used grows across turns, counting the reused prefix",
+          0 < hc1["context_used"] < hc2["context_used"], f"{hc1['context_used']} -> {hc2['context_used']}")
+    check("used + remaining equals the ceiling on every turn",
+          all(h["context_used"] + h["context_remaining"] == h["max_completion_tokens"] for h in (hc1, hc2)))
+
     # ---------------------------------------------------------------- who may drive this server
     # This server has no authentication, so "who is asking" is the whole defence. A wildcard
     # CORS header let any page the user happened to have open POST here and READ the reply.

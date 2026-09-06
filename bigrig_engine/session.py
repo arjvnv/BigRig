@@ -1193,6 +1193,11 @@ class Session:
         self._wm_peak = 0.0
         self._wm_max_prefill = 0
         self._wm_decode = 0
+        # THE SIZE OF THE CONVERSATION AS LAST SEEN, so the page can say how much room is left
+        # before the next turn hits the context or memory ceiling -- the cliff a user otherwise
+        # meets with no warning. prompt + reply of the most recent completed request.
+        self._last_prompt_tokens = 0
+        self._last_generation_tokens = 0
         # RUNS OF FLAGS, NOT SINGLE FLAGS, ARE WHAT DEGRADATION LOOKS LIKE.
         #     The meter judges each token against this model's own normal at z = 2.5, so about
         #     one healthy token in a hundred trips it by chance -- measured, 2 of 281 on a clean
@@ -1889,9 +1894,14 @@ class Session:
         #     the whole of it, and would leave the reply to be read again.
         pc, full_ids, prompt_in = None, None, text
         self._generated_ids = []
+        # The conversation's true length for this request. With prompt-cache reuse mlx_lm reports
+        # only the UNREAD tail as prompt_tokens, so the size the next turn starts from has to be
+        # taken from the full token list when there is one. None -> fall back to what mlx_lm says.
+        self._this_prompt_full = None
         if self._prompt_cache is not None:
             try:
                 full_ids = self.tokenizer.encode(text)
+                self._this_prompt_full = len(full_ids)
                 pc, tail, _protected = self._prompt_cache.fetch_nearest_cache(
                     self._cache_key, full_ids)
                 _matched = (len(full_ids) - len(tail)) if pc is not None else 0
@@ -2048,6 +2058,10 @@ class Session:
                         pass
                     self._wm_max_prefill = max(self._wm_max_prefill, int(r.prompt_tokens or 0))
                     self._wm_decode += 1
+                self._last_prompt_tokens = int(self._this_prompt_full
+                                               if self._this_prompt_full is not None
+                                               else (r.prompt_tokens or 0))
+                self._last_generation_tokens = int(r.generation_tokens or 0)
                 raw += r.text
                 # A CONSTRUCT CANNOT BE REWRITTEN A PIECE AT A TIME.
                 #     Rewriting only the newly-arrived tail splits `<|channel|>analysis` from its
@@ -2411,6 +2425,12 @@ class Session:
              "context_length": self.context_length,
              "max_completion_tokens": self.max_completion_tokens,
              "token_limit_reason": self.token_limit_reason,
+             # How full the conversation is against the ceiling that actually binds (memory or
+             # the model's window), and how much is left. `context_used` is the last request's
+             # prompt plus its reply -- the size the next turn starts from.
+             "context_used": self._last_prompt_tokens + self._last_generation_tokens,
+             "context_remaining": max(0, int(self.max_completion_tokens or 0)
+                                      - (self._last_prompt_tokens + self._last_generation_tokens)),
              "budget_gb": round(self.budget_gb, 2),
              # Which read path the experts take. Packed is the page-aligned copy the GPU can
              # read in place; unpacked means every expert is copied in from the model's own

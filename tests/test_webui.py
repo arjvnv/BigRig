@@ -349,6 +349,15 @@ check("the creativity control explains what the number does, in words",
       "0 always picks the likeliest next word" in _page)
 check("the instructions control says the text stays in this browser", "Kept in this browser only" in _page)
 
+print("\n" + "=" * 84); print("8. THE CONTEXT METER READS THE SERVER, NEVER RE-DERIVES THE LIMIT"); print("=" * 84)
+check("the page has a Context meter", 'id="m-ctx"' in html and 'id="m-bar-ctx"' in html)
+check("...filled from context_used and context_remaining as the server reports them",
+      "h.context_used" in script and "h.context_remaining" in script)
+check("...against the ceiling the server computed, not one the page re-derives",
+      "h.max_completion_tokens" in script)
+check("...and it says which limit binds when nothing is used yet", "token_limit_reason" in script)
+check("a nearly full context turns the bar the warning colour", '"warn"' in script)
+
 print()
 print("=" * 84)
 print("ALL TESTS PASSED" if not FAIL else f"{len(FAIL)} FAILURES: " + ", ".join(FAIL))
