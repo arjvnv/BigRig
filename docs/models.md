@@ -72,6 +72,26 @@ itself barely moves the miss rate in the range a small Mac reaches, which is why
 higher ceiling often changes nothing. The first run measures the exact best setting for your
 Mac, and the table above is what those predictions were checked against.
 
+## Against a dense model that fits
+
+The question a 16 GB Mac owner is really asking is whether a streamed 35B mixture-of-experts model
+beats the dense model they could hold instead. Measured, rather than assumed, on one Mac, same
+prompts, greedy, thinking off, caps high enough that no reply was cut (1,024 and 768 tokens):
+
+| | GSM8K (50) | HumanEval (40) | decode tok/s | first token |
+|---|---|---|---|---|
+| Qwen3.6-35B-A3B-4bit, streamed by BigRig at a 9 GB budget | 49/50 | 40/40 | 8.4 / 6.1 | 4.4 s / 6.2 s |
+| Qwen3-14B-4bit, dense, fully resident on plain mlx_lm | 49/50 | 38/40 | 9.3 / 8.6 | 2.1 s / 2.7 s |
+
+Level in what the two get right -- one GSM8K miss each, and two more HumanEval solutions for
+the streamed model, a margin forty items cannot tell from noise -- and the dense model is quicker
+where it fits. What the streamed model buys is where it runs: the 14B needs its 8.3 GB
+of weights plus a conversation cache in memory, which a 16 GB Mac cannot give it, while the
+35B-A3B runs there from a budget of a few gigabytes -- and brings a newer generation's tools,
+reasoning and vision with it. The honest claim is capability at a fraction of the memory, not
+more capability. Two evaluations of fifty and forty items each cannot resolve a difference of
+one or two answers; they can rule out a large one, and they do.
+
 ## Quantisation
 
 Most MLX models ship at 4-bit. BigRig will shrink a model further **only with your agreement**,
