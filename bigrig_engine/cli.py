@@ -604,10 +604,11 @@ def _session(a):
     draft = getattr(a, "draft", None)
     if draft:
         draft = resolve_model(draft)
-    if getattr(a, "file_pool", False):
+    if getattr(a, "file_pool", False) or getattr(a, "slot_pool", False):
         from . import stream as _stm
-        _stm.VIEWS_PREFILL = True
-        _stm.VIEWS_DECODE = True
+        on = not getattr(a, "slot_pool", False)
+        _stm.VIEWS_PREFILL = on
+        _stm.VIEWS_DECODE = on
     mtp = getattr(a, "mtp", None)
     if mtp:
         from . import mtp as _mtp
@@ -1313,13 +1314,16 @@ def build_parser():
                        help="quantise the head's experts to this many bits (default 4: a third "
                             "of the memory, same acceptance measured; 0 keeps bf16)")
         x.add_argument("--file-pool", action="store_true",
-                       help="run the experts straight from the file's cached pages instead of "
-                            "copying each into a pool slot. Measured on Qwen3.6-35B-A3B-4bit: "
-                            "1.4-2.0x faster to the first token, about 1.1x faster decode, and a "
-                            "0.5 GB smaller footprint because the hot experts no longer exist "
-                            "twice. The arithmetic runs through a different kernel than a "
-                            "resident model's, so a reply can differ in a near-tie (1 of 3 "
-                            "measured). Off by default for that reason.")
+                       help="(the default) run the experts straight from the file's cached pages "
+                            "instead of copying each into a pool slot: faster to the first token "
+                            "on every streamed model measured (1.1-2.6x), faster decode on most, "
+                            "and a peak 2.5-6.5 GB lower. Kept as a flag so older commands still work.")
+        x.add_argument("--slot-pool", action="store_true",
+                       help="the copy path instead: each expert copied into a pool slot on the GPU. "
+                            "Its greedy replies differ from the default's in about half of short "
+                            "replies at a near-tie -- not in quality: the same GSM8K score on "
+                            "Qwen3.6, HumanEval 38/40 against the default's 40/40. For comparing "
+                            "against earlier versions, or a kernel path that misbehaves.")
         x.add_argument("--prefetch", type=int, default=0, metavar="N",
                        help="experts to name a layer ahead from the hidden state. OFF by "
                             "default and measured not to pay on Qwen3.6 (0.84x prose, 0.98x code, "

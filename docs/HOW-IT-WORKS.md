@@ -128,15 +128,15 @@ give the same reply.
 ## The file as the pool
 
 A Mac's GPU and its file cache share one memory, so an expert sitting in the page cache can be
-handed to the GPU without a copy. The shipped pool uses that for the copy IN: an admitted expert
-is read from the cache into a pool slot with no CPU copy. `--file-pool` goes one step further and
-keeps no slots at all: a resident expert is a live view of its cached pages, eviction is dropping
-the view, and prefill reads every expert a chunk wants straight from the cache. Measured, that is
-1.4-2.0x faster to the first token, about 1.1x faster decode, and a 0.5 GB smaller process
-footprint, because the hot experts no longer exist twice. It is a choice rather than the default
-because the rows then run through a different kernel than a resident model's, and about one reply
-in three flips a near-tie. A native Metal kernel that gathers across views would remove that
-difference; it is the piece of this design that is not built.
+handed to the GPU without a copy. The pool keeps no slots at all: a resident expert is a live
+view of its cached pages, eviction is dropping the view, and prefill reads every expert a chunk
+wants straight from the cache. Measured against the copy path (each expert copied into a GPU
+slot) on five models, that is faster to the first token on every streamed model, faster decode
+on most, a peak 2.5-6.5 GB lower, and the same benchmark scores. The rows run through a
+different kernel than a resident model's, so about half of short greedy replies differ somewhere
+at a near-tie -- the same class of difference chunk width already causes; `--slot-pool` restores
+the copy path. A native Metal kernel that gathers across views would remove that difference; it
+is the piece of this design that is not built.
 
 ## Guessing one token ahead
 

@@ -243,8 +243,10 @@ def _flag(name, env_value, var):
     return _sp3.run([_sys3.executable, "-c", "import sys; sys.path.insert(0, %r); "
                      "from bigrig_engine import stream; print(stream.%s)" % (ROOT, name)],
                     capture_output=True, text=True, env=env).stdout.strip()
-check("off unless asked", stream.VIEWS_PREFILL is False and _flag("VIEWS_PREFILL", None, "BIGRIG_VIEWS_PREFILL") == "False"
-      and _flag("VIEWS_PREFILL", "1", "BIGRIG_VIEWS_PREFILL") == "True")
+check("on by default since the measurement that gated it, and switchable off",
+      stream.VIEWS_PREFILL is True and _flag("VIEWS_PREFILL", None, "BIGRIG_VIEWS_PREFILL") == "True"
+      and _flag("VIEWS_PREFILL", "0", "BIGRIG_VIEWS_PREFILL") == "False"
+      and _flag("VIEWS_DECODE", None, "BIGRIG_VIEWS_DECODE") == "True" and _flag("VIEWS_DECODE", "0", "BIGRIG_VIEWS_DECODE") == "False")
 check("only a real prefill chunk that wants most of the layer takes it",
       "flat.shape[0] >= VIEWS_MIN_TOKENS" in _src3 and "VIEWS_MIN_SHARE * self._pool.n_experts" in _src3
       and stream.VIEWS_MIN_TOKENS >= 4)
@@ -253,9 +255,9 @@ check("it fetches every expert of the chunk once and never admits to the pool",
       "self._fetcher.fetch(" in _fv and "admit" not in _fv and "ensure(" not in _fv)
 check("rows come back in the caller's (token, k) order", "np.argsort(order, kind=\"stable\")" in _fv
       and "return y[mx.array(inv)]" in _fv)
-check("the CLI exposes it as --file-pool and says what it costs",
-      "--file-pool" in open(os.path.join(ROOT, "bigrig_engine", "cli.py")).read()
-      and "near-tie" in open(os.path.join(ROOT, "bigrig_engine", "cli.py")).read())
+_cli_help = _sp3.run([_sys3.executable, "-m", "bigrig_engine.cli", "serve", "--help"], capture_output=True, text=True, cwd=ROOT).stdout
+check("the CLI keeps --file-pool (now the default) and offers --slot-pool, which says what it costs",
+      "--file-pool" in _cli_help and "--slot-pool" in _cli_help and "near-tie" in _cli_help)
 
 print("\n" + "=" * 82)
 print("3d4. IN VIEWS MODE A RESIDENT EXPERT IS A LIVE VIEW, AND EVICTION IS A DROP")

@@ -1425,9 +1425,17 @@ PREFILL_EVAL_EVERY = 8
 #     path skips the slot. Each expert's bytes are wrapped as a zero-copy view of the page cache
 #     and the rows routed to it go through `quantized_matmul` on that view directly; the views
 #     live for this layer only, so Metal wires 453 MB at a time and releases it. Same weights,
-#     same arithmetic per row. Whether it pays is a measurement, not an argument; it is OFF
-#     unless BIGRIG_VIEWS_PREFILL=1 until it has.
-VIEWS_PREFILL = os.environ.get("BIGRIG_VIEWS_PREFILL", "0") == "1"
+#     same arithmetic per row.
+#
+#     ON BY DEFAULT SINCE 2026-09-07, AFTER THE MEASUREMENT IT WAITED FOR. Against the slot pool
+#     on the same prompts, one process each, five models: faster to the first token on every
+#     streamed model (1.1-2.6x) and in decode on most (up to 1.9x), a peak 2.5-6.5 GB lower, and
+#     on Qwen3.6 the same GSM8K score (49/50 both) and HumanEval 40/40 against 38/40. Every live
+#     suite passes under it (456 assertions). What it changes: about half of short greedy replies
+#     differ somewhere from the slot path's -- a near-tie flipped by a different kernel path, the
+#     same class of difference chunk width already causes -- and the two benchmarks say that is
+#     not a quality loss. `--slot-pool` (or BIGRIG_VIEWS_PREFILL=0) restores the copy path.
+VIEWS_PREFILL = os.environ.get("BIGRIG_VIEWS_PREFILL", "1") == "1"
 # THE FILE AS THE POOL, FOR DECODE: RESIDENT EXPERTS ARE LIVE VIEWS, NOT COPIES.
 #     In views mode a streamed layer's pool holds no slot tensors. Admitting an expert wraps its
 #     page-cache bytes as a zero-copy view and keeps the view alive; Metal wires those pages while
@@ -1438,9 +1446,9 @@ VIEWS_PREFILL = os.environ.get("BIGRIG_VIEWS_PREFILL", "0") == "1"
 #     on its view (1.5 ms a token for 36 layers x 8 x 3, measured, against 1.0 for the gathers).
 #     The policy, the accounting and the ceiling are the pool's own; only what a slot IS changes.
 #     What MLX's own memory counter cannot see -- wired file pages -- `calibrate.phys_footprint_gb`
-#     can, and the session's footprint adds the resident bytes in this mode. OFF unless
-#     BIGRIG_VIEWS_DECODE=1 until its identity and speed are measured.
-VIEWS_DECODE = os.environ.get("BIGRIG_VIEWS_DECODE", "0") == "1"
+#     can, and the session's footprint adds the resident bytes in this mode. On by default with
+#     VIEWS_PREFILL (see above); BIGRIG_VIEWS_DECODE=0 or --slot-pool turns it off.
+VIEWS_DECODE = os.environ.get("BIGRIG_VIEWS_DECODE", "1") == "1"
 VIEWS_MIN_TOKENS = 32
 VIEWS_MIN_SHARE = 0.5
 # Most experts a layer will copy to the GPU on the previous layer's say-so. Eight is the

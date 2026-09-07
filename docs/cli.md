@@ -157,23 +157,27 @@ tokens it kept -- one extra pass, reported as `rereads`. That is why acceptance 
 for it to pay on those models. A build before this re-read left rejected guesses in the state,
 which showed up as a reply repeating the user's own sentence; if you saw that, update.
 
-## The file as the pool: `--file-pool`
+## The file as the pool (the default): `--slot-pool` to turn it off
 
 ```bash
-rig serve <model> --file-pool
+rig serve <model>                # experts run from the file's cached pages: no copy, no slot
+rig serve <model> --slot-pool    # the copy path: each expert copied into a pool slot on the GPU
 ```
 
-Normally an expert the model needs is copied from the file's cached pages into a pool slot on
-the GPU, and the pool holds the hot experts beside the page cache that already has them. With
-`--file-pool` there is no copy and no slot: a resident expert is a live view of its cached pages,
-eviction is dropping the view, and the arithmetic runs on the view. Measured on
-Qwen3.6-35B-A3B-4bit at the 9.7 GB ceiling: 1.4-2.0x faster to the first token (no copies during
-prefill), about 1.1x faster decode, and a 0.5 GB smaller process footprint because the hot
-experts exist once. The cost is the same one `--mtp` has: the rows run through
-`quantized_matmul` rather than the gather a resident model uses, and about one reply in three
-differs somewhere in a near-tie. Off by default for that reason. The numbers are in
-measurement; this is the software form of the design that a native Metal kernel
-would make exact.
+A resident expert is a live view of its cached pages, eviction is dropping the view, and the
+arithmetic runs on the view; prefill reads every expert a chunk wants straight from the cache.
+This became the default in 0.9 after the measurement it waited for -- five models, one process
+per mode, the same prompts: faster to the first token on every streamed model (1.1-2.6x), faster
+decode on most (up to 1.9x), a peak 2.5-6.5 GB lower, and on Qwen3.6 the same GSM8K score as the
+copy path (49/50 both) with HumanEval 40/40 against 38/40. Every live suite passes under it.
+
+What it changes: the rows run through `quantized_matmul` rather than the gather a resident model
+uses, so about half of short greedy replies differ somewhere from the copy path's -- a near-tie
+flipped by a different kernel path, the same class of difference chunk width already causes, and
+the two benchmarks say it is not a quality loss. `--slot-pool` restores the copy path, for
+comparing against earlier versions. (The copy path's prefill also had a defect the measurement
+found -- a long prompt could grow its lazy graph to 20 GB and be killed by Metal -- fixed in
+the same release; the views path never accumulated it.)
 
 ## The conversation cache: `--kv-bits`
 
