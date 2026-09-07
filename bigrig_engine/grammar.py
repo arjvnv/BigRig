@@ -106,6 +106,52 @@ class JSONPrefix:
         c.keys, c.cur_key, c.in_key = list(self.keys), self.cur_key, self.in_key
         return c
 
+    def wrap_up(self) -> list:
+        """The shortest sequence of pieces that turns the text so far into a complete document,
+        one piece per step: finish an escape or a half-written literal, close an open string,
+        give a dangling key or colon its smallest legal value, then close every open container.
+        Empty when the document is already complete."""
+        out = []
+        probe = self.copy()
+        for _ in range(256):                               # depth is bounded far below this
+            if probe.done:
+                return out
+            st = probe.state
+            if st == self.IN_STRING:
+                piece = "n" if probe.esc else ("0" if probe.hex_left else '"')
+            elif st == self.IN_NUMBER:
+                if probe.num and probe.num[-1] in "-.eE+":
+                    piece = "0"                            # the number cannot end here yet
+                elif probe.stack:
+                    piece = "}" if probe.stack[-1] == "{" else "]"
+                else:
+                    return out                             # a bare number is complete as it stands
+            elif st == self.IN_LITERAL:
+                full = next((w for w in ("true", "false", "null") if w.startswith(probe.lit)), None)
+                if full is None:
+                    return out
+                piece = full[len(probe.lit):]
+            elif st == self.COLON:
+                piece = ":"
+            elif st == self.VALUE:
+                # At the top of a document that must be an object, the shortest completion opens
+                # it and closes it; anywhere else the smallest value is `null`.
+                piece = probe.first_container if (not probe.stack and probe.first_container) else "null"
+            elif st == self.KEY:
+                piece = '""'
+            elif st == self.KEY_OR_CLOSE:
+                piece = "}"
+            elif st == self.ARRAY_START:
+                piece = "]"
+            elif st == self.AFTER_VALUE:
+                piece = "}" if probe.stack and probe.stack[-1] == "{" else "]"
+            else:
+                return out
+            if not probe.feed_text(piece):
+                return out                                 # cannot help; the caller stops forcing
+            out.append(piece)
+        return out
+
     # -- helpers -----------------------------------------------------------------------------
     def _close_value(self) -> None:
         """A complete scalar or container just ended; decide what may follow."""
@@ -319,8 +365,18 @@ class JSONProcessor:
     logits-processor signature: (tokens_so_far, logits) -> logits.
     """
 
-    def __init__(self, tokenizer, schema: dict | None = None, top: int = TOP_CANDIDATES):
+    def __init__(self, tokenizer, schema: dict | None = None, top: int = TOP_CANDIDATES,
+                 max_tokens: int | None = None):
         self.tok = tokenizer
+        # THE REPLY MUST PARSE EVEN WHEN THE LIMIT ARRIVES FIRST. A constraint that keeps every
+        # token legal but lets the token limit cut the document in half returns something no
+        # client can read -- measured live: a rambling object at temperature 0.9 cut at 80 tokens.
+        # With the budget known, once the tokens left equal the steps needed to close the document
+        # (JSONPrefix.wrap_up), only the next closing step stays legal, and the document closes on
+        # the last token instead of being cut through.
+        self.max_tokens = int(max_tokens) if max_tokens else None
+        self.generated = 0
+        self.wrapping = False
         self.required = required_keys(schema)
         # Both json_object and json_schema mean "an object", as they do in OpenAI's API.
         self.auto = JSONPrefix(require_object=True)
@@ -359,6 +415,7 @@ class JSONProcessor:
         while self.seen < n:
             tid = int(tokens[self.seen])
             self.seen += 1
+            self.generated += 1
             if tid in self.eos:
                 continue
             s = self._decode(tid)
@@ -389,6 +446,14 @@ class JSONProcessor:
         probe = self.auto.copy()
         if not probe.feed_text(s):
             return False
+        # EVERY TOKEN MUST LEAVE ROOM TO CLOSE. With a budget, a token is legal only if the
+        # document it leads to can still be wrapped up (and EOS emitted) inside the tokens that
+        # remain after it. Measured without this: the model chose `,` with three tokens left,
+        # the wrap-up then needed five, and the reply ended `"cat","":null` -- unparseable.
+        if self.max_tokens and not self.wrapping and not probe.done:
+            left = self.max_tokens - self.generated - 1
+            if self._wrap_cost(probe) + 1 > left:
+                return False
         # THE CLOSING BRACE IS WHERE REQUIRED KEYS ARE ENFORCED, NOT EOS. Once the top-level
         # object has closed nothing can add a key to it, so a check at EOS time is a check made
         # after the only moment it could have mattered -- the model recited a schema, closed the
@@ -401,6 +466,66 @@ class JSONProcessor:
     def _required_satisfied(self) -> bool:
         return self.relaxed or all(k in self.auto.keys for k in self.required)
 
+    def _legal_candidates(self, row, vocab: int) -> list:
+        k = min(self.top, vocab)
+        cand = [int(i) for i in mx.argpartition(-row, k - 1)[:k].tolist()]
+        legal = [t for t in cand if self._legal(t)]
+        if not legal:
+            # Slow path: nothing in the top candidates continues the document. Check all.
+            legal = [t for t in range(vocab) if self._legal(t)]
+        if not legal:
+            self.forced_eos = True
+            legal = sorted(self.eos) if self.eos else []
+        return legal
+
+    def _wrap_cost(self, auto) -> int:
+        """Tokens the wrap-up from this state costs; the token count of each piece is cached."""
+        cache = self.__dict__.setdefault("_piece_cost", {})
+        total = 0
+        for pc in auto.wrap_up():
+            if pc not in cache:
+                cache[pc] = self._piece_tokens(pc)
+            total += cache[pc]
+        return total
+
+    def _piece_tokens(self, piece: str) -> int:
+        """How many tokens a wrap-up piece costs on this tokenizer. `""` is two on most; a
+        closer is one. Counted, not assumed -- assuming one per piece closed one token short."""
+        try:
+            return max(1, len(self.tok.encode(piece, add_special_tokens=False)))
+        except Exception:                          # noqa: BLE001
+            return max(1, len(piece))
+
+    def _wrap_now(self) -> bool:
+        """Time to close: the tokens left are no more than the wrap-up costs in TOKENS, plus the
+        EOS the model still has to emit. Once true it stays true -- a wrap-up never reopens."""
+        if self.wrapping:
+            return True
+        remaining = self.max_tokens - self.generated
+        steps = self.auto.wrap_up()
+        cost = self._wrap_cost(self.auto)
+        if steps and remaining <= cost + 1:
+            self.wrapping = True
+            self.relaxed = True                    # required keys cannot be had now; the object must close
+        return self.wrapping
+
+    def _wrap_tokens(self, vocab: int) -> list:
+        """Token ids whose text is exactly the next wrap-up piece (a closer, a colon, `null`)."""
+        steps = self.auto.wrap_up()
+        if not steps:
+            return sorted(self.eos) if self.eos else []
+        piece = steps[0]
+        try:
+            enc = [int(t) for t in self.tok.encode(piece, add_special_tokens=False)]
+        except Exception:                          # noqa: BLE001
+            enc = []
+        ids = [t for t in enc if self._decode(t) == piece]
+        if not ids and enc and piece.startswith(self._decode(enc[0])) and self._decode(enc[0]):
+            ids = [enc[0]]                         # a multi-token piece: force its first token; the
+        if not ids:                                # automaton advances and the next call continues
+            ids = [t for t in range(vocab) if self._decode(t) == piece]
+        return [t for t in ids if self._legal(t)]
+
     def __call__(self, tokens, logits):
         self._fold(tokens)
         row = logits[-1] if logits.ndim > 1 else logits
@@ -408,16 +533,12 @@ class JSONProcessor:
         if (self.auto.done and self._required_satisfied()) or self.forced_eos:
             # Complete: EOS is the only legal continuation.
             legal = sorted(self.eos) if self.eos else []
+        elif self.max_tokens and self._wrap_now():
+            legal = self._wrap_tokens(vocab)
+            if not legal:                          # no token spells the piece: fall through
+                legal = self._legal_candidates(row, vocab)
         else:
-            k = min(self.top, vocab)
-            cand = [int(i) for i in mx.argpartition(-row, k - 1)[:k].tolist()]
-            legal = [t for t in cand if self._legal(t)]
-            if not legal:
-                # Slow path: nothing in the top candidates continues the document. Check all.
-                legal = [t for t in range(vocab) if self._legal(t)]
-            if not legal:
-                self.forced_eos = True
-                legal = sorted(self.eos) if self.eos else []
+            legal = self._legal_candidates(row, vocab)
         if not legal:
             return logits                   # no EOS id at all: nothing sensible to force
         m = np.full(vocab, -np.inf, dtype=np.float32)

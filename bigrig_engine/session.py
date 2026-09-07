@@ -2105,7 +2105,7 @@ class Session:
             from . import grammar as _gr
             kind, schema = _gr.parse_response_format(response_format)
             if kind is not None:
-                json_proc = _gr.JSONProcessor(self.tokenizer, schema)
+                json_proc = _gr.JSONProcessor(self.tokenizer, schema, max_tokens=max_tokens)
                 think = False
                 note = _gr.schema_instruction(kind, schema)
                 # In front of the conversation as a system message, so it binds the whole reply

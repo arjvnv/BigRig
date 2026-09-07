@@ -215,6 +215,53 @@ else:
         closes = False
     check("...so the reply is a parseable object rather than an unclosed one", closes)
 
+print("\n" + "=" * 84); print("6. THE REPLY PARSES EVEN WHEN THE TOKEN LIMIT ARRIVES FIRST"); print("=" * 84)
+# The wrap-up: the shortest legal completion from any prefix, one piece per step.
+import json as _json                                                     # noqa: E402
+from bigrig_engine import grammar as G                                   # noqa: E402
+_cases = ['{"type": "person", "name": "Sam', '{"a": [1, 2, {"b": tr', '{"a": 1,', '{"a":', '{"k": -',
+          '{"k": 1.5e', '{"a": [', '{', '{"a": {"b": ["c"', '{"a": nul', '{"a": 1, "b"', '{"a": "x\\',
+          '{"s": "\\u00', '  \n ', '{"done": true}']
+_bad = []
+for _c in _cases:
+    _a = G.JSONPrefix(require_object=True)
+    assert _a.feed_text(_c), repr(_c)
+    _steps = _a.wrap_up()
+    _text = _c + "".join(_steps)
+    try:
+        if not isinstance(_json.loads(_text), dict):
+            _bad.append((_c, _text))
+    except ValueError:
+        _bad.append((_c, _text))
+check("from fifteen awkward prefixes -- half-written strings, escapes, \\u, dangling commas and colons, "
+      "open arrays, whitespace only -- the wrap-up yields a parseable object every time", not _bad, str(_bad[:2]))
+check("a complete document needs no wrap-up", G.JSONPrefix(require_object=True).feed_text('{"done": true}') and
+      (lambda a: (a.feed_text('{"done": true}'), a.wrap_up())[1])(G.JSONPrefix(require_object=True)) == [])
+check("whitespace at the top of a required object opens it, then closes it",
+      (lambda a: (a.feed_text("  \n"), a.wrap_up())[1])(G.JSONPrefix(require_object=True)) == ["{", "}"])
+# The live rule, on a real model: tiny limits at a hot temperature, every reply must parse. This
+# is the measurement that found both defects -- a piece costed at one token that was two, and a
+# comma allowed with no room to close after it.
+_olmoe = os.path.join(ROOT, "models", "OLMoE-1B-7B-0125-4bit")
+if os.path.isdir(_olmoe):
+    from bigrig_engine.session import Session as _Session
+    _s = _Session(_olmoe, persist=False)
+    _fails = []
+    for _limit in (4, 6, 8, 12, 24):
+        for _seed in range(6):
+            _out = "".join(c for c, _ in _s.stream_text([{"role": "user", "content": "Describe a cat as JSON with fields name and legs."}],
+                                                         max_tokens=_limit, temperature=0.9, seed=_seed,
+                                                         response_format={"type": "json_object"}))
+            try:
+                if not isinstance(_json.loads(_out), dict):
+                    _fails.append((_limit, _seed, _out[:60]))
+            except ValueError:
+                _fails.append((_limit, _seed, _out[:60]))
+    check("live, thirty replies at limits of 4 to 24 tokens and temperature 0.9: every one parses", not _fails, str(_fails[:3]))
+    _s.close()
+else:
+    print("  SKIPPED - live part needs OLMoE")
+
 print()
 print("=" * 84)
 print("ALL TESTS PASSED" if not FAIL else f"{len(FAIL)} FAILURES: " + ", ".join(FAIL))
