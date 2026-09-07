@@ -1320,6 +1320,14 @@ class StreamingSwitchGLU(nn.Module):
                 sl = self.ensure(spe[lo:hi], ranks=rank[lo:hi])
                 outs.append(self._forward_pairs(xf[mx.array(tok[lo:hi])],
                                                 mx.array(sl.reshape(-1))))
+                # BOUND THE LAZY GRAPH, OR A LONG PROMPT TAKES THE MAC DOWN. Left unevaluated, every
+                # chunk's gather intermediates stay live until the concatenate below -- measured on
+                # Nemotron, a 1,468-token prompt on the copy path climbed ~0.5 GB per 38-token chunk
+                # to 19.7 GB and Metal killed the process. Forcing the finished chunk materialises
+                # its output and frees the intermediates behind it; the tokens are identical, this
+                # only says WHEN the same work runs. See _forward_views for the path that avoids it.
+                if len(outs) % PREFILL_EVAL_EVERY == 0:
+                    mx.eval(outs[-1])
             if issued:
                 self._fetcher.drop(issued)
             y = mx.concatenate(outs, axis=0)
@@ -1335,6 +1343,8 @@ class StreamingSwitchGLU(nn.Module):
             # key is collected by fetch() rather than read twice, so the bytes and the slot
             # assignments are identical to the serial path -- which is what keeps this bit-exact.
             outs.append(self._forward(xf[lo:hi], mx.array(self.ensure(flat[lo:hi]))))
+            if len(outs) % PREFILL_EVAL_EVERY == 0:      # bound the lazy graph; see the note above
+                mx.eval(outs[-1])
         if issued:
             # Anything a later span turned out not to need is still holding its buffer.
             self._fetcher.drop(issued)
@@ -1404,6 +1414,10 @@ SORT_ROWS = 64
 # Group prefill work by expert rather than by token -- see _pair_chunks. Switchable so the two
 # paths can be measured against each other on the same process.
 EXPERT_SORTED_PREFILL = True
+# Force the accumulated prefill outputs this often (in chunks), so the lazy graph cannot
+# grow to the whole prompt's activations and crash Metal. Measured cause on Nemotron's copy
+# path; 8 keeps the peak flat while leaving the prefetch pipeline several chunks to overlap.
+PREFILL_EVAL_EVERY = 8
 # THE FILE AS THE POOL, FOR PREFILL: NO SLOT, NO COPY, THE GPU READS THE PAGE CACHE.
 #     A prefill chunk routes to nearly every expert of a layer, and the shipped path admits each
 #     one into a pool slot -- a GPU copy of 1.77 MB -- before the gather can run: about 18 GB of
