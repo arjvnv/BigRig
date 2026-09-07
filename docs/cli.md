@@ -384,8 +384,18 @@ says so on the footer.
 ## rig doctor
 
 ```bash
-rig doctor [--calibrate]
+rig doctor                         # this Mac, your prepared models, and what on the hub fits
+rig doctor --for coding            # the ranked list, kept to models suited to coding
+rig doctor <model-or-repo>         # the full account for one model
+rig doctor [--calibrate]           # re-measure RAM and disk bandwidth (~30s)
 ```
+
+With no model named, after the machine and the prepared models, doctor reads the shapes of a
+short curated list of Mixture-of-Experts checkpoints from the hub (metadata only; nothing is
+downloaded, about 25 seconds) and ranks them: whether each runs at your budget and at which speed
+tier, then by size. It is the same verdict `doctor <repo>` gives, side by side, with a plain note
+of what each model is for -- not a quality ranking, because this engine has not measured that.
+`--for chat|coding|reasoning|vision` filters; `--no-recommend` skips it.
 
 `--calibrate` re-measures RAM and disk bandwidth (~30s) instead of using the stored profile.
 

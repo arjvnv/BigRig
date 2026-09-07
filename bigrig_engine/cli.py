@@ -287,6 +287,20 @@ def cmd_doctor(a) -> int:
         if r["variants"]:
             print(f"    {'':<42} {'':>9}   already compressed: {', '.join(r['variants'])}")
     print()
+    # NO MODEL NAMED: THE QUESTION IS "WHAT SHOULD I DOWNLOAD", AND THE ENGINE CAN ANSWER IT.
+    #     The same verdict as `doctor <repo>`, over a short curated list, side by side (recommend.py).
+    #     Skipped when a model WAS named, and with --no-recommend, and when the hub is unreachable
+    #     it says so per row instead of failing the report.
+    if not want and not getattr(a, "no_recommend", False):
+        from . import recommend
+        for_ = getattr(a, "for_", None)
+        print(f"  reading {len([e for e in recommend.CURATED if not for_ or for_ in e[1]])} models' shapes from the hub "
+              f"(metadata only; nothing is downloaded) ...", flush=True)
+        rows = recommend.rank(budget, serving_reserve_gb(), want=for_, disk_gbs=measured_disk_gbs(),
+                              progress=lambda repo, i, n: print(f"    {i + 1:2d}/{n}  {repo.split('/')[1]}", flush=True))
+        print()
+        print(recommend.render(rows, budget, for_))
+        print()
     return 0
 
 
@@ -1217,6 +1231,10 @@ def build_parser():
     d.add_argument("--calibrate", action="store_true", help="measure bandwidths (takes ~30s)")
     d.add_argument("--memory", type=float, default=None,
                    help="plan against this many GB instead of what is free now")
+    d.add_argument("--for", dest="for_", choices=("chat", "coding", "reasoning", "vision"), default=None,
+                   help="with no model named: keep only models suited to this")
+    d.add_argument("--no-recommend", action="store_true",
+                   help="with no model named: skip the ranked list of what fits (it reads the hub)")
     d.set_defaults(fn=cmd_doctor)
 
     ss = sub.add_parser("sessions", help="conversations kept on disk so a restart resumes them")
