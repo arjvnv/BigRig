@@ -292,6 +292,11 @@ else:
             check("...and says it is a choice, not a wall", "choice, not a wall" in out4)
         else:
             print("  SKIP  this machine runs the model at 5.6 GB; the run refusal cannot be exercised here")
+        # prepare's closing verdict is the one serve will reach -- it used to plan against free
+        # memory and say "Streamed, GOOD" right before serve refused at the ceiling.
+        code7, out7 = cli("prepare", local, "--no-pack", timeout=120)
+        check(f"`rig prepare` closes with the same number as doctor and run ({need})",
+              f"BIGRIG_MAX_GB={need} bigrig run {local}" in out7 and "Streamed" not in out7, out7[-500:])
     code5, out5 = cli("doctor", "--memory", "8", local, "--no-recommend")
     check("doctor's MACHINE block says a clamped --memory request was clamped, and which knob raises it",
           "--memory asked for 8.0 GB" in out5 and "BIGRIG_MAX_GB=8 raises it" in out5, out5[:900])

@@ -535,16 +535,24 @@ def cmd_prepare(a) -> int:
                                                 os.path.basename(path) + ".experts"),
                              verbose=a.verbose)
         print(f"  packed in {time.perf_counter()-t0:.0f}s")
-    from .autoconfig import choose_strategy, describe_strategy
-    from .precision import non_expert_gb
+    # The closing line is the verdict `serve` will reach: the same ceiling, the same terms. It
+    # used to plan against whatever was free, so on a 16 GB Mac it said "Streamed, GOOD" and the
+    # very next command, serve at the 5.6 GB default ceiling, refused the same model.
+    from .autoconfig import CeilingRefusal, choose_strategy, describe_strategy
+    from .calibrate import available_gb
+    from .session import MAX_ALLOWED_GB, planning_terms, resolve_budget, serving_reserve_gb
+    budget = resolve_budget(None, quiet=True)
     try:
-        st = choose_strategy(man, top_k=stream.model_top_k(path, man),
-                             non_expert_gb=non_expert_gb(path, manifest=man))
-        print(f"  {describe_strategy(st)}")
+        tk = stream.model_top_k(path, man)
+        terms = planning_terms(os.path.basename(path), path, man, tk, budget)
+        st = choose_strategy(man, budget_gb=budget, top_k=tk, reserve_gb=terms["reserve_gb"],
+                             resident_reserve_gb=serving_reserve_gb(
+                                 prompt_cache_gb=terms["prompt_cache_gb"], streamed=False),
+                             non_expert_gb=terms["non_expert_gb"],
+                             stream_non_expert_gb=terms["streamed_non_expert_gb"],
+                             headroom_gb=terms["headroom_gb"], reserve_fn=terms["reserve_fn"])
+        print(f"  {describe_strategy(st, measured_disk_gbs())}")
     except MemoryError as e:
-        from .autoconfig import CeilingRefusal
-        from .calibrate import available_gb
-        from .session import MAX_ALLOWED_GB
         if isinstance(e, CeilingRefusal):
             e.context(model=os.path.basename(path), ceiling_gb=MAX_ALLOWED_GB, free_gb=available_gb())
         print(f"  WARNING: {e}")
