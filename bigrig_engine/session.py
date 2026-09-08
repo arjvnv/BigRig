@@ -694,6 +694,67 @@ _LAST_CLOSE = [float("-inf")]
 SETTLE_AFTER_CLOSE_S = 0.6
 
 
+def planning_terms(name: str, config_dir: str, manifest: dict, top_k: int, budget_gb: float,
+                   stream_embedding: bool = True, prompt_cache_gb: float | None = None) -> dict:
+    """Every number the pool planner is handed for THIS model at THIS budget, computed once.
+
+    ONE FUNCTION, FOR THE SAME REASON AS serving_reserve_gb. `doctor` and `serve` each assembled
+    these terms on their own and drifted twice: doctor charged the full prompt cache where serve
+    scales it to the budget, and the full embedding where serve streams it from the page cache.
+    So doctor said "needs 6.6 GB" and serve said "needs 6.1" for the same model on the same
+    machine, and a flag printed by one could be refused by the other. Both call this now.
+
+    `reserve_fn` is the reserve AS A FUNCTION OF THE BUDGET, because two of its terms move with
+    it: the prompt cache is 6% of the budget (capped), and the scratch reserve is whatever was
+    measured at that exact budget. The refusal's search for the smallest workable budget has to
+    re-evaluate them at each candidate, or the number it prints can be one serve then refuses.
+    """
+    non_expert = precision.non_expert_gb(config_dir, manifest=manifest)
+    embed = 0.0
+    if stream_embedding:
+        try:
+            from . import embed_stream as _es
+            embed = _es.streamable_gb(config_dir)
+        except Exception:                       # noqa: BLE001 -- never worth a failed load
+            embed = 0.0
+
+    def working_memory(gb: float) -> float:
+        rec = _workmem.load(name, gb)
+        if rec:
+            return _workmem.reserve_from(float(rec["peak_gb"]), WORKING_MEMORY_GB)
+        return WORKING_MEMORY_GB
+
+    def prompt_cache(gb: float) -> float:
+        if prompt_cache_gb is not None:
+            return max(0.0, float(prompt_cache_gb))
+        return round(min(PROMPT_CACHE_GB, max(0.0, float(gb) * 0.06)), 2)
+
+    def reserve_fn(gb: float) -> float:
+        return serving_reserve_gb(working_memory(gb), prompt_cache(gb))
+
+    b = float(budget_gb)
+    return {"top_k": int(top_k), "non_expert_gb": non_expert, "embed_stream_gb": embed,
+            "streamed_non_expert_gb": max(0.0, non_expert - embed),
+            "working_memory_gb": working_memory(b), "prompt_cache_gb": prompt_cache(b),
+            "reserve_gb": reserve_fn(b), "reserve_fn": reserve_fn,
+            "headroom_gb": autoconfig.scaled_headroom(b)}
+
+
+def requested_budget_gb(budget_gb: float | None = None) -> float | None:
+    """The budget somebody ASKED for -- the --memory flag, else BIGRIG_MEM_GB -- or None when the
+    run is planned against what is free. One reader for both, so the clamp message and doctor's
+    MACHINE block cannot disagree about whether a number was requested."""
+    if budget_gb is not None:
+        return float(budget_gb)
+    env = os.environ.get("BIGRIG_MEM_GB")
+    if env:
+        try:
+            return float(env)
+        except ValueError:
+            return None
+    return None
+
+
 def resolve_budget(budget_gb: float | None = None, quiet: bool = False) -> float:
     """How much memory this run may use: the flag, then the environment, then what is free.
 
@@ -702,16 +763,8 @@ def resolve_budget(budget_gb: float | None = None, quiet: bool = False) -> float
     planned against BIGRIG_MEM_GB and ran 4 of 128. Both were internally consistent and one of
     them was a lie to whoever read it first.
     """
-    want = None
-    if budget_gb is not None:
-        want = float(budget_gb)
-    else:
-        env = os.environ.get("BIGRIG_MEM_GB")
-        if env:
-            try:
-                want = float(env)
-            except ValueError:
-                want = None
+    want = requested_budget_gb(budget_gb)
+    requested = want is not None
     if want is None:
         # A session closed in this process moments ago is still being given back by macOS: the
         # available figure lags the release by about half a second (measured: 7.5 GB read right
@@ -723,9 +776,19 @@ def resolve_budget(budget_gb: float | None = None, quiet: bool = False) -> float
         want = calibrate.available_gb()
     if want > MAX_ALLOWED_GB:
         if not quiet:                     # doctor explains the cap itself, in its MACHINE block
-            # Said from the user's side: nobody "asked for" 12.8 GB, that is what was free.
-            print(f"  memory: {want:.1f} GB is free; using the {MAX_ALLOWED_GB:.1f} GB ceiling "
-                  f"so the rest of the Mac keeps working (BIGRIG_MAX_GB raises it)", flush=True)
+            if requested:
+                # --memory and BIGRIG_MEM_GB ask; only BIGRIG_MAX_GB raises the ceiling. Clamping
+                # an explicit request silently left people with a smaller pool than they set and
+                # no idea why -- say which knob they turned and which one they needed.
+                src = "--memory" if budget_gb is not None else "BIGRIG_MEM_GB"
+                print(f"  memory: {src} asked for {want:.1f} GB, but the ceiling is "
+                      f"{MAX_ALLOWED_GB:.1f} GB ({SAFE_SHARE_OF_RAM:.0%} of this Mac's "
+                      f"{calibrate.total_gb():.1f} GB); using {MAX_ALLOWED_GB:.1f}. "
+                      f"BIGRIG_MAX_GB={want:g} raises the ceiling itself.", flush=True)
+            else:
+                # Said from the user's side: nobody "asked for" 12.8 GB, that is what was free.
+                print(f"  memory: {want:.1f} GB is free; using the {MAX_ALLOWED_GB:.1f} GB ceiling "
+                      f"so the rest of the Mac keeps working (BIGRIG_MAX_GB raises it)", flush=True)
         want = MAX_ALLOWED_GB
     return want
 
@@ -897,6 +960,7 @@ class Session:
         #     the machine happened to have free -- 13.6 GB on a 24 GB Mac -- and the ceiling was
         #     honoured only by the accident of --residency landing under it. It is a real ceiling
         #     now, and everything downstream is planned against it.
+        self._budget_requested = requested_budget_gb(budget_gb) is not None
         self.budget_gb = resolve_budget(budget_gb)
         budget_gb = self.budget_gb
         # Set before anything can fail, so a model that never streams still reports it honestly.
@@ -988,63 +1052,62 @@ class Session:
         man, blob = stream.expert_source(self.model_dir)
         self.packed = bool(blob)
         top_k = stream.model_top_k(self.model_dir, man)
-        # config_dir, not model_dir. A session started on a hub repo id has no directory at
-        # model_dir -- the experts come from a blob keyed on the basename and mlx_lm resolves the
-        # id against the cache -- so this read failed and returned 0.0, silently telling the
-        # planner that a model's attention weights, embeddings and norms were free. On this model
-        # that is 0.67 GB unreserved against a 9 GB ceiling. The CLI happened to be safe because
-        # it downloads to a real directory first; anything using the Python API was not.
-        self.non_expert_gb = precision.non_expert_gb(self.config_dir, manifest=man)
         # THE INPUT EMBEDDING NEED NOT BE RESIDENT. It is looked up one row at a time and can be
         # gathered from the page cache instead of held in wired memory (embed_stream.py) -- but
         # only when it is untied from the output head and quantised in a shape the gather handles.
         # `streamable_gb` returns >0 only when attach is then certain to succeed, so the pool is
         # never sized for a saving that fails to arrive. Streamed models only: a resident model
         # has the room and gains nothing from the extra host gather on every token.
-        self.embed_stream_gb = 0.0
         self._stream_embedding = bool(stream_embedding)
-        if self._stream_embedding:
-            try:
-                from . import embed_stream as _es
-                self.embed_stream_gb = _es.streamable_gb(self.config_dir)
-            except Exception:                       # noqa: BLE001 -- never worth a failed load
-                self.embed_stream_gb = 0.0
         # Applied ONLY to the streamed pool sizing below, never to the native/compress
         # decision: if a model runs resident the embedding is resident too, and
         # judging "does it fit whole" against a saving that only exists when streaming would be
         # the one way this over-commits. self.non_expert_gb stays the full resident figure.
-        self.streamed_non_expert_gb = max(0.0, self.non_expert_gb - self.embed_stream_gb)
-        self.working_memory_gb = self._working_memory(man, top_k, budget_gb)
         # Charged to the reserve BEFORE the pool is planned, so the pool is one that leaves room
         # for it. Adding it afterwards would mean the ceiling the user set is not the ceiling.
-        # SCALED TO THE BUDGET when the caller did not set one. 0.5 GB of remembered prompt is a
-        # good trade at 9 GB and a luxury at 3.5, where it is a seventh of everything free -- and
-        # on a machine that tight, running at all beats remembering the last turn. Caps at the
-        # 0.5 it replaces (unchanged at 8.3 GB and up), floors at 0.0 (below which it is off).
-        if prompt_cache_gb is None:
-            self.prompt_cache_gb = round(min(PROMPT_CACHE_GB,
-                                             max(0.0, float(budget_gb) * 0.06)), 2)
-        else:
-            self.prompt_cache_gb = max(0.0, float(prompt_cache_gb))
+        # The prompt cache is SCALED TO THE BUDGET when the caller did not set one: 0.5 GB of
+        # remembered prompt is a good trade at 9 GB and a luxury at 3.5, where it is a seventh of
+        # everything free. Every term here comes from planning_terms, which doctor also calls.
+        # config_dir, not model_dir: a session started on a hub repo id has no directory at
+        # model_dir -- the experts come from a blob keyed on the basename and mlx_lm resolves the
+        # id against the cache -- so the non-expert read failed there and returned 0.0, silently
+        # telling the planner that a model's attention weights, embeddings and norms were free.
+        # On one model that was 0.67 GB unreserved against a 9 GB ceiling.
+        terms = planning_terms(self.name, self.config_dir, man, top_k, budget_gb,
+                               stream_embedding=self._stream_embedding,
+                               prompt_cache_gb=prompt_cache_gb)
+        self.non_expert_gb = terms["non_expert_gb"]
+        self.embed_stream_gb = terms["embed_stream_gb"]
+        self.streamed_non_expert_gb = terms["streamed_non_expert_gb"]
+        self.working_memory_gb = terms["working_memory_gb"]
+        self.prompt_cache_gb = terms["prompt_cache_gb"]
         self.kv_bits = resolve_kv_bits(kv_bits)
         self.kv_quant_start = int(KV_QUANT_START if kv_quant_start is None else kv_quant_start)
-        self.serving_reserve_gb = serving_reserve_gb(self.working_memory_gb,
-                                                     self.prompt_cache_gb)
+        self.serving_reserve_gb = terms["reserve_gb"]
+        reserve_fn = terms["reserve_fn"]
         if not self.kv_bytes_per_token:      # nothing to derive from; keep the tuned constant
             self.serving_reserve_gb = autoconfig.RESERVE_GB
-        self.headroom_gb = autoconfig.scaled_headroom(budget_gb)
+            reserve_fn = None
+        self.headroom_gb = terms["headroom_gb"]
         try:
             self.plan = autoconfig.choose_capacity(man, budget_gb=budget_gb, top_k=top_k,
                                                    reserve_gb=self.serving_reserve_gb,
                                                    non_expert_gb=self.streamed_non_expert_gb,
-                                                   headroom_gb=self.headroom_gb)
-        except MemoryError:
+                                                   headroom_gb=self.headroom_gb,
+                                                   reserve_fn=reserve_fn)
+        except MemoryError as e:
             # The planner refuses a model it cannot fit, which is right when it is the one
             # choosing. It is not right when the caller has already chosen: everywhere else in
             # this engine an explicit request wins, and refusing one here would mean a user who
             # knows their machine better than the estimate cannot say so. Honour it, and say
             # plainly what the estimate thought.
             if capacity is None:
+                # The refusal leaves here knowing where the budget came from, so what `main`
+                # prints is the right advice: raise the ceiling, free memory, or a bigger Mac.
+                if isinstance(e, autoconfig.CeilingRefusal):
+                    e.context(model=os.path.basename(os.path.normpath(model_dir)),
+                              ceiling_gb=MAX_ALLOWED_GB, free_gb=calibrate.available_gb(),
+                              requested=self._budget_requested)
                 raise
             n_exp = max(int(l["n_experts"]) for l in man["layers"].values())
             per = max(int(l["bytes_per_expert"]) for l in man["layers"].values())
@@ -1070,12 +1133,17 @@ class Session:
         # Skipped entirely when the caller named a capacity: the answer is discarded two lines
         # below, and asking a planner that may refuse for an answer nobody uses turns an explicit
         # request into a crash.
-        self.strategy = None if capacity is not None else autoconfig.choose_strategy(
-            man, budget_gb=budget_gb, top_k=top_k, reserve_gb=self.serving_reserve_gb,
-            resident_reserve_gb=serving_reserve_gb(prompt_cache_gb=self.prompt_cache_gb,
-                                                   streamed=False),
-            non_expert_gb=self.non_expert_gb, headroom_gb=self.headroom_gb,
-            min_bits=autoconfig.DEFAULT_MIN_BITS if min_bits is None else min_bits)
+        try:
+            self.strategy = None if capacity is not None else autoconfig.choose_strategy(
+                man, budget_gb=budget_gb, top_k=top_k, reserve_gb=self.serving_reserve_gb,
+                resident_reserve_gb=serving_reserve_gb(prompt_cache_gb=self.prompt_cache_gb,
+                                                       streamed=False),
+                non_expert_gb=self.non_expert_gb, headroom_gb=self.headroom_gb,
+                stream_non_expert_gb=self.streamed_non_expert_gb, reserve_fn=reserve_fn,
+                min_bits=autoconfig.DEFAULT_MIN_BITS if min_bits is None else min_bits)
+        except autoconfig.CeilingRefusal as e:
+            raise e.context(model=self.name, ceiling_gb=MAX_ALLOWED_GB,
+                            free_gb=calibrate.available_gb(), requested=self._budget_requested)
         if capacity is not None:                       # an explicit request always wins
             self.strategy = {"mode": "stream",
                              "capacity": (int(round(capacity * self.plan["n_experts"]))
@@ -1502,22 +1570,6 @@ class Session:
         # touched and the counters showing a token nobody asked for. Both are reset.
         if self.handle:
             self.handle.reset_stats()
-
-    def _working_memory(self, manifest, top_k: int, budget_gb: float) -> float:
-        """What a step costs beyond the resident weights and the KV cache.
-
-        The flat WORKING_MEMORY_GB was measured on two models and applied to all; it is the
-        largest single item a small machine reserves and most models need far less. If this
-        model has been measured on this machine at this budget (by the tune, or by a previous
-        served run -- see workmem.py) the reserve is sized from that peak instead, with a margin
-        and a floor, and CLAMPED to the flat default as a ceiling so it can only ever free
-        memory, never take more than the shipped constant. No measurement -> the flat default,
-        unchanged.
-        """
-        rec = _workmem.load(self.name, budget_gb)
-        if rec:
-            return _workmem.reserve_from(float(rec["peak_gb"]), WORKING_MEMORY_GB)
-        return WORKING_MEMORY_GB
 
     def _load_mtp(self, verbose: bool = True) -> None:
         """Load the model's own multi-token-prediction head, refusing a model it cannot drive.

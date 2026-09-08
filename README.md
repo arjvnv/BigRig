@@ -164,8 +164,9 @@ Full list, and how the speed prediction works: **[docs/models.md](docs/models.md
 - **Python 3.10+.**
 - **Memory.** By default BigRig plans to use 35% of installed RAM so the rest of your Mac keeps
   working, and it never exceeds that. Most 17–20 GB models need a six to seven gigabyte ceiling,
-  which that default clears on a 24 GB Mac. On a 16 GB Mac it does not, so raise it — `doctor`
-  prints the exact figure and the command (`BIGRIG_MAX_GB=7 bigrig run <model>`).
+  which that default clears on a 24 GB Mac. On a 16 GB Mac it does not, so raise it — `doctor`,
+  `serve` and `run` all print the exact figure and the command (`BIGRIG_MAX_GB=6.1 bigrig run
+  <model>`), and say plainly that it is a choice, not a wall.
 - **Disk.** The model, plus one more copy of its experts for a streamed model's fast path. That
   copy doubles the model's footprint; the size is printed before it is made, it is skipped when
   the disk is tight, and `--no-pack` declines it. A model that fits in RAM writes nothing extra.

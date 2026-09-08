@@ -403,6 +403,27 @@ of what each model is for -- not a quality ranking, because this engine has not 
 
 `--calibrate` re-measures RAM and disk bandwidth (~30s) instead of using the stored profile.
 
+A "no" always says which of three things it is, and the same words come out of `serve` and `run`
+for the same model on the same machine, because all three read one refusal:
+
+- `NOT AT THIS CEILING` -- the model needs more than the ceiling this run was given (by default
+  35% of installed memory; 5.6 GB on a 16 GB Mac, where most 17-20 GB models need six to seven).
+  Doctor prints the smallest budget that works, what that budget buys (`at 6.1 GB it would hold 8
+  of 256 experts and be GOOD`), the first half-gigabyte step up that reaches GOOD if the smallest
+  is slower than that, and the exact command: `BIGRIG_MAX_GB=6.1 bigrig run <model>`. The number
+  is the planner's own -- the same inequality it refused with, solved for the budget -- so `serve`
+  at that ceiling runs. That is a choice, not a wall, and the message says so.
+- `NOT AT THIS BUDGET` -- the ceiling would allow it, but this run's budget was smaller: a
+  `--memory` request under what the model needs (`ask for at least 6.1 GB: --memory 6.1`), or
+  less memory free right now than the ceiling (`close something and try again`).
+- `IMPOSSIBLE ON THIS MAC` / `cannot run on this Mac` -- even the smallest workable budget is more
+  than Metal will let a process use here (about three quarters of installed memory: 10.9 GB on a
+  16 GB Mac). No flag changes that, and none is offered.
+
+`--memory N` and `BIGRIG_MEM_GB` ask for a budget; only `BIGRIG_MAX_GB` raises the ceiling. A
+request above the ceiling is clamped to it, and both `doctor` and `serve` say so and name the
+knob that would have worked, instead of quietly running a smaller pool than you set.
+
 The speed word in the verdict (FAST / GOOD / USABLE / SLOW) is a prediction, and says so. It is
 the expert bytes one token moves -- an assumed 0.6 miss rate (measured 0.53-0.61 across 7-30%
 residency) times top_k, streamed layers and bytes per expert -- divided by the rate this Mac

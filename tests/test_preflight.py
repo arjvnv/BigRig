@@ -309,8 +309,8 @@ check("the layer index is read from `.layers.N.` wherever it sits, not only `mod
 _cli = open(os.path.join(ROOT, "bigrig_engine", "cli.py"), encoding="utf-8").read()
 check("a model that needs more memory than the Mac HAS is called impossible",
       "IMPOSSIBLE ON THIS MAC" in _cli)
-check("...and 'a choice, not a wall' is only said when it does fit the machine",
-      _cli.index("need <= total") < _cli.index("a choice, not a wall"))
+check("...and 'a choice, not a wall' is only said when it does fit what Metal will wire",
+      _cli.index("need <= wall + 1e-9") < _cli.index("a choice, not a wall"))
 check("a RUNS verdict always carries its speed word",
       "RUNS, {tier}" in _cli)
 check("a SLOW verdict points at the 4-bit build before the download",

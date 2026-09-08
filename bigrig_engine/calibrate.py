@@ -53,6 +53,22 @@ def total_gb() -> float:
         return 0.0
 
 
+def gpu_working_set_gb() -> float:
+    """The most memory Metal will let a process wire on this Mac, in GB; 0.0 where unknown.
+
+    This is the number every local runtime treats as the wall -- MLX, llama.cpp, Ollama all read
+    it -- and it is about three quarters of installed memory, not all of it: 10.9 GB on a 16 GB
+    Mac, 19.1 GB on this 24 GB one. A model whose smallest workable budget is above it cannot run
+    here whatever flag is set, and saying "raise the ceiling" for such a model sends someone to a
+    Metal out-of-memory crash. Installed memory is the fallback when Metal cannot be asked.
+    """
+    try:
+        import mlx.core as mx
+        return int(mx.device_info()["max_recommended_working_set_size"]) / 1e9
+    except Exception:                          # no Metal, or an MLX without the field
+        return 0.0
+
+
 def available_gb() -> float:
     """Memory an engine may actually plan to use.
 

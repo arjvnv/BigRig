@@ -177,7 +177,13 @@ def _doctor_remote(repo_id: str, budget_gb: float) -> int:
         print(f"\n    to run it:  bigrig run {repo_id}")
     else:
         need = v["needs_gb"]
-        if need and need <= total:
+        # The wall is what Metal will let a process wire, not installed memory -- the same rule
+        # the downloaded-model path judges by (CeilingRefusal.machine_can), so the two verdicts
+        # cannot disagree about whether a flag helps.
+        from .autoconfig import machine_gb
+        _total, wall = machine_gb()
+        wall = wall or total
+        if need and need <= wall + 1e-9:
             # IT FITS THE MACHINE, JUST NOT THE SAFE DEFAULT. A decision, and said so.
             pn = v["plan_at_needs"]
             tier, why = speed_tier(sh, pn, disk_gbs)
@@ -185,15 +191,19 @@ def _doctor_remote(repo_id: str, budget_gb: float) -> int:
                   f"it needs {_human(need)}")
             print(f"                     at {_human(need)} it would hold {pn['capacity']} of "
                   f"{sh['n_experts']} experts ({pn['residency']:.0%}) and be {tier}: {why}")
+            print(f"                     (an estimate from the hub's metadata; doctor on the "
+                  f"downloaded model gives the exact figure)")
             print(f"\n    this Mac has {total:.1f} GB, so that is a choice, not a wall. To make it:")
             print(f"      BIGRIG_MAX_GB={need} bigrig run {repo_id}")
             print(f"    Leave less for everything else while it runs.")
         elif need:
             # IT DOES NOT FIT THE MACHINE. This used to print "a decision rather than an
             # impossibility" for a 657 GB model needing 41 GB on a 25.8 GB Mac. It is not.
+            limit = (f"this Mac's GPU can use at most {wall:.1f} GB of its {total:.1f} GB"
+                     if wall < total - 0.05 else f"this Mac has {total:.1f} GB in total")
             print(f"    VERDICT          IMPOSSIBLE ON THIS MAC")
             print(f"                     even at its lowest workable setting it needs "
-                  f"{_human(need)} of memory, and this Mac has {total:.1f} GB in total.")
+                  f"{_human(need)} of memory, and {limit}.")
             print(f"                     No flag changes that. It needs a machine with more memory.")
         else:
             print(f"    VERDICT          IMPOSSIBLE ON THIS MAC")
@@ -205,20 +215,95 @@ def _doctor_remote(repo_id: str, budget_gb: float) -> int:
     return 0 if v["fits_now"] else 2
 
 
+def _refusal_verdict(e: Exception, name: str, budget: float, avail: float,
+                     requested: bool) -> str:
+    """What doctor prints for a downloaded model the planner refused. Multi-line.
+
+    THE HUB PATH ALREADY TOLD THE TRUTH; THIS PATH SAID "YOUR MAC CAN'T". For a model not yet
+    downloaded, doctor searched for the smallest workable ceiling and printed "NOT AT THIS
+    CEILING" with the flag. For a model already on disk -- the moment everyone actually reaches,
+    right after `prepare` -- it printed the planner's refusal verbatim, which ended "cannot run on
+    this machine". Same machine, same model, two verdicts, one of them false. Both paths now speak
+    from the same refusal object.
+    """
+    from .autoconfig import CeilingRefusal, choose_capacity
+    from .session import MAX_ALLOWED_GB
+    if not isinstance(e, CeilingRefusal):
+        return f"WILL NOT RUN: {e}"
+    e.context(model=name, ceiling_gb=MAX_ALLOWED_GB, free_gb=avail, requested=requested)
+    if not e.machine_can:
+        return f"WILL NOT RUN: {e}"
+    # "CEILING" only when the ceiling is what stands in the way; a --memory request under a
+    # ceiling that would allow the model is a budget problem, and the advice below says so.
+    what = "CEILING" if e.needs_gb > (e.ceiling_gb or 0.0) + 0.05 else "BUDGET"
+    lines = [f"NOT AT THIS {what}: your budget is {_human(budget)}, it needs {_human(e.needs_gb)}"]
+    # What the flag buys, computed for THIS model at the budget the flag names -- and, when the
+    # smallest workable budget is a slow one, the first half-gigabyte step that makes it GOOD.
+    try:
+        from .preflight import speed_tier
+        from .session import planning_terms
+        man = _prepared_manifest(name)
+        sh = _shape_for_speed(man, e.top_k)
+        probes = [e.needs_gb] + [round(e.needs_gb + 0.5 * i, 1) for i in range(1, 5)]
+        limit = e.wall_gb or e.total_gb
+        for i, gb in enumerate(probes):
+            if gb > limit + 1e-9:
+                break
+            t = planning_terms(name, os.path.join(MODELS_DIR, name), man, e.top_k, gb)
+            plan = choose_capacity(man, budget_gb=gb, top_k=e.top_k, reserve_gb=t["reserve_gb"],
+                                   non_expert_gb=t["streamed_non_expert_gb"],
+                                   headroom_gb=t["headroom_gb"])
+            tier, why = speed_tier(sh, plan, measured_disk_gbs(), bool(plan.get("fits_entirely")))
+            if i == 0:
+                lines.append(f"at {_human(gb)} it would hold {plan['capacity']} of {sh['n_experts']} "
+                             f"experts ({plan['residency']:.0%}) and be {tier}: {why}")
+                if tier in ("GOOD", "FAST"):
+                    break
+            elif tier in ("GOOD", "FAST"):
+                lines.append(f"at {_human(gb)} it would be {tier} ({plan['capacity']} of "
+                             f"{sh['n_experts']} experts): BIGRIG_MAX_GB={gb:g}")
+                break
+    except (MemoryError, OSError, ValueError, KeyError):
+        pass                                   # the advice below stands on its own
+    lines.extend(e.advice().splitlines())
+    return "\n".join(lines)
+
+
+def _prepared_manifest(name: str) -> dict:
+    for r in _prepared():
+        if r["name"] == name:
+            return r["manifest"]
+    raise KeyError(name)
+
+
+def _shape_for_speed(manifest: dict, top_k: int) -> dict:
+    """The four numbers the speed prediction reads, from a downloaded model's manifest."""
+    from .autoconfig import model_shape
+    sh = model_shape(manifest)
+    return {"n_layers": sh["n_layers"], "n_experts": sh["n_experts"],
+            "bytes_per_expert": sh["bytes_per_expert"], "top_k": int(top_k)}
+
+
 def cmd_doctor(a) -> int:
     from .calibrate import available_gb, under_pressure
-    from .session import resolve_budget, serving_reserve_gb
+    from .session import planning_terms, resolve_budget, serving_reserve_gb
     print("\n  MACHINE")
+    from .session import MAX_ALLOWED_GB, SAFE_SHARE_OF_RAM, requested_budget_gb
     avail = available_gb()
+    requested = requested_budget_gb(getattr(a, "memory", None))
     budget = resolve_budget(getattr(a, "memory", None), quiet=True)
     print(f"    memory available now      {_human(avail)}")
-    if abs(budget - avail) > 0.05:
-        if getattr(a, "memory", None):
-            src = "--memory"
-        elif os.environ.get("BIGRIG_MEM_GB"):
-            src = "BIGRIG_MEM_GB"
+    if abs(budget - avail) > 0.05 or requested is not None:
+        knob = "--memory" if getattr(a, "memory", None) else "BIGRIG_MEM_GB"
+        if requested is not None and requested > budget + 0.05:
+            # The request was clamped. Naming the knob that was turned without the one that was
+            # needed is how a person ends up with a 5.6 GB pool after typing 8.
+            src = (f"{knob} asked for {_human(requested)}; the ceiling is {_human(MAX_ALLOWED_GB)}, "
+                   f"{SAFE_SHARE_OF_RAM:.0%} of installed memory. BIGRIG_MAX_GB={requested:g} "
+                   f"raises it")
+        elif requested is not None:
+            src = knob
         else:
-            from .session import SAFE_SHARE_OF_RAM
             src = (f"the safe default: {SAFE_SHARE_OF_RAM:.0%} of installed memory, so the rest "
                    f"of your Mac keeps working. Raise it with BIGRIG_MAX_GB")
         print(f"    budget for this run       {_human(budget)}  ({src})")
@@ -263,7 +348,6 @@ def cmd_doctor(a) -> int:
         try:
             from .autoconfig import choose_strategy, describe_strategy
             from .stream import model_top_k
-            from .precision import non_expert_gb
             md = os.path.join(MODELS_DIR, r["name"])
             # The manifest is passed explicitly. Without it non_expert_gb falls back to reading
             # one from the blob path, which is "" for a model that was never packed -- and the
@@ -272,18 +356,28 @@ def cmd_doctor(a) -> int:
             # The same budget and the same reserve `serve` will use, so the two cannot report
             # different plans for the same machine -- which was NOT true until both sides were
             # made to call `serving_reserve_gb`; this path was short by the prompt cache.
-            ne = non_expert_gb(md, manifest=r["manifest"]) if os.path.isdir(md) else 0.0
-            st = choose_strategy(r["manifest"], budget_gb=budget,
-                                 top_k=model_top_k(md, r["manifest"]),
-                                 reserve_gb=serving_reserve_gb(),
-                                 resident_reserve_gb=serving_reserve_gb(streamed=False),
-                                 non_expert_gb=ne)
+            # ...and EVERY other term serve will use -- its headroom, its prompt cache scaled
+            # to the budget, its measured scratch, its streamed embedding -- from the one function
+            # serve takes them from (planning_terms). Assembling them here by hand is how this path
+            # came to say "needs 6.6 GB" while serve said 6.1, on the same model and machine.
+            tk = model_top_k(md, r["manifest"])
+            terms = planning_terms(r["name"], md, r["manifest"], tk, budget)
+            st = choose_strategy(r["manifest"], budget_gb=budget, top_k=tk,
+                                 reserve_gb=terms["reserve_gb"],
+                                 resident_reserve_gb=serving_reserve_gb(
+                                     prompt_cache_gb=terms["prompt_cache_gb"], streamed=False),
+                                 non_expert_gb=terms["non_expert_gb"],
+                                 stream_non_expert_gb=terms["streamed_non_expert_gb"],
+                                 headroom_gb=terms["headroom_gb"], reserve_fn=terms["reserve_fn"])
             verdict = describe_strategy(st, measured_disk_gbs())
         except MemoryError as e:
-            verdict = f"WILL NOT RUN: {e}"
+            verdict = _refusal_verdict(e, r["name"], budget, avail, requested is not None)
         except (OSError, ValueError, KeyError) as e:
             verdict = f"could not be read: {e}"
-        print(f"    {r['name'][:40]:<42} {_human(r['gb']):>9}   {verdict}")
+        lines = verdict.splitlines() or [verdict]
+        print(f"    {r['name'][:40]:<42} {_human(r['gb']):>9}   {lines[0]}")
+        for extra in lines[1:]:
+            print(f"    {'':<42} {'':>9}   {extra}")
         if r["variants"]:
             print(f"    {'':<42} {'':>9}   already compressed: {', '.join(r['variants'])}")
     print()
@@ -448,6 +542,11 @@ def cmd_prepare(a) -> int:
                              non_expert_gb=non_expert_gb(path, manifest=man))
         print(f"  {describe_strategy(st)}")
     except MemoryError as e:
+        from .autoconfig import CeilingRefusal
+        from .calibrate import available_gb
+        from .session import MAX_ALLOWED_GB
+        if isinstance(e, CeilingRefusal):
+            e.context(model=os.path.basename(path), ceiling_gb=MAX_ALLOWED_GB, free_gb=available_gb())
         print(f"  WARNING: {e}")
     return 0
 
@@ -464,7 +563,16 @@ def cmd_compress(a) -> int:
     if a.bits:
         bits, group = a.bits, a.group
     else:
-        st = choose_strategy(man, budget_gb=a.memory, top_k=tk, non_expert_gb=ne)
+        try:
+            st = choose_strategy(man, budget_gb=a.memory, top_k=tk, non_expert_gb=ne)
+        except MemoryError as e:
+            from .autoconfig import CeilingRefusal
+            from .calibrate import available_gb
+            from .session import MAX_ALLOWED_GB
+            if isinstance(e, CeilingRefusal):
+                e.context(model=os.path.basename(path), ceiling_gb=MAX_ALLOWED_GB,
+                          free_gb=available_gb(), requested=a.memory is not None)
+            raise
         if st["mode"] != "compress":
             print(f"  {describe_strategy(st)}")
             if st["mode"] == "native":

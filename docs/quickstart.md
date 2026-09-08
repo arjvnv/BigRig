@@ -103,6 +103,23 @@ BigRig stops and asks, because the two ways forward cost different things:
 Your answer is remembered, and every run still prints which one it is serving. In a script with
 neither `--compress` nor `--exact`, it refuses rather than guessing.
 
+## If it says NOT AT THIS CEILING
+
+BigRig gives itself a memory ceiling -- 35% of installed memory by default, so the rest of the
+Mac keeps working. On a 16 GB Mac that is 5.6 GB, and most 17-20 GB models need six to seven.
+When that is the only thing in the way, doctor, `serve` and `run` all say so and print the exact
+command, with a number that is the planner's own:
+
+```
+NOT AT THIS CEILING: your budget is 5.6 GB, it needs 6.1 GB
+at 6.1 GB it would hold 8 of 256 experts (3%) and be GOOD: ...
+the ceiling is 5.6 GB and this Mac has 17.2 GB, so that is a choice, not a wall:
+    BIGRIG_MAX_GB=6.1 bigrig run Qwen3.6-35B-A3B-4bit
+```
+
+`BIGRIG_MAX_GB=6.1 rig serve ...` sets it for one command. `echo 'export BIGRIG_MAX_GB=6.1' >>
+~/.zshrc` sets it for every terminal from then on.
+
 ## If the model cannot fit at all
 
 Some models need more memory than your Mac has, at any setting. `bigrig doctor` says so before

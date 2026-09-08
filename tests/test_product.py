@@ -921,7 +921,9 @@ _doc = inspect.getsource(_cli.cmd_doctor)
 #   ".manifest.json not found -- run pack_experts() before streaming"
 # to stderr, naming a Python function no user has ever called, in the middle of a machine report.
 check("doctor passes the manifest it already has rather than re-reading one",
-      'non_expert_gb(md, manifest=r["manifest"])' in _doc)
+      'planning_terms(r["name"], md, r["manifest"]' in _doc
+      and "precision.non_expert_gb(config_dir, manifest=manifest)"
+      in inspect.getsource(_sess.planning_terms))
 check("...and a model it cannot read is reported, not raised through the report",
       "could not be read" in _doc)
 check("a model name can be given, because a user will try it",

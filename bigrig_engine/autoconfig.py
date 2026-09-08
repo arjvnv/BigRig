@@ -9,6 +9,7 @@ the packed manifest, and the reserve from what a decode step was measured to act
 """
 from __future__ import annotations
 
+import math
 import os
 
 from .calibrate import available_gb, under_pressure
@@ -109,11 +110,147 @@ def plan_full_layers(n_layers: int, n_experts: int, top_k: int, capacity: int,
     return n_full, rest
 
 
+# --------------------------------------------------------------------------- refusals
+_MACHINE: dict = {}
+
+
+def machine_gb() -> tuple:
+    """(GB installed, GB Metal will actually let a process use). Cached: neither number moves."""
+    if not _MACHINE:
+        from .calibrate import gpu_working_set_gb, total_gb
+        _MACHINE["total"], _MACHINE["wall"] = total_gb(), gpu_working_set_gb()
+    return _MACHINE["total"], _MACHINE["wall"]
+
+
+def smallest_budget_gb(sh: dict, top_k: int, reserve_gb: float, non_expert_gb: float,
+                       reserve_fn=None) -> float:
+    """The smallest budget the planner accepts for this model, to a tenth of a GB, rounded up.
+
+    THE REFUSAL'S OWN INEQUALITY, SOLVED FOR THE BUDGET. The planner refuses when the pool left
+    after the reserve, the headroom and the always-resident weights holds fewer than top-k experts
+    a layer. Headroom is 12% of the budget (floored and capped, see scaled_headroom) and, when the
+    caller gives `reserve_fn`, so is part of the reserve (the prompt cache is 6% of it) -- so the
+    budget appears on both sides. The loop is a fixed point that converges in a handful of steps
+    because both shares are contractions. Computed the way `serve` plans, because the number is
+    printed as the flag to hand `serve`, and a flag that serve then refuses would be worse than no
+    flag; the final loop re-checks the exact inequality at the exact budget it will print.
+    Verified against a bisection of the planner itself in tests/test_preflight.py.
+    """
+    per = sh["bytes_per_expert"] * sh["n_layers"] / 1e9
+    ne = max(0.0, float(non_expert_gb))
+    reserve = (lambda gb: float(reserve_gb)) if reserve_fn is None else reserve_fn
+    gb = float(reserve_gb) + ne + top_k * per + HEADROOM_FLOOR_GB
+    for _ in range(16):
+        gb = reserve(gb) + ne + top_k * per + scaled_headroom(gb)
+    gb = math.ceil(gb * 10 - 1e-9) / 10
+    while int((gb - reserve(gb) - scaled_headroom(gb) - ne) / per) < top_k:
+        gb = round(gb + 0.1, 1)                     # rounding must never land back in the refusal
+    return gb
+
+
+class CeilingRefusal(MemoryError):
+    """The planner said no, and it knows the number that would have been yes.
+
+    WHY THIS IS A CLASS AND NOT A SENTENCE. The refusal used to end "it cannot run on this machine
+    right now" -- and on the machine this engine is for, that was false. A 16 GB Mac gets a 5.6 GB
+    ceiling by default (35% of installed memory); the flagship needs about 6.7, and at 7 the same
+    planner says GOOD. The message blamed the computer for a number the engine had picked itself,
+    and a new user believed it. Whoever catches this can render the truth: which budget, which
+    number would do, whether the Mac can give it (`machine_can`), and the exact flag -- the same
+    words for `doctor`, `serve` and `run`, because they are the same object.
+    """
+
+    def __init__(self, budget_gb: float, sh: dict, top_k: int, reserve_gb: float,
+                 non_expert_gb: float, floor: tuple | None = None, reserve_fn=None):
+        self.budget_gb = float(budget_gb)
+        self.top_k, self.reserve_gb = int(top_k), float(reserve_gb)
+        self.non_expert_gb = max(0.0, float(non_expert_gb))
+        self.floor_experts_gb = top_k * sh["bytes_per_expert"] * sh["n_layers"] / 1e9
+        self.needs_gb = smallest_budget_gb(sh, top_k, reserve_gb, non_expert_gb, reserve_fn)
+        self.floor = floor                  # (bits, GB) the compress floor, if one was on the table
+        self.total_gb, self.wall_gb = machine_gb()
+        # Filled in by whoever knows where the budget came from; see `context`.
+        self.model = None
+        self.ceiling_gb = None
+        self.free_gb = None
+        self.requested = False
+        super().__init__(self.render())
+
+    @property
+    def machine_can(self) -> bool:
+        """Whether a flag can get there at all. Judged against what Metal will wire, not against
+        installed memory: a 13 GB budget on a 16 GB Mac is a crash, not a choice."""
+        wall = self.wall_gb or self.total_gb
+        return bool(wall) and self.needs_gb <= wall + 1e-9
+
+    def context(self, model: str | None = None, ceiling_gb: float | None = None,
+                free_gb: float | None = None, requested: bool = False) -> "CeilingRefusal":
+        """Say where the budget came from, so the advice can be the right advice."""
+        self.model = model or self.model
+        self.ceiling_gb = ceiling_gb if ceiling_gb is not None else self.ceiling_gb
+        self.free_gb = free_gb if free_gb is not None else self.free_gb
+        self.requested = bool(requested) or self.requested
+        return self
+
+    def command(self) -> str:
+        return f"BIGRIG_MAX_GB={self.needs_gb:g} bigrig run {self.model or '<model>'}"
+
+    def why(self) -> str:
+        return (f"top-{self.top_k} experts a layer need {self.floor_experts_gb:.1f} GB, "
+                f"{self.reserve_gb:.1f} GB is held back for the runtime and the KV cache, and "
+                f"{self.non_expert_gb:.1f} GB of the model is resident whatever the pool does")
+
+    def advice(self) -> str:
+        """What to do about it, for a Mac that CAN. The command, when the ceiling is what stands
+        in the way; the other cause, when it is not. Doctor prints this under its own header."""
+        needs = self.needs_gb
+        if self.ceiling_gb is None:            # nobody said where the budget came from
+            return (f"this Mac has {self.total_gb:.1f} GB, so that is a choice, not a wall:"
+                    f"\n    {self.command()}")
+        if needs > self.ceiling_gb + 0.05:     # the ceiling itself is what stands in the way
+            s = (f"the ceiling is {self.ceiling_gb:.1f} GB and this Mac has {self.total_gb:.1f} GB, "
+                 f"so that is a choice, not a wall:\n    {self.command()}")
+            if self.free_gb is not None and self.free_gb < needs:
+                s += (f"\n  ({self.free_gb:.1f} GB is free right now and {needs:.1f} GB has to "
+                      f"be, so close something as well)")
+            return s
+        # The ceiling would allow it; the budget was small for some other reason.
+        if self.requested:
+            return (f"the {self.ceiling_gb:.1f} GB ceiling allows it; ask for at least "
+                    f"{needs:.1f} GB:  --memory {needs:g}")
+        free = (f"only {self.free_gb:.1f} GB is free right now" if self.free_gb is not None
+                else "less than that is free right now")
+        return f"the {self.ceiling_gb:.1f} GB ceiling allows it; {free}. Close something and try again."
+
+    def render(self) -> str:
+        needs, budget = self.needs_gb, self.budget_gb
+        if not self.machine_can:
+            wall = (f"this Mac's GPU can use at most {self.wall_gb:.1f} GB of its "
+                    f"{self.total_gb:.1f} GB" if self.wall_gb
+                    else f"this Mac has {self.total_gb:.1f} GB in total")
+            s = (f"cannot run on this Mac: even the smallest workable budget is {needs:.1f} GB, "
+                 f"and {wall}. No flag changes that; it needs a machine with more memory "
+                 f"({self.why()}).")
+            if self.floor:
+                s += (f" Compressing would not help either: even at {self.floor[0]}-bit it needs "
+                      f"{self.floor[1]:.1f} GB resident.")
+            return s
+        advice = self.advice()
+        return (f"not at this budget: this model needs {needs:.1f} GB and the budget is "
+                f"{budget:.1f} GB ({self.why()}). {advice[0].upper()}{advice[1:]}")
+
+    def __str__(self) -> str:
+        return self.render()
+
+
 def choose_capacity(manifest: dict, budget_gb: float | None = None, top_k: int = 8,
                     reserve_gb: float = RESERVE_GB, non_expert_gb: float = 0.0,
                     resident_reserve_gb: float | None = None,
-                    headroom_gb: float | None = None) -> dict:
+                    headroom_gb: float | None = None, reserve_fn=None) -> dict:
     """How many experts per layer fit, and what that implies.
+
+    `reserve_fn` (budget -> reserve) is only used when this refuses, to find the smallest budget
+    that would not have; see CeilingRefusal. The plan itself is made against `reserve_gb`.
 
     Returns `capacity`, plus `fits_entirely` when the whole model would fit anyway -- in which
     case the honest answer is to not stream at all. An engine that inserts itself into a model
@@ -132,13 +269,9 @@ def choose_capacity(manifest: dict, budget_gb: float | None = None, top_k: int =
     per_layer_all = sh["bytes_per_expert"] * sh["n_experts"] / 1e9
     total_gb = sh["expert_bytes"] / 1e9
 
-    if pool_gb <= 0:
-        raise MemoryError(
-            f"only {avail:.1f} GB is available, {reserve_gb:.1f} GB must be held back for the "
-            f"runtime and the KV cache, and {non_expert_gb:.1f} GB of this model is resident "
-            f"whatever the pool does. Close something, or use a smaller model.")
-
     per_expert_all_layers = sh["bytes_per_expert"] * sh["n_layers"] / 1e9
+    if pool_gb <= 0:
+        raise CeilingRefusal(avail, sh, top_k, reserve_gb, non_expert_gb, reserve_fn=reserve_fn)
     cap = int(pool_gb / per_expert_all_layers)
     cap = max(0, min(sh["n_experts"], cap))
     # A model that fits entirely is resident, so it is judged against the resident reserve --
@@ -148,10 +281,7 @@ def choose_capacity(manifest: dict, budget_gb: float | None = None, top_k: int =
                        else float(resident_reserve_gb)) <= avail
 
     if cap < top_k:
-        raise MemoryError(
-            f"this model needs at least {top_k} experts per layer resident "
-            f"({top_k * per_expert_all_layers:.1f} GB) and only {max(pool_gb,0):.1f} GB is free for the "
-            f"pool. It cannot run on this machine right now.")
+        raise CeilingRefusal(avail, sh, top_k, reserve_gb, non_expert_gb, reserve_fn=reserve_fn)
 
     return {"capacity": cap, "n_experts": sh["n_experts"], "residency": cap / sh["n_experts"],
             "pool_gb": cap * per_expert_all_layers, "available_gb": avail,
@@ -195,8 +325,17 @@ def choose_strategy(manifest: dict, budget_gb: float | None = None, top_k: int =
                     reserve_gb: float = RESERVE_GB, non_expert_gb: float = 0.0,
                     min_bits: int = DEFAULT_MIN_BITS,
                     resident_reserve_gb: float | None = None,
-                    headroom_gb: float | None = None) -> dict:
+                    headroom_gb: float | None = None, reserve_fn=None,
+                    stream_non_expert_gb: float | None = None) -> dict:
     """Decide HOW to run this model on this machine, not just how much of it to keep.
+
+    `stream_non_expert_gb` is what stays resident when the model is STREAMED -- less than
+    `non_expert_gb` when the input embedding can be gathered from the page cache instead of held
+    (embed_stream.py). It applies to the streaming room only: a model that runs resident holds its
+    embedding too, so the native/compress decision is judged against the full figure. Without it
+    this function charged the full embedding to the streaming room while choose_capacity did not,
+    so the two disagreed by half a gigabyte about the smallest budget that would run -- and the
+    flag one printed, the other refused.
 
     Three outcomes, in the order they are preferred:
 
@@ -224,7 +363,8 @@ def choose_strategy(manifest: dict, budget_gb: float | None = None, top_k: int =
     #     Defaults to `reserve_gb` so a caller that says nothing gets exactly the old behaviour.
     res_reserve = reserve_gb if resident_reserve_gb is None else float(resident_reserve_gb)
     headroom = MIN_HEADROOM_GB if headroom_gb is None else float(headroom_gb)
-    room = avail - reserve_gb - headroom - non_expert_gb
+    stream_ne = non_expert_gb if stream_non_expert_gb is None else max(0.0, float(stream_non_expert_gb))
+    room = avail - reserve_gb - headroom - stream_ne
     resident_room = avail - res_reserve - headroom - non_expert_gb
     q = (manifest["layers"][str(sh["layer_keys"][0])].get("quant")
          or {"bits": 4, "group_size": 64})
@@ -276,11 +416,10 @@ def choose_strategy(manifest: dict, budget_gb: float | None = None, top_k: int =
                      f"{floor_gb:.1f} GB")
     cap = max(0, min(sh["n_experts"], int(room / per_layer_all)))
     if cap < top_k:
-        raise MemoryError(
-            f"this model needs {top_k * per_layer_all:.1f} GB just to hold top-{top_k} experts "
-            f"per layer, and only {max(room,0):.1f} GB is free. Even at the floor precision it "
-            f"would need {floor_gb:.1f} GB at {allowed_floor[0]}-bit. It cannot run on this "
-            f"machine right now.")
+        # The compress floor is only a fact about compression when compression was on the table.
+        raise CeilingRefusal(avail, sh, top_k, reserve_gb, stream_ne,
+                             floor=(allowed_floor[0], floor_gb) if allowed else None,
+                             reserve_fn=reserve_fn)
     return {"mode": "stream", "capacity": cap, "n_experts": sh["n_experts"],
             # The shape the speed word needs. Without these the description could only speak in
             # residency, which stopped meaning anything once the zero-copy path landed.
