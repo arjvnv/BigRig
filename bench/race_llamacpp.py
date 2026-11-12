@@ -1,11 +1,12 @@
-"""Race for card `llamacpp-race-16gb-2`: BigRig against llama.cpp on a simulated 16 GB Mac.
+"""Race for card `llamacpp-race-16gb-3`: BigRig against llama.cpp on a simulated 16 GB Mac.
 
 SAME MACHINE FOR BOTH
-    This 24 GB Mac with a random-data balloon held for the whole run, sized before each run to
-    top memory in use (anonymous + wired + compressed) up to 14 GB, at most 8 GB: the room a 16 GB
-    Mac leaves for the engine and page cache, whatever else is open (a fixed 8 GB balloon with a
-    browser open pushed swap +1.6 GB on 2026-11-12; card -2 had the fixed balloon). Each engine gets its own best settings for that machine, chosen
-    by a fixed sweep (one run per setting), then the two winners race in 12 interleaved rounds.
+    This 24 GB Mac with a fixed 5 GB random-data balloon held for every run (why -3: card -1 had a
+    fixed 8 GB balloon, which with a browser open pushes swap past the guard; card -2 sized it to
+    a memory total, and the reading right after a run made it swing 0.05-7 GB). With the browser
+    open, 5 GB is about last night's quiet-Mac + 8 GB total. Each engine gets its own best settings
+    for that machine, chosen by a fixed sweep (one run per setting), then the two winners race in
+    12 interleaved rounds. BigRig is the engine on main (626c47a), as released.
 
 SAME MODEL, EACH ENGINE'S OWN 4-BIT FORMAT
     BigRig: Qwen3.6-35B-A3B-4bit (MLX, 19 GB). llama.cpp: Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
@@ -44,7 +45,7 @@ import threading
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CARD = "llamacpp-race-16gb-2"
+CARD = "llamacpp-race-16gb-3"
 ESTIMATOR_ID = "race-paired-logratio-t95-v1"
 MODEL = os.path.join(ROOT, "models", "Qwen3.6-35B-A3B-4bit")
 GGUF = os.path.join(ROOT, "models", "Qwen3.6-35B-A3B-GGUF", "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf")
@@ -52,12 +53,11 @@ GGUF_BYTES = 22360456160
 LLAMA = "/opt/homebrew/bin/llama-server"
 LLAMA_VERSION = "version: 0.9.0 (build 12110, commit cd959bae9)"
 PORT = 18931
-BALLOON_GB = 8.0
+BALLOON_GB = 5.0
 MAX_TOKENS = 128
 LONG_MAX_TOKENS = 32
 README_COMMIT = "626c47a29abbabc94a627da546bcd7cc2b654dcf"
 LONG_CHARS = 6000
-CONFIRM_CARD = "warm-ahead-confirm-3"
 BIGRIG_COMMITS = {"base": "6e87fcd4030a4f79493f8c4156fa5f3b098e9ae6",
                   "warm": "1c89e3df5aa4c40ad85fdc642357cbd8dc972091",
                   "warm_fast": "0a9bf849f5231711dc070221264ce3addbcb1884"}
@@ -82,9 +82,7 @@ HEAVIER = {"bigrig-7.5": ["bigrig-9.0"], "llama-ncmoe34-t4": ["llama-ncmoe28-t4"
 RACE_ROUNDS = 12
 SWAP_GROWTH_MAX_GB = 1.0
 EXTRA_MEM_MAX_GB = 11.0
-TARGET_USED_GB = 14.0
 BALLOON_KEEP = 0.9
-BUSY_WAIT_S = 900
 RUN_TIMEOUT_S = 900
 KEYWORDS = ["heat", "def fib", "9:40"]   # one per climb prompt, inside any competent first 128 tokens
 
@@ -346,26 +344,6 @@ def decide(dec: dict, ttft: dict) -> dict:
     return {"decision": d, "decision_ttft_long": t}
 
 
-def bigrig_arm(runs_dir) -> tuple:
-    """The BigRig commit, by warm-ahead-confirm-2's latest finished confirm run (the card's rule)."""
-    found = None
-    for d in sorted(os.listdir(runs_dir)) if os.path.isdir(runs_dir) else []:
-        try:
-            meta, st, res = (json.load(open(os.path.join(runs_dir, d, f)))
-                             for f in ("meta.json", "status.json", "results.json"))
-        except (OSError, ValueError):
-            continue
-        if (meta.get("mode") == "confirm" and (meta.get("card") or {}).get("id") == CONFIRM_CARD
-                and st.get("status") == "ok" and res.get("complete")):
-            found = (d, res["decisions"])
-    if found is None:
-        raise RuntimeError(f"no finished {CONFIRM_CARD} confirm run")
-    run, dec = found
-    arm = ("warm_fast" if dec["warm"] == "ship" and dec["warm_fast"] == "ship"
-           else "warm" if dec["warm"] == "ship" else "base")
-    return run, arm, BIGRIG_COMMITS[arm]
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--worker", choices=["bigrig", "llama"])
@@ -403,8 +381,7 @@ def main():
         stop(f"llama-server is not {LLAMA_VERSION}")
     if os.path.getsize(GGUF) != GGUF_BYTES:
         stop("GGUF size changed")
-    run, arm, commit = (("smoke", "base", BIGRIG_COMMITS["base"]) if a.smoke
-                        else bigrig_arm(os.path.join(ROOT, ".lab", "runs")))
+    run, arm, commit = "fixed", "base", BIGRIG_COMMITS["base"]
     arm_dir = os.path.realpath(os.path.join(work, "bigrig_arm"))
     os.makedirs(arm_dir)
     tar = subprocess.run(["git", "-C", ROOT, "archive", commit, "bigrig_engine"], capture_output=True, check=True).stdout
@@ -417,18 +394,12 @@ def main():
     env["HF_HUB_OFFLINE"] = "1"
     configs = {n: ["--worker", "bigrig", "--arm-dir", arm_dir, "--budget", str(b)] for n, b in BIGRIG_GRID}
     configs.update({n: ["--worker", "llama", "--flags", json.dumps(f)] for n, f in LLAMA_GRID})
-    res["target_used_gb"] = TARGET_USED_GB
+    res["balloon_gb"] = 0.0 if a.smoke else BALLOON_GB
 
     def one(name, tag):
         out = os.path.join(work, tag + ".json")
-        before, waited = mac_state(), 0
-        while not a.smoke and before["used_gb"] > TARGET_USED_GB:
-            if waited >= BUSY_WAIT_S:
-                stop(f"memory in use {before['used_gb']} GB above the {TARGET_USED_GB} GB target for 15 min")
-            time.sleep(30)
-            waited += 30
-            before = mac_state()
-        bgb = 0.0 if a.smoke else round(min(BALLOON_GB, TARGET_USED_GB - before["used_gb"]), 2)
+        before = mac_state()
+        bgb = 0.0 if a.smoke else BALLOON_GB
         p = subprocess.Popen([sys.executable, os.path.abspath(__file__), *configs[name], "--balloon-gb", str(bgb),
                               "--out", out], cwd=ROOT,
                              env=env, stdin=subprocess.DEVNULL, stdout=open(out + ".log", "w"),

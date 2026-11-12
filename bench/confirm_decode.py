@@ -1,20 +1,12 @@
-"""Confirm run for card `warm-ahead-confirm-3`: do the climb's two decode speed-ups hold up?
+"""Confirm run for card `warm-ahead-confirm-4`: do the climb's two decode speed-ups hold up?
 
-BALLOON SIZED TO A FIXED TOTAL (why there is a -3): a fixed 8 GB balloon simulates a 16 GB Mac only
-when little else is open. On 2026-11-12 with a browser open (memory in use 10 GB before any run)
-it pushed swap +1.6 GB in 11 minutes and the swap guard stopped the run. So before each balloon
-run the balloon tops memory in use (anonymous + wired + compressed, as lab run counts it) up to
-TARGET_USED_GB, at most 8 GB: the engine and page cache then get the same room whatever else is
-open. 14 GB is about last night's level (quiet Mac + 8 GB balloon; those 18 climb runs grew swap
-by 0 MB). The balloon is started by this harness around the locked eval, which runs --no-balloon.
-
-PLAN PINNED (why there is a -2): BigRig chooses its expert plan from the memory free at start, and
-the reply depends on that plan. A trial on 2026-11-12 with more memory free got 11 slots a layer
-and a reply that left the reference at about token 15; at 8 slots and no whole layers (the
-reference's plan) it was identical. So every run here builds Session with capacity=8 and
-full_layers=() -- the reference's plan -- and the exactness gate compares like with like in both
-regimes. Card warm-ahead-confirm (frozen) did not pin it; its no-balloon regime would have stopped
-on a reply the arms did not cause.
+FIXED 5 GB BALLOON (why there is a -4): the 8 GB balloon simulates a 16 GB Mac only with little
+else open; with a browser open it pushed swap +1.6 GB in 11 minutes (card 1). Card -3 sized the
+balloon to top memory in use up to 14 GB, but memory read right after a run still counts the
+previous balloon being released, so sizes swung 0.05-7 GB run to run and decode followed them
+(4.7-9.1 tok/s). A fixed 5 GB balloon has no such feedback; with the browser open it is about
+last night's total (quiet Mac + 8 GB), and runs with 5-7 GB balloons grew swap by 0 MB today.
+The balloon is started by this harness around the locked eval, which runs --no-balloon.
 
 ARMS (bigrig_engine/ exported from git at each commit; nothing else differs)
     base       6e87fcd  the climb's starting code (bigrig_engine identical to main 626c47a)
@@ -22,7 +14,7 @@ ARMS (bigrig_engine/ exported from git at each commit; nothing else differs)
     warm_fast  0a9bf84  + decode host fast path (climb iter 8, on top of iter 5)
 
 REGIMES (the locked bench/climb_decode.py, unchanged, run once per arm per round)
-    16gb       6.1 GB budget, balloon topping memory in use up to 14 GB (at most 8 GB). 18 rounds.
+    16gb       6.1 GB budget, 5 GB balloon. 18 rounds.
     24gb_warm  same, --no-balloon: page cache holds most of the weights. No-regression guard. 12 rounds.
 
     Each regime starts with one discarded warm-up round (thermal state, page cache). Round r
@@ -35,8 +27,7 @@ ESTIMATOR (estimator_id below; the card's decision rule reads these numbers)
     97.5% rather than 95% because the card asks two primary questions (Bonferroni).
 
 STOPS (kill criteria): any reply not exact; Mac not on AC power; swap more than 1.5 GB above
-the start; memory pressure critical; the balloon squeezed below 90% of its start; memory in use
-above the target for 15 minutes before a balloon run; a run that fails or
+the start; memory pressure critical; the balloon squeezed below 90% of its start; a run that fails or
 times out twice in one arm; an arm whose capacity differs; code loaded from the wrong arm.
 """
 import itertools
@@ -52,7 +43,7 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CLIMB = os.path.join(ROOT, "bench", "climb_decode.py")
-CARD = "warm-ahead-confirm-3"
+CARD = "warm-ahead-confirm-4"
 PIN = {"capacity": 8, "full_layers": ()}
 ESTIMATOR_ID = "paired-logratio-t9875-v1"
 ARMS = {
@@ -62,10 +53,8 @@ ARMS = {
 }
 # (name, balloon on, scored rounds). The locked eval always runs --no-balloon; the shim holds the balloon.
 REGIMES = [("16gb", True, 18), ("24gb_warm", False, 12)]
-TARGET_USED_GB = 14.0
-BALLOON_MAX_GB = 8.0
+BALLOON_GB = 5.0
 BALLOON_KEEP = 0.9
-BUSY_WAIT_S = 900
 ORDERS = list(itertools.permutations(ARMS))
 RUN_TIMEOUT_S = 420
 SWAP_GROWTH_MAX_GB = 1.5
@@ -231,7 +220,7 @@ def main():
     start = mac_state()
     res = {"estimator_id": ESTIMATOR_ID, "card": CARD, "complete": False, "mac_start": start,
            "regimes": {g: {"balloon": b, "rounds": n} for g, b, n in REGIMES},
-           "target_used_gb": TARGET_USED_GB, "rows": []}
+           "balloon_gb": BALLOON_GB, "rows": []}
 
     def save():
         with open(res_path, "w") as f:
@@ -267,16 +256,7 @@ def main():
                     stop("memory pressure critical")
                 if st["swap_used_gb"] - start["swap_used_gb"] > SWAP_GROWTH_MAX_GB:
                     stop(f"swap grew {st['swap_used_gb'] - start['swap_used_gb']:.2f} GB")
-                bgb = 0.0
-                if with_balloon:
-                    waited = 0
-                    while st["used_gb"] > TARGET_USED_GB:
-                        if waited >= BUSY_WAIT_S:
-                            stop(f"memory in use {st['used_gb']} GB above the {TARGET_USED_GB} GB target for 15 min")
-                        time.sleep(30)
-                        waited += 30
-                        st = mac_state()
-                    bgb = round(min(BALLOON_MAX_GB, TARGET_USED_GB - st["used_gb"]), 2)
+                bgb = BALLOON_GB if with_balloon else 0.0
                 tag = f"{regime}-r{rd:02d}-{arm}"
                 out, prov = (os.path.join(work, f"{tag}.{x}.json") for x in ("result", "prov"))
                 t0 = time.time()
