@@ -1,4 +1,12 @@
-"""Confirm run for card `warm-ahead-confirm`: do the climb's two decode speed-ups hold up?
+"""Confirm run for card `warm-ahead-confirm-2`: do the climb's two decode speed-ups hold up?
+
+PLAN PINNED (why there is a -2): BigRig chooses its expert plan from the memory free at start, and
+the reply depends on that plan. A trial on 2026-11-12 with more memory free got 11 slots a layer
+and a reply that left the reference at about token 15; at 8 slots and no whole layers (the
+reference's plan) it was identical. So every run here builds Session with capacity=8 and
+full_layers=() -- the reference's plan -- and the exactness gate compares like with like in both
+regimes. Card warm-ahead-confirm (frozen) did not pin it; its no-balloon regime would have stopped
+on a reply the arms did not cause.
 
 ARMS (bigrig_engine/ exported from git at each commit; nothing else differs)
     base       6e87fcd  the climb's starting code (bigrig_engine identical to main 626c47a)
@@ -35,7 +43,8 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CLIMB = os.path.join(ROOT, "bench", "climb_decode.py")
-CARD = "warm-ahead-confirm"
+CARD = "warm-ahead-confirm-2"
+PIN = {"capacity": 8, "full_layers": ()}
 ESTIMATOR_ID = "paired-logratio-t9875-v1"
 ARMS = {
     "base": "6e87fcd4030a4f79493f8c4156fa5f3b098e9ae6",
@@ -54,16 +63,27 @@ ALPHA = 0.025
 # every bigrig_engine.* submodule resolves through the already-imported package's __path__.
 SHIM = r"""
 import json, runpy, sys
-arm, prov, climb = sys.argv[1], sys.argv[2], sys.argv[3]
+arm, prov, climb, pin = sys.argv[1], sys.argv[2], sys.argv[3], json.loads(sys.argv[4])
 sys.path.insert(0, arm)
 import bigrig_engine
-sys.argv = [climb] + sys.argv[4:]
+import bigrig_engine.session as _bs
+_init, _seen = _bs.Session.__init__, []
+
+def _pinned(self, *a, **k):
+    k.update(capacity=pin["capacity"], full_layers=tuple(pin["full_layers"]))
+    _init(self, *a, **k)
+    st = self.stats()
+    _seen.append({"capacity": st.get("capacity"), "full_layers": st.get("full_layers")})
+
+_bs.Session.__init__ = _pinned
+sys.argv = [climb] + sys.argv[5:]
 try:
     runpy.run_path(climb, run_name="__main__")
 finally:
     with open(prov, "w") as f:
-        json.dump({n: getattr(m, "__file__", None) for n, m in list(sys.modules.items())
-                   if n == "bigrig_engine" or n.startswith("bigrig_engine.")}, f)
+        json.dump({"modules": {n: getattr(m, "__file__", None) for n, m in list(sys.modules.items())
+                               if n == "bigrig_engine" or n.startswith("bigrig_engine.")},
+                   "plan": _seen}, f)
 """
 
 
@@ -196,6 +216,11 @@ def main():
     failures = {}
     capacity = {}
     for regime, flags, n_rounds in REGIMES:
+        if res["rows"]:
+            res["finished_regimes"] = {g: {k: paired(res["rows"], g, n, d) for k, (n, d) in
+                                           {"warm_vs_base": ("warm", "base"), "warm_fast_vs_warm": ("warm_fast", "warm")}.items()}
+                                       for g in {r["regime"] for r in res["rows"]}}
+            save()
         for rd in range(n_rounds + 1):
             order = ORDERS[(rd - 1) % len(ORDERS)] if rd else ORDERS[0]
             for pos, arm in enumerate(order):
@@ -211,7 +236,7 @@ def main():
                 t0 = time.time()
                 try:
                     p = subprocess.run([sys.executable, "-c", SHIM, res["arms"][arm]["dir"], prov, CLIMB,
-                                        "--out", out, *flags], cwd=ROOT, env=env, stdin=subprocess.DEVNULL,
+                                        json.dumps(PIN), "--out", out, *flags], cwd=ROOT, env=env, stdin=subprocess.DEVNULL,
                                        timeout=RUN_TIMEOUT_S)
                     ok = p.returncode == 0 and os.path.exists(out)
                 except subprocess.TimeoutExpired:
@@ -223,12 +248,15 @@ def main():
                     if failures[arm] >= 2:
                         stop(f"arm {arm} failed twice")
                     continue
-                files = json.load(open(prov)).values()
-                if not all(f and os.path.realpath(f).startswith(res["arms"][arm]["dir"] + os.sep) for f in files):
+                provj = json.load(open(prov))
+                if not all(f and os.path.realpath(f).startswith(res["arms"][arm]["dir"] + os.sep)
+                           for f in provj["modules"].values()):
                     stop(f"{tag} loaded bigrig_engine from outside its arm")
+                if provj["plan"] != [{"capacity": PIN["capacity"], "full_layers": 0}]:
+                    stop(f"{tag} plan {provj['plan']} is not the pinned one")
                 r = json.load(open(out))
                 row = {"regime": regime, "round": rd, "pos": pos, "arm": arm, "wall_s": wall,
-                       "mac_before": st, **r}
+                       "mac_before": st, "plan": provj["plan"], **r}
                 res["rows"].append(row)
                 save()
                 print(f"{tag}: {r['decode_tok_s']} tok/s, ttft {r['ttft_s']} s, exact {r['exact']}", flush=True)
