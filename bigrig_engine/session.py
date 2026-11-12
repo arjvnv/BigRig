@@ -901,7 +901,7 @@ def kv_bytes(cfg: dict) -> tuple:
 class Session:
     """A loaded model plus its expert pool, its meter, and its counters."""
 
-    def __init__(self, model_dir: str, capacity=None, policy: str = "lfuda", threads: int = 4,
+    def __init__(self, model_dir: str, capacity=None, policy: str = "lfuda", threads: int = 8,
                  monitor: bool = True, budget_gb: float | None = None, verbose: bool = True,
                  force_stream: bool = False, min_bits: int | None = None,
                  preference: str | None = None, interactive: bool = False,
