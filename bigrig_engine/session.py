@@ -1088,6 +1088,10 @@ class Session:
         if not self.kv_bytes_per_token:      # nothing to derive from; keep the tuned constant
             self.serving_reserve_gb = autoconfig.RESERVE_GB
             reserve_fn = None
+        # Whether that reserve CONTAINS the prompt cache, decided now: _measure_kv fills in
+        # kv_bytes_per_token from a forward pass after load, so reading it later says "yes" for
+        # exactly the flat-constant sessions where the answer is no (see slot_room).
+        self.reserve_holds_cache = bool(self.kv_bytes_per_token)
         self.headroom_gb = terms["headroom_gb"]
         try:
             self.plan = autoconfig.choose_capacity(man, budget_gb=budget_gb, top_k=top_k,
@@ -2967,10 +2971,62 @@ class Session:
                       # What one more resident expert costs, so a caller can price the slider it
                       # is drawing rather than guessing at the shape of the trade.
                       "gb_per_slot": round(self.plan["bytes_per_expert"]
-                                           * self.plan["n_layers"] / 1e9, 4),
+                                           * self.plan["n_layers"] / 1e9, 6),
                       "non_expert_gb": round(self.non_expert_gb, 2),
-                      "working_memory_gb": round(self.working_memory_gb, 2)})
+                      "working_memory_gb": round(self.working_memory_gb, 2),
+                      # slot_room's result, so the page's slider starts from the server's own
+                      # number rather than re-adding rounded terms (which drifted by a slot).
+                      "pool_budget_gb": round(self.slot_room()["budget_gb"], 6),
+                      "slot_fixed_gb": round(self.slot_room()["fixed_gb"], 6),
+                      "slot_cache_in_reserve": bool(getattr(self, "reserve_holds_cache",
+                                                            self.kv_bytes_per_token))})
         return s
+
+    def slot_room(self, kv_tokens: int = 0, prompt_cache_gb: float | None = None) -> dict:
+        """The most resident experts per layer this session holds, by the PLANNER'S OWN SUM.
+
+        THREE SUMS, ONE CEILING, AND TWO OF THEM WERE WRONG.
+            The planner sizes the pool as pool budget - reserve - headroom - streamed non-expert
+            weights. The /config price check used budget - non-expert - working memory: no
+            runtime, no prompt cache, no headroom. The web page's slider used a third sum. On
+            Qwen3.6-35B-A3B at a 9.00 GB ceiling (measured 2026-11-11) the planner allowed 43
+            slots, the page offered 57, and /config accepted 65 -- which peaked at 10.36 GB,
+            1.36 GB over the ceiling the check exists to enforce. 43 peaked at 6.75 GB.
+
+            This is that one sum: server.price_config refuses above it, and stats() reports its
+            result so the page's slider starts from the same number (tests/test_webui.py).
+
+        THE POOL BUDGET, NOT THE CEILING. A draft model, an MTP head, a resident vision tower or
+        an embedding encoder come off the ceiling before the planner sees it (`pool_budget_gb`).
+        Priced against the ceiling, a session with a draft and a head was offered 45 slots where
+        the planner had planned 28.
+
+        `kv_tokens` prices a reply's KV cache on top, for the page's slots-versus-context trade;
+        the planner itself leaves KV to the context limit, so 0 here equals the planner's answer.
+        `prompt_cache_gb` prices a prompt-cache size other than the live one. The reserve only
+        CONTAINS the cache when it was built from the model's KV terms; without them it is the
+        flat autoconfig.RESERVE_GB, and swapping a cache out of a constant that never held one
+        would hand the pool memory nobody reserved. That is decided at planning time
+        (reserve_holds_cache), because kv_bytes_per_token is measured and filled in after load.
+
+        Returns {"fits", "fixed_gb" (everything but the pool), "per_slot_gb", "budget_gb"}.
+        """
+        n = int(self.plan.get("n_experts") or 0)
+        per = self.plan.get("bytes_per_expert", 0) * self.plan.get("n_layers", 0) / 1e9
+        # The budget the planner was actually handed: plan["available_gb"] is exact, where
+        # pool_budget_gb is rounded to 2 places and was a slot off at some draft sizes.
+        budget = float(self.plan.get("available_gb") or getattr(self, "pool_budget_gb", None)
+                       or self.budget_gb)
+        fixed = (self.serving_reserve_gb + self.headroom_gb + self.streamed_non_expert_gb
+                 + max(0, int(kv_tokens)) * (self.kv_bytes_per_token or 0) / 1e9)
+        if prompt_cache_gb is not None and getattr(self, "reserve_holds_cache",
+                                                   bool(self.kv_bytes_per_token)):
+            fixed += max(0.0, float(prompt_cache_gb)) - float(self.prompt_cache_gb or 0.0)
+        if per <= 0:
+            return {"fits": n, "fixed_gb": fixed, "per_slot_gb": per, "budget_gb": budget}
+        fits = int((budget - fixed) / per)
+        return {"fits": max(0, min(n, fits)), "fixed_gb": fixed, "per_slot_gb": per,
+                "budget_gb": budget}
 
     def plan_summary(self) -> str:
         """The plan, in the lines the first run would otherwise have printed three times."""
