@@ -692,12 +692,12 @@ def price_config(session, body: dict):
         The page sends capacity and prompt-cache size together. Priced against the LIVE cache, a
         smaller cache was refused the slots it frees, and {capacity: 43, prompt_cache_gb: 8} was
         accepted while the planner refuses that configuration outright. A cache change alone is
-        priced too when the session's capacity was set explicitly at launch, because the reload
-        keeps that capacity rather than re-planning around the new cache.
+        priced too when the reload will not re-plan around it: when the capacity was set
+        explicitly at launch, or a saved knee will be applied over the planner's choice.
 
     LOWERING MEMORY IS ALWAYS ALLOWED. A session started over plan (an explicit --residency the
-    planner would refuse) must be able to step down, so fewer slots than it holds, with no larger
-    cache, passes even when it is still above the plan.
+    planner would refuse) must be able to step down, so no more slots than it holds, with no
+    larger cache, passes even when it is still above the plan.
     """
     pc = None
     if body.get("prompt_cache_gb") is not None:
@@ -719,12 +719,20 @@ def price_config(session, body: dict):
         cap = int(cap) if cap > 1 else cap
     priced = cap
     if priced is None and pc is not None:
+        # What the reload will hold with only the cache changed: the capacity set at launch,
+        # or else the saved knee, which Session.__init__ applies OVER the planner's choice
+        # (clamped to the expert count, not to the plan) -- so "the planner re-plans around the
+        # new cache" is only true when there is no knee. With the flagship's 9 GB knee of 38, a
+        # 3 GB cache re-plans to 8 and the reload still ran 38.
         priced = (getattr(session, "init_kwargs", None) or {}).get("capacity")
+        knee = getattr(session, "knee", None)
+        if priced is None and knee and knee.get("capacity"):
+            priced = min(int(knee["capacity"]), int(n_exp))
     if priced is not None:
         slots = int(round(priced * n_exp)) if priced <= 1.0 else int(priced)
         room = session.slot_room(prompt_cache_gb=pc)
         holding = int(getattr(session, "planned_from", None) or session.plan.get("capacity") or 0)
-        lowering = slots < holding and (pc is None or pc <= float(session.prompt_cache_gb or 0))
+        lowering = slots <= holding and (pc is None or pc <= float(session.prompt_cache_gb or 0))
         if slots > room["fits"] and not lowering:
             need = room["fixed_gb"] + slots * room["per_slot_gb"]
             return (f"{slots} experts per layer needs about {need:.1f} GB and the budget "

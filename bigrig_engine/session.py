@@ -1088,6 +1088,10 @@ class Session:
         if not self.kv_bytes_per_token:      # nothing to derive from; keep the tuned constant
             self.serving_reserve_gb = autoconfig.RESERVE_GB
             reserve_fn = None
+        # Whether that reserve CONTAINS the prompt cache, decided now: _measure_kv fills in
+        # kv_bytes_per_token from a forward pass after load, so reading it later says "yes" for
+        # exactly the flat-constant sessions where the answer is no (see slot_room).
+        self.reserve_holds_cache = bool(self.kv_bytes_per_token)
         self.headroom_gb = terms["headroom_gb"]
         try:
             self.plan = autoconfig.choose_capacity(man, budget_gb=budget_gb, top_k=top_k,
@@ -2972,10 +2976,10 @@ class Session:
                       "working_memory_gb": round(self.working_memory_gb, 2),
                       # slot_room's result, so the page's slider starts from the server's own
                       # number rather than re-adding rounded terms (which drifted by a slot).
-                      "pool_budget_gb": round(float(getattr(self, "pool_budget_gb", None)
-                                                    or self.budget_gb), 6),
+                      "pool_budget_gb": round(self.slot_room()["budget_gb"], 6),
                       "slot_fixed_gb": round(self.slot_room()["fixed_gb"], 6),
-                      "slot_cache_in_reserve": bool(self.kv_bytes_per_token)})
+                      "slot_cache_in_reserve": bool(getattr(self, "reserve_holds_cache",
+                                                            self.kv_bytes_per_token))})
         return s
 
     def slot_room(self, kv_tokens: int = 0, prompt_cache_gb: float | None = None) -> dict:
@@ -3002,16 +3006,21 @@ class Session:
         `prompt_cache_gb` prices a prompt-cache size other than the live one. The reserve only
         CONTAINS the cache when it was built from the model's KV terms; without them it is the
         flat autoconfig.RESERVE_GB, and swapping a cache out of a constant that never held one
-        would hand the pool memory nobody reserved.
+        would hand the pool memory nobody reserved. That is decided at planning time
+        (reserve_holds_cache), because kv_bytes_per_token is measured and filled in after load.
 
         Returns {"fits", "fixed_gb" (everything but the pool), "per_slot_gb", "budget_gb"}.
         """
         n = int(self.plan.get("n_experts") or 0)
         per = self.plan.get("bytes_per_expert", 0) * self.plan.get("n_layers", 0) / 1e9
-        budget = float(getattr(self, "pool_budget_gb", None) or self.budget_gb)
+        # The budget the planner was actually handed: plan["available_gb"] is exact, where
+        # pool_budget_gb is rounded to 2 places and was a slot off at some draft sizes.
+        budget = float(self.plan.get("available_gb") or getattr(self, "pool_budget_gb", None)
+                       or self.budget_gb)
         fixed = (self.serving_reserve_gb + self.headroom_gb + self.streamed_non_expert_gb
                  + max(0, int(kv_tokens)) * (self.kv_bytes_per_token or 0) / 1e9)
-        if prompt_cache_gb is not None and self.kv_bytes_per_token:
+        if prompt_cache_gb is not None and getattr(self, "reserve_holds_cache",
+                                                   bool(self.kv_bytes_per_token)):
             fixed += max(0.0, float(prompt_cache_gb)) - float(self.prompt_cache_gb or 0.0)
         if per <= 0:
             return {"fits": n, "fixed_gb": fixed, "per_slot_gb": per, "budget_gb": budget}
