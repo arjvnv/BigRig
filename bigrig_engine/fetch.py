@@ -226,6 +226,17 @@ class WeightStore:
             return None
         return memoryview(mm)[offset:offset + length]
 
+    def region_resident(self, seg) -> bool:
+        """True if `seg` is mapped and every page of it is in memory. False when unsure."""
+        with self._map_lock:
+            ent = self._maps.get(seg.path)
+        if ent is None:
+            return False
+        try:
+            return pages_resident(ent[3] + seg.offset, seg.length)
+        except Exception:                        # noqa: BLE001 -- a hint, never a fault
+            return False
+
     def warm_region(self, path: str, offset: int, length: int) -> bool:
         """Pull one region's pages into the page cache if they are not there. True if it read.
 
@@ -453,8 +464,22 @@ class ParallelFetcher:
                 else:
                     self.hit_pending += 1
         t0 = time.perf_counter()
-        futures = self._submit(keys)
-        out = {k: f.result() for k, f in futures.items()}      # re-raises worker exceptions
+        # A KEY WHOSE PAGES ARE ALREADY IN MEMORY IS WRAPPED HERE, NOT HANDED TO A THREAD. Its view
+        # costs microseconds; the round trip through the pool (future, wakeup, wait) costs more
+        # than the work. Only single-segment mapped keys not already in flight qualify, so the
+        # bytes are the same view _read_region would return. Cold keys still read in parallel.
+        out = {}
+        if self.mapped:
+            with self._lock:
+                free = [k for k in keys if k not in self._inflight]
+            for k in free:
+                segs = self.store.segments(k)
+                if len(segs) == 1 and self.store.region_resident(segs[0]):
+                    v = self._read_region(k)
+                    if v is not None:
+                        out[k] = v
+        futures = self._submit([k for k in keys if k not in out])
+        out.update({k: f.result() for k, f in futures.items()})  # re-raises worker exceptions
         dt = time.perf_counter() - t0
         with self._lock:
             for k in futures:
