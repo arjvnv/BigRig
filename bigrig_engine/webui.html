@@ -1002,27 +1002,38 @@ let cfgLive = null;             // what the server is serving right now
 let cfgWant = null;             // what the sliders say
 let cfgBusy = false;
 
-function slotsThatFit(kvTokens){
-  // budget - things that are resident whatever happens - one step's working set - the memory set
-  // aside for remembered prompts - this reply's KV cache = what is left for expert slots.
+function slotFixedGb(){
+  // Everything the budget holds that is not an expert slot: Session.slot_room's `fixed_gb`, term
+  // for term, so this slider offers exactly what /config will accept and the planner would plan.
   //
-  // EVERY TERM THE SERVER RESERVES MUST APPEAR HERE. The reserve gained `prompt_cache_gb` when
-  // the engine started remembering prompts, and for a while this did not know about it -- so the
-  // slider offered five more experts a layer than the planner would accept, which is precisely
-  // the lying control the comment above was written to prevent.
+  // EVERY TERM THE SERVER RESERVES MUST APPEAR HERE. Twice this was a copy that drifted: first
+  // the reserve gained `prompt_cache_gb` and this did not; then it subtracted the full non-expert
+  // weights and working memory but not the runtime, the headroom, or the embedding the planner
+  // streams, and offered 57 slots where the planner allows 43 (Qwen3.6, 9 GB). Both functions
+  // below call this one, so they cannot drift from each other either.
   const h=health;
-  // The WANTED reserve, not the live one. While the third slider is being dragged the page is
-  // previewing a configuration that does not exist yet, and pricing it against the reserve the
-  // server currently has would show the user a ceiling for the setting they are leaving.
+  // The WANTED prompt cache, not the live one. While the third slider is being dragged the page
+  // is previewing a configuration that does not exist yet, and pricing it against the reserve the
+  // server currently has would show the user a ceiling for the setting they are leaving. The
+  // reserve already holds the live prompt cache, so the previewed size swaps it out.
   const pc = (cfgWant && cfgWant.pcache != null) ? cfgWant.pcache : (h.prompt_cache_gb||0);
-  const spare = (h.budget_gb||0) - (h.non_expert_gb||0) - (h.working_memory_gb||0) - pc
-              - (h.draft_gb||0) - kvTokens*(h.kv_bytes_per_token||0)/1e9;
+  return ((h.serving_reserve_gb||0) - (h.prompt_cache_gb||0) + pc)
+       + (h.headroom_gb||0) + (h.streamed_non_expert_gb||0) + (h.draft_gb||0);
+}
+function slotsThatFit(kvTokens){
+  // budget - everything that is not a slot - this reply's KV cache = what is left for slots.
+  const h=health;
+  const spare = (h.budget_gb||0) - slotFixedGb() - kvTokens*(h.kv_bytes_per_token||0)/1e9;
   const per = h.gb_per_slot||0;
   if(per<=0) return h.n_experts||0;
   return Math.max(1, Math.min(h.n_experts||0, Math.floor(spare/per)));
 }
 function kvTokensThatFit(slots){
-  const h=health;                        // same terms as slotsThatFit, and for the same reason
+  // NOT slotFixedGb. The server limits a reply by Session._token_ceiling -- budget minus what is
+  // resident minus working memory, no headroom -- not by the planner's sum, so this mirrors that.
+  // Pointed at the planner's sum it offered 2,519 tokens at 43 slots where the server allows far
+  // more (Qwen3.6, 9 GB), a control lying in the other direction.
+  const h=health;
   const pc = (cfgWant && cfgWant.pcache != null) ? cfgWant.pcache : (h.prompt_cache_gb||0);
   const spare = (h.budget_gb||0) - (h.non_expert_gb||0) - (h.working_memory_gb||0) - pc
               - (h.draft_gb||0) - slots*(h.gb_per_slot||0);

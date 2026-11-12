@@ -928,18 +928,20 @@ def make_handler(state: _State):
                     # reload sequence is written to avoid. Measured with the reference held: a
                     # 40 -> 53 reload reported 10.56 GB for 5.25 GB of weights, which then fed
                     # the reply ceiling and cut it from 13,852 tokens to the 256 floor.
+                    # THE PLANNER'S SUM, NOT A COPY OF PART OF IT. This check used to price
+                    # budget - non-expert - working memory and nothing else, and accepted 65
+                    # slots on Qwen3.6-35B-A3B at 9 GB: measured peak 10.36 GB. slot_room is the
+                    # sum the planner sizes the pool with; see its note.
                     _s = state.session
-                    budget, non_exp = _s.budget_gb, _s.non_expert_gb
-                    work = _s.working_memory_gb
-                    per = (_s.plan.get("bytes_per_expert", 0) * _s.plan.get("n_layers", 0)) / 1e9
+                    budget = _s.budget_gb
+                    room = _s.slot_room()
                     del _s
                     slots = int(round(cap * n_exp)) if cap <= 1.0 else int(cap)
-                    need = slots * per + non_exp + work
-                    if need > budget:
-                        fits = max(1, int((budget - non_exp - work) // per)) if per else n_exp
+                    if slots > room["fits"]:
+                        need = room["fixed_gb"] + slots * room["per_slot_gb"]
                         return self._bad(
                             f"{slots} experts per layer needs about {need:.1f} GB and the budget "
-                            f"is {budget:.1f} GB. The most that fits is {fits}.")
+                            f"is {budget:.1f} GB. The most that fits is {room['fits']}.")
                     want["capacity"] = cap
                 # CLEARING REMEMBERED PROMPTS IS NOT A RELOAD, AND MUST NOT BE TREATED AS ONE.
                 #     Everything else on this endpoint rebuilds the pool, which takes seconds and
