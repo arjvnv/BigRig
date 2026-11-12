@@ -672,6 +672,74 @@ def _thinking_budget(body: dict):
     return resolve_budget(tb, eff)
 
 
+def price_config(session, body: dict):
+    """Validate a /v1/config body and price what the reload would build. Returns (error, want).
+
+    `error` is the message for a 400, or None; `want` is what to hand the pump.
+
+    PRICE IT BEFORE ACCEPTING IT.
+        A capacity given explicitly is honoured everywhere else in this engine, which is right
+        for a flag someone typed and wrong for a slider in a browser. Asked for all 128 experts
+        of a 12.68 GB model against a 9 GB ceiling, this endpoint once said 200 and took the
+        footprint to 30.68 GB on a 26 GB machine -- the exact failure the ceiling exists to
+        prevent.
+
+    THE PLANNER'S SUM, NOT A COPY OF PART OF IT (Session.slot_room).
+        This check used to price budget - non-expert - working memory and nothing else, and
+        accepted 65 slots on Qwen3.6-35B-A3B at 9 GB: measured peak 10.36 GB.
+
+    THE CACHE IN THE SAME BODY IS PART OF THE PRICE.
+        The page sends capacity and prompt-cache size together. Priced against the LIVE cache, a
+        smaller cache was refused the slots it frees, and {capacity: 43, prompt_cache_gb: 8} was
+        accepted while the planner refuses that configuration outright. A cache change alone is
+        priced too when the session's capacity was set explicitly at launch, because the reload
+        keeps that capacity rather than re-planning around the new cache.
+
+    LOWERING MEMORY IS ALWAYS ALLOWED. A session started over plan (an explicit --residency the
+    planner would refuse) must be able to step down, so fewer slots than it holds, with no larger
+    cache, passes even when it is still above the plan.
+    """
+    pc = None
+    if body.get("prompt_cache_gb") is not None:
+        try:
+            pc = float(body["prompt_cache_gb"])
+        except (TypeError, ValueError):
+            return "`prompt_cache_gb` must be a number", None
+        if not 0 <= pc <= 8:                                   # also refuses NaN
+            return "`prompt_cache_gb` must be between 0 and 8", None
+    n_exp = session.plan.get("n_experts") or 1
+    cap = body.get("capacity")
+    if cap is not None:
+        try:
+            cap = float(cap)
+        except (TypeError, ValueError):
+            return "`capacity` must be a number", None
+        if not 0 < cap <= n_exp:                               # also refuses NaN and inf
+            return "`capacity` must be between 1 and the expert count", None
+        cap = int(cap) if cap > 1 else cap
+    priced = cap
+    if priced is None and pc is not None:
+        priced = (getattr(session, "init_kwargs", None) or {}).get("capacity")
+    if priced is not None:
+        slots = int(round(priced * n_exp)) if priced <= 1.0 else int(priced)
+        room = session.slot_room(prompt_cache_gb=pc)
+        holding = int(getattr(session, "planned_from", None) or session.plan.get("capacity") or 0)
+        lowering = slots < holding and (pc is None or pc <= float(session.prompt_cache_gb or 0))
+        if slots > room["fits"] and not lowering:
+            need = room["fixed_gb"] + slots * room["per_slot_gb"]
+            return (f"{slots} experts per layer needs about {need:.1f} GB and the budget "
+                    f"is {room['budget_gb']:.1f} GB. The most that fits is {room['fits']}."), None
+    want = {}
+    if cap is not None:
+        want["capacity"] = cap
+    for name in ("prefetch_width", "reroute", "draft_tokens"):
+        if body.get(name) is not None:
+            want[name] = body[name]
+    if pc is not None:
+        want["prompt_cache_gb"] = pc
+    return None, want
+
+
 def make_handler(state: _State):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -904,45 +972,16 @@ def make_handler(state: _State):
                 # only the pump's thread may do. The request is handed over and waited on.
                 if state.pending_config is not None:
                     return self._bad("a settings change is already being applied")
-                want = {}
-                cap = body.get("capacity")
-                if cap is not None:
-                    try:
-                        cap = float(cap)
-                    except (TypeError, ValueError):
-                        return self._bad("`capacity` must be a number")
-                    n_exp = state.session.plan.get("n_experts") or 1
-                    if not 0 < cap <= n_exp:
-                        return self._bad("`capacity` must be between 1 and the expert count")
-                    cap = int(cap) if cap > 1 else cap
-                    # PRICE IT BEFORE ACCEPTING IT.
-                    #     A capacity given explicitly is honoured everywhere else in this engine,
-                    #     which is right for a flag someone typed and wrong for a slider in a
-                    #     browser. Asked for all 128 experts of a 12.68 GB model against a 9 GB
-                    #     ceiling, this endpoint said 200 and took the footprint to 30.68 GB on a
-                    #     26 GB machine -- the exact failure the ceiling exists to prevent.
-                    # Numbers only, and no reference to the session kept past this block. This
-                    # handler's thread then blocks on `config_event` for as long as the reload
-                    # takes, and a local holding the OLD session would keep its pool alive while
-                    # the pump builds the new one -- two pools at once is precisely what the
-                    # reload sequence is written to avoid. Measured with the reference held: a
-                    # 40 -> 53 reload reported 10.56 GB for 5.25 GB of weights, which then fed
-                    # the reply ceiling and cut it from 13,852 tokens to the 256 floor.
-                    # THE PLANNER'S SUM, NOT A COPY OF PART OF IT. This check used to price
-                    # budget - non-expert - working memory and nothing else, and accepted 65
-                    # slots on Qwen3.6-35B-A3B at 9 GB: measured peak 10.36 GB. slot_room is the
-                    # sum the planner sizes the pool with; see its note.
-                    _s = state.session
-                    budget = _s.budget_gb
-                    room = _s.slot_room()
-                    del _s
-                    slots = int(round(cap * n_exp)) if cap <= 1.0 else int(cap)
-                    if slots > room["fits"]:
-                        need = room["fixed_gb"] + slots * room["per_slot_gb"]
-                        return self._bad(
-                            f"{slots} experts per layer needs about {need:.1f} GB and the budget "
-                            f"is {budget:.1f} GB. The most that fits is {room['fits']}.")
-                    want["capacity"] = cap
+                # PRICE IT BEFORE ACCEPTING IT -- see price_config. Numbers only, and no reference
+                # to the session kept past this call: this thread then blocks on `config_event`
+                # for as long as the reload takes, and a local holding the OLD session would keep
+                # its pool alive while the pump builds the new one -- two pools at once is
+                # precisely what the reload sequence is written to avoid. Measured with the
+                # reference held: a 40 -> 53 reload reported 10.56 GB for 5.25 GB of weights,
+                # which then fed the reply ceiling and cut it from 13,852 tokens to the 256 floor.
+                err, want = price_config(state.session, body)
+                if err:
+                    return self._bad(err)
                 # CLEARING REMEMBERED PROMPTS IS NOT A RELOAD, AND MUST NOT BE TREATED AS ONE.
                 #     Everything else on this endpoint rebuilds the pool, which takes seconds and
                 #     goes through the pump. This just drops a dictionary. Answering it here, and
@@ -958,17 +997,6 @@ def make_handler(state: _State):
                                          f"{freed / 1e9:.2f} GB released", bytes=int(freed))
                     return _json(self, 200, {"ok": True, "freed_bytes": int(freed),
                                              "prompt_cache_bytes": 0})
-                for name in ("prefetch_width", "reroute", "draft_tokens", "prompt_cache_gb"):
-                    if body.get(name) is not None:
-                        want[name] = body[name]
-                if want.get("prompt_cache_gb") is not None:
-                    try:
-                        v = float(want["prompt_cache_gb"])
-                    except (TypeError, ValueError):
-                        return self._bad("`prompt_cache_gb` must be a number")
-                    if not 0 <= v <= 8:
-                        return self._bad("`prompt_cache_gb` must be between 0 and 8")
-                    want["prompt_cache_gb"] = v
                 if not want:
                     return self._bad("nothing to change")
                 state.config_event.clear()

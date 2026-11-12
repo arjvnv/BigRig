@@ -1003,27 +1003,28 @@ let cfgWant = null;             // what the sliders say
 let cfgBusy = false;
 
 function slotFixedGb(){
-  // Everything the budget holds that is not an expert slot: Session.slot_room's `fixed_gb`, term
-  // for term, so this slider offers exactly what /config will accept and the planner would plan.
-  //
-  // EVERY TERM THE SERVER RESERVES MUST APPEAR HERE. Twice this was a copy that drifted: first
-  // the reserve gained `prompt_cache_gb` and this did not; then it subtracted the full non-expert
-  // weights and working memory but not the runtime, the headroom, or the embedding the planner
-  // streams, and offered 57 slots where the planner allows 43 (Qwen3.6, 9 GB). Both functions
-  // below call this one, so they cannot drift from each other either.
+  // Everything the pool budget holds that is not an expert slot, AS THE SERVER COMPUTED IT:
+  // Session.slot_room's `fixed_gb`, reported as slot_fixed_gb. This page used to re-add the terms
+  // itself, and copies drift: first the reserve gained `prompt_cache_gb` and this did not; then it
+  // left out the runtime, the headroom and the streamed embedding and offered 57 slots where the
+  // planner allows 43 (Qwen3.6, 9 GB); re-added from rounded figures it was still a slot off at
+  // some budgets. Now it starts from the server's number and changes only what it previews.
   const h=health;
   // The WANTED prompt cache, not the live one. While the third slider is being dragged the page
   // is previewing a configuration that does not exist yet, and pricing it against the reserve the
-  // server currently has would show the user a ceiling for the setting they are leaving. The
-  // reserve already holds the live prompt cache, so the previewed size swaps it out.
+  // server currently has would show the user a ceiling for the setting they are leaving. Only
+  // swapped when the server says its reserve holds the cache (slot_cache_in_reserve).
   const pc = (cfgWant && cfgWant.pcache != null) ? cfgWant.pcache : (h.prompt_cache_gb||0);
-  return ((h.serving_reserve_gb||0) - (h.prompt_cache_gb||0) + pc)
-       + (h.headroom_gb||0) + (h.streamed_non_expert_gb||0) + (h.draft_gb||0);
+  const swap = h.slot_cache_in_reserve ? pc - (h.prompt_cache_gb||0) : 0;
+  return (h.slot_fixed_gb||0) + swap;
 }
 function slotsThatFit(kvTokens){
-  // budget - everything that is not a slot - this reply's KV cache = what is left for slots.
+  // pool budget - everything that is not a slot - this reply's KV cache = what is left for slots.
+  // The POOL budget: a draft model or an MTP head comes off the ceiling before the planner sees
+  // it, so the ceiling would offer slots the planner never planned for.
   const h=health;
-  const spare = (h.budget_gb||0) - slotFixedGb() - kvTokens*(h.kv_bytes_per_token||0)/1e9;
+  const spare = (h.pool_budget_gb||h.budget_gb||0) - slotFixedGb()
+              - kvTokens*(h.kv_bytes_per_token||0)/1e9;
   const per = h.gb_per_slot||0;
   if(per<=0) return h.n_experts||0;
   return Math.max(1, Math.min(h.n_experts||0, Math.floor(spare/per)));

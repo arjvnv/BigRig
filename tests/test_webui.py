@@ -203,67 +203,138 @@ else:
 #
 #     Checked by term, against the server's own reserve, rather than by re-deriving the sum here
 #     -- which would be a third copy and would drift from both.
-#     The sum now lives in ONE method, `Session.slot_room`, which the /config price check calls.
-#     It replaced two copies that had drifted: /config priced budget - non-expert - working
-#     memory and accepted 65 slots on Qwen3.6-35B-A3B at 9 GB (measured peak 10.36 GB), and this
-#     page offered 57 where the planner allows 43. Its terms are read off its body here, so a
-#     term added there and not here fails this file.
-_room_src = _sess[_sess.index("    def slot_room("):]
-_room_src = _room_src[:_room_src.index("\n    def ", 10)]
-_terms = set(re.findall(r"self\.([a-z_]+_gb)\b", _room_src)) - {"budget_gb"}
-check("the server's slot sum (Session.slot_room) is there to read the terms from",
-      len(_terms) >= 4, f"{sorted(_terms)}")
-_fixed = script[script.index("function slotFixedGb"):script.index("function slotsThatFit")]
-_absent = sorted(t for t in _terms if f"h.{t}" not in _fixed)
-check("every term of the server's slot sum is subtracted by the page's own arithmetic",
-      not _absent, f"the page never subtracts: {_absent}")
+#     The sum now lives in ONE method, `Session.slot_room`; server.price_config refuses above it
+#     and stats() reports its result, which the page starts from instead of re-adding terms. It
+#     replaced copies that had drifted: /config priced budget - non-expert - working memory and
+#     accepted 65 slots on Qwen3.6-35B-A3B at 9 GB (measured peak 10.36 GB), and this page
+#     offered 57 where the planner allows 43.
+#
+#     WIRING, read off the source.
 _stats_src = _sess[_sess.index("    def stats(self)"):]
 _stats_src = _stats_src[:_stats_src.index("\n    def ", 10)]
-_unreported = sorted(t for t in _terms if f'"{t}"' not in _stats_src)
-check("...and the server reports every one of them for the page to read",
+_unreported = [k for k in ("pool_budget_gb", "slot_fixed_gb", "slot_cache_in_reserve")
+               if f'"{k}"' not in _stats_src]
+check("the server reports the slot sum's result, its budget and its cache rule",
       not _unreported, f"never reported: {_unreported}")
+check("...and the reported sum IS slot_room's, not a fourth copy",
+      'self.slot_room()["fixed_gb"]' in _stats_src)
+_fixed = script[script.index("function slotFixedGb"):script.index("function slotsThatFit")]
 _fit = script[script.index("function slotsThatFit"):script.index("function kvTokensThatFit")]
+check("the page's expert slider starts from the server's sum and its cache rule",
+      "h.slot_fixed_gb" in _fixed and "h.slot_cache_in_reserve" in _fixed)
+check("...against the POOL budget, which a draft model or a head has already been taken off",
+      "h.pool_budget_gb" in _fit and "slotFixedGb()" in _fit)
 _kv = script[script.index("function kvTokensThatFit"):]
 _kv = _kv[:_kv.index("\n}")]
-check("the expert slider takes its fixed terms from the helper",
-      "slotFixedGb()" in _fit)
 # The reply-length slider mirrors the server's REPLY limit (Session._token_ceiling: budget -
 # resident - working memory, no headroom), not the planner's slot sum. Pointed at the slot sum it
 # offered 2,519 tokens at 43 slots on Qwen3.6 at 9 GB, far below what the server accepts.
 check("the reply-length slider prices the terms the server's reply limit uses",
       "prompt_cache_gb" in _kv and "working_memory_gb" in _kv and "slotFixedGb()" not in _kv)
-_srv = open(os.path.join(ROOT, "bigrig_engine", "server.py"), encoding="utf-8").read()
-_cfg = _srv[_srv.index("PRICE IT BEFORE ACCEPTING IT"):]
-_cfg = _cfg[:_cfg.index('want["capacity"] = cap')]
-check("/config prices a slider request with that same sum", "slot_room()" in _cfg)
 
-# AND THE NUMBER, AGAINST THE PLANNER RATHER THAN AGAINST ITSELF. The terms below are the ones a
-# live Qwen3.6-35B-A3B-4bit session reported at a 9.00 GB budget on 2026-11-11 (40 layers, 256
-# experts, 0.0708 GB a slot). The planner, autoconfig.choose_capacity, is separate code; the
-# live session's planner said 43 for the same terms.
+# THE NUMBER, AGAINST THE PLANNER RATHER THAN AGAINST ITSELF. Terms are the ones a live
+# Qwen3.6-35B-A3B-4bit session reported at a 9.00 GB budget on 2026-11-11 (40 layers, 256 experts,
+# 0.0708 GB a slot); its planner said 43. autoconfig.choose_capacity is separate code.
+import math as _math                                                        # noqa: E402
 import types as _types                                                      # noqa: E402
 sys.path.insert(0, ROOT)
-from bigrig_engine import autoconfig as _A                                  # noqa: E402
+sys.path.insert(0, os.path.join(ROOT, "tests"))
+from bigrig_engine import autoconfig as _A, server as _server               # noqa: E402
 from bigrig_engine.session import Session as _Sess                          # noqa: E402
-_L, _B = 40, 1769472
+_L, _B, _NE = 40, 1769472, 1.103603855
+_PER = _B * _L / 1e9
 _man = {"layers": {str(i): {"n_experts": 256, "bytes_per_expert": _B} for i in range(_L)},
         "total_bytes": 256 * _B * _L}
-_planner = _A.choose_capacity(_man, budget_gb=9.0, top_k=8, reserve_gb=3.8,
-                              non_expert_gb=1.103603855, headroom_gb=1.0)["capacity"]
-_live = _types.SimpleNamespace(plan={"n_experts": 256, "bytes_per_expert": _B, "n_layers": _L},
-                               budget_gb=9.0, serving_reserve_gb=3.8, prompt_cache_gb=0.5,
-                               headroom_gb=1.0, streamed_non_expert_gb=1.103603855,
-                               kv_bytes_per_token=20480)
-_r = _Sess.slot_room(_live)
+
+
+def _session(pool=9.0, kvb=20480, planned_from=38, explicit=None, **over):
+    """A session's planning terms as Session.__init__ derives them for a POOL budget."""
+    pc = round(min(0.5, pool * 0.06), 2)
+    reserve = round(0.3 + 3.0 + pc, 2) if kvb else _A.RESERVE_GB
+    t = dict(plan={"n_experts": 256, "bytes_per_expert": _B, "n_layers": _L, "capacity": 13},
+             budget_gb=9.0, pool_budget_gb=pool, serving_reserve_gb=reserve, prompt_cache_gb=pc,
+             headroom_gb=_A.scaled_headroom(pool), streamed_non_expert_gb=_NE,
+             kv_bytes_per_token=kvb, planned_from=planned_from,
+             init_kwargs={"capacity": explicit})
+    t.update(over)
+    ns = _types.SimpleNamespace(**t)
+    ns.slot_room = _types.MethodType(_Sess.slot_room, ns)
+    return ns
+
+
+def _planner(ns):
+    return _A.choose_capacity(_man, budget_gb=ns.pool_budget_gb, top_k=8,
+                              reserve_gb=ns.serving_reserve_gb, non_expert_gb=_NE,
+                              headroom_gb=ns.headroom_gb)["capacity"]
+
+
+_q = _session()
 check("on the measured Qwen3.6 terms the server's sum equals the planner's answer (43)",
-      _r["fits"] == _planner == 43, f"slot_room {_r['fits']}, planner {_planner}")
-check("...so the 65 slots that peaked at 10.36 GB against a 9 GB ceiling are refused",
-      65 > _r["fits"])
-check("...and a reply's KV cache only ever lowers it",
-      _Sess.slot_room(_live, kv_tokens=100_000)["fits"] < _r["fits"])
-check("...and previewing a larger prompt cache lowers it by that cache's slots",
-      _Sess.slot_room(_live, prompt_cache_gb=1.5)["fits"] == int((9.0 - 3.8 - 1.0 - 1.0 - 1.103603855)
-                                                                / (_B * _L / 1e9)))
+      _q.slot_room()["fits"] == _planner(_q) == 43, f"{_q.slot_room()['fits']} vs {_planner(_q)}")
+_d = _session(pool=8.4, planned_from=30)                 # a 0.6 GB draft off a 9 GB ceiling
+check("with a draft model it prices the POOL budget, and still equals the planner (35, not 43)",
+      _d.slot_room()["fits"] == _planner(_d) == 35, f"{_d.slot_room()['fits']} vs {_planner(_d)}")
+check("a reply's KV cache only ever lowers it",
+      _q.slot_room(kv_tokens=100_000)["fits"] < _q.slot_room()["fits"])
+check("a smaller previewed cache frees exactly its own slots (0.5 GB -> 50)",
+      _q.slot_room(prompt_cache_gb=0.0)["fits"] == int((9.0 - 3.3 - 1.0 - _NE) / _PER) == 50)
+_flat = _session(kvb=0)                                  # reserve is the flat RESERVE_GB constant
+check("...but not when the reserve is a flat constant that never held the cache",
+      _flat.slot_room(prompt_cache_gb=0.0)["fits"] == _flat.slot_room()["fits"] == _planner(_flat))
+
+# THE /config PRICE, CALLED, NOT READ. A gate that only finds the function name in the handler
+# passes with the comparison broken (a reviewer changed it to `fits + 20` and this file stayed
+# green); these call the same price_config the handler calls.
+def _price(ns, body):
+    err, want = _server.price_config(ns, body)
+    return err, want
+
+
+check("65 slots, which peaked at 10.36 GB against a 9 GB ceiling, are refused",
+      "most that fits is 43" in (_price(_q, {"capacity": 65})[0] or ""))
+check("...and so is 44, one past the planner", _price(_q, {"capacity": 44})[0] is not None)
+check("...while 43 is accepted as asked", _price(_q, {"capacity": 43}) == (None, {"capacity": 43}))
+check("a cache raised in the same body is priced: capacity 43 with an 8 GB cache is refused",
+      _price(_q, {"capacity": 43, "prompt_cache_gb": 8})[0] is not None)
+check("a cache lowered in the same body buys its slots: 50 with no cache is accepted, 51 is not",
+      _price(_q, {"capacity": 50, "prompt_cache_gb": 0})[0] is None
+      and _price(_q, {"capacity": 51, "prompt_cache_gb": 0})[0] is not None)
+check("with a draft model the price is the pool's: 36 refused, 35 accepted",
+      _price(_d, {"capacity": 36})[0] is not None and _price(_d, {"capacity": 35})[0] is None)
+_x = _session(explicit=43)
+check("a cache change alone is priced when the capacity was set explicitly at launch",
+      _price(_x, {"prompt_cache_gb": 8})[0] is not None
+      and _price(_x, {"prompt_cache_gb": 0.25})[0] is None)
+check("...and passes when the planner chose it, because the reload re-plans around the cache",
+      _price(_q, {"prompt_cache_gb": 8}) == (None, {"prompt_cache_gb": 8.0}))
+_over = _session(planned_from=60, explicit=60)           # started over plan with --residency
+check("a session over plan can step down even while still above the plan",
+      _price(_over, {"capacity": 55})[0] is None)
+check("...but not by also raising its cache, and not upward",
+      _price(_over, {"capacity": 55, "prompt_cache_gb": 1.0})[0] is not None
+      and _price(_over, {"capacity": 61})[0] is not None)
+check("a fraction is priced as the slots it becomes: 0.2 (51) refused, 0.16 (41) accepted",
+      _price(_q, {"capacity": 0.2})[0] is not None
+      and _price(_q, {"capacity": 0.16}) == (None, {"capacity": 0.16}))
+_bad = [{"capacity": v} for v in ("abc", None and 0, 0, -1, 300, _math.nan, _math.inf)]
+_bad += [{"prompt_cache_gb": v} for v in ("abc", -1, 9, _math.nan)]
+_bad = [b for b in _bad if list(b.values())[0] is not None]
+check("hostile values are refused with a message, never raised",
+      all(isinstance(_price(_q, b)[0], str) for b in _bad),
+      str([b for b in _bad if not isinstance(_price(_q, b)[0], str)]))
+
+# AND THROUGH THE REAL HANDLER, so the wiring is proven by a refusal over HTTP, not by a string.
+from _fakeserver import fake_server as _fake, post as _fpost, FakeSession as _FS  # noqa: E402
+_fs = _FS()
+for _k, _v in vars(_session()).items():
+    if _k != "slot_room":
+        setattr(_fs, _k, _v)
+_fs.slot_room = _types.MethodType(_Sess.slot_room, _fs)
+with _fake(_fs) as (_url, _state, _):
+    _st, _body, _ = _fpost(_url, "/v1/config", {"capacity": 65})
+check("/v1/config over HTTP refuses 65 with the planner's number",
+      _st == 400 and "most that fits is 43" in json.dumps(_body), f"{_st} {_body}")
+
 # A SLIDER MUST SHOW THE SETTING, NOT ITS CONSEQUENCE. With whole layers in play the residency
 # a user asks for and the residency the streamed layers end up with are different numbers -- 12
 # becomes one full layer plus 9 slots elsewhere, and `capacity` reports the 9. Seeding from it
