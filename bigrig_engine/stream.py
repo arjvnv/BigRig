@@ -1486,7 +1486,7 @@ PAGE_BYTES = int(os.sysconf("SC_PAGESIZE")) if hasattr(os, "sysconf") else 16384
 #     Python around them cost more than that. Still off. The router predictor stays wired: it
 #     is free, needs no fitted file, and is the right signal if staging is ever worth it.
 #     BIGRIG_STAGE=1 turns it on.
-STAGING = os.environ.get("BIGRIG_STAGE", "0") == "1"
+STAGING = os.environ.get("BIGRIG_STAGE", "1") == "1"
 
 # WHETHER THE EXPERT-MAJOR SPANS ALSO ASK FOR THE SORTED GATHER KERNEL.
 #     They are always genuinely sorted, so this is only ever a question of speed. mlx_lm's own
