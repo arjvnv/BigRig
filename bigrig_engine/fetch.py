@@ -41,6 +41,7 @@ from dataclasses import dataclass
 
 F_NOCACHE = 48                 # macOS: read around the unified buffer cache
 DEFAULT_THREADS = 8            # measured optimum on M4; calibrate_threads() re-measures per host
+WARM_THREADS = 4               # background next-layer cache warming (see ExpertFetcher.warm)
 DEFAULT_CHUNK = 4 << 20        # per-syscall read size
 
 
@@ -224,6 +225,28 @@ class WeightStore:
         if offset < 0 or length < 0 or offset + length > size:
             return None
         return memoryview(mm)[offset:offset + length]
+
+    def warm_region(self, path: str, offset: int, length: int) -> bool:
+        """Pull one region's pages into the page cache if they are not there. True if it read.
+
+        The background half of next-layer prefetch: same file, same offset, same length as the
+        view ensure() will later wrap, so the only effect is WHEN the pages arrive.
+        """
+        with self._map_lock:
+            ent = self._maps.get(path)
+        if ent is None:
+            if self.region_view(path, offset, length) is None:      # creates the map
+                return False
+            with self._map_lock:
+                ent = self._maps.get(path)
+        _mm, _size, fd, base = ent
+        if pages_resident(base + offset, length):
+            return False
+        try:
+            os.pread(fd, length, offset)
+            return True
+        except OSError:
+            return False
 
     def close_maps(self) -> None:
         with self._map_lock:
@@ -467,12 +490,51 @@ class ParallelFetcher:
                     "seconds": self.seconds, "throughput_gbs": gbs,
                     "n_fetches": self.n_fetches, "threads": self.threads}
 
+    def warm(self, keys, max_queued: int = 64) -> int:
+        """Warm these keys' pages into the page cache on a separate pool; return at once.
+
+        A SEPARATE POOL, so a guess about the next layer is never queued ahead of a read the
+        current layer is waiting for. Bounded: past `max_queued` outstanding regions new
+        guesses are skipped rather than allowed to build a backlog. Returns regions queued.
+        """
+        if self._closed:
+            return 0
+        if getattr(self, "_warm_pool", None) is None:
+            self._warm_pool = ThreadPoolExecutor(max_workers=WARM_THREADS,
+                                                 thread_name_prefix="bigrig-warm")
+            self._warm_queued = 0
+            self.warm_issued = 0
+            self.warm_read = 0
+
+        def job(seg):
+            try:
+                if self.store.warm_region(seg.path, seg.offset, seg.length):
+                    self.warm_read += 1
+            finally:
+                with self._lock:
+                    self._warm_queued -= 1
+
+        n = 0
+        for k in keys:
+            for seg in self.store.segments(k):
+                with self._lock:
+                    if self._warm_queued >= max_queued:
+                        return n
+                    self._warm_queued += 1
+                self._warm_pool.submit(job, seg)
+                self.warm_issued += 1
+                n += 1
+        return n
+
     def close(self) -> None:
         with self._lock:
             if self._closed:
                 return
             self._closed = True
         self._pool.shutdown(wait=True)
+        wp = getattr(self, "_warm_pool", None)
+        if wp is not None:
+            wp.shutdown(wait=True)
 
     def __enter__(self):
         return self
