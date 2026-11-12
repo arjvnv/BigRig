@@ -1,8 +1,10 @@
-"""Race for card `llamacpp-race-16gb`: BigRig against llama.cpp on a simulated 16 GB Mac.
+"""Race for card `llamacpp-race-16gb-2`: BigRig against llama.cpp on a simulated 16 GB Mac.
 
 SAME MACHINE FOR BOTH
-    This 24 GB Mac with the climb's 8 GB random-data balloon held for the whole run: the page
-    cache a 16 GB Mac would have. Each engine gets its own best settings for that machine, chosen
+    This 24 GB Mac with a random-data balloon held for the whole run, sized before each run to
+    top memory in use (anonymous + wired + compressed) up to 14 GB, at most 8 GB: the room a 16 GB
+    Mac leaves for the engine and page cache, whatever else is open (a fixed 8 GB balloon with a
+    browser open pushed swap +1.6 GB on 2026-11-12; card -2 had the fixed balloon). Each engine gets its own best settings for that machine, chosen
     by a fixed sweep (one run per setting), then the two winners race in 12 interleaved rounds.
 
 SAME MODEL, EACH ENGINE'S OWN 4-BIT FORMAT
@@ -42,7 +44,7 @@ import threading
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CARD = "llamacpp-race-16gb"
+CARD = "llamacpp-race-16gb-2"
 ESTIMATOR_ID = "race-paired-logratio-t95-v1"
 MODEL = os.path.join(ROOT, "models", "Qwen3.6-35B-A3B-4bit")
 GGUF = os.path.join(ROOT, "models", "Qwen3.6-35B-A3B-GGUF", "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf")
@@ -55,7 +57,7 @@ MAX_TOKENS = 128
 LONG_MAX_TOKENS = 32
 README_COMMIT = "626c47a29abbabc94a627da546bcd7cc2b654dcf"
 LONG_CHARS = 6000
-CONFIRM_CARD = "warm-ahead-confirm-2"
+CONFIRM_CARD = "warm-ahead-confirm-3"
 BIGRIG_COMMITS = {"base": "6e87fcd4030a4f79493f8c4156fa5f3b098e9ae6",
                   "warm": "1c89e3df5aa4c40ad85fdc642357cbd8dc972091",
                   "warm_fast": "0a9bf849f5231711dc070221264ce3addbcb1884"}
@@ -80,7 +82,9 @@ HEAVIER = {"bigrig-7.5": ["bigrig-9.0"], "llama-ncmoe34-t4": ["llama-ncmoe28-t4"
 RACE_ROUNDS = 12
 SWAP_GROWTH_MAX_GB = 1.0
 EXTRA_MEM_MAX_GB = 11.0
-BALLOON_MIN_GB = 7.5
+TARGET_USED_GB = 14.0
+BALLOON_KEEP = 0.9
+BUSY_WAIT_S = 900
 RUN_TIMEOUT_S = 900
 KEYWORDS = ["heat", "def fib", "9:40"]   # one per climb prompt, inside any competent first 128 tokens
 
@@ -301,8 +305,8 @@ def unhealthy(res) -> list:
             why.append(f"reply only {r['tokens']} tokens")
         if any(flat.count(flat[i:i + 20]) >= 5 for i in range(0, max(0, len(flat) - 20), 10)):
             why.append("reply repeats itself")
-    if res["balloon_end_gb"] < BALLOON_MIN_GB:
-        why.append(f"balloon squeezed to {res['balloon_end_gb']} GB")
+    if res["balloon_start_gb"] <= 0 or res["balloon_end_gb"] < BALLOON_KEEP * res["balloon_start_gb"]:
+        why.append(f"balloon {res['balloon_start_gb']} -> {res['balloon_end_gb']} GB")
     if res["engine"] == "bigrig":
         # Not gated on the locked reference: BigRig's reply depends on the expert plan it picks
         # from the memory free at start (trial 2026-11-12: 11 slots left the 8-slot reference at
@@ -411,13 +415,22 @@ def main():
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(("BIGRIG_", "LLAMA_")) and k not in ("LAB_RESULTS", "LAB_RUN_DIR")}
     env["HF_HUB_OFFLINE"] = "1"
-    bal = ["--balloon-gb", "0" if a.smoke else str(BALLOON_GB)]
-    configs = {n: ["--worker", "bigrig", "--arm-dir", arm_dir, "--budget", str(b), *bal] for n, b in BIGRIG_GRID}
-    configs.update({n: ["--worker", "llama", "--flags", json.dumps(f), *bal] for n, f in LLAMA_GRID})
+    configs = {n: ["--worker", "bigrig", "--arm-dir", arm_dir, "--budget", str(b)] for n, b in BIGRIG_GRID}
+    configs.update({n: ["--worker", "llama", "--flags", json.dumps(f)] for n, f in LLAMA_GRID})
+    res["target_used_gb"] = TARGET_USED_GB
 
     def one(name, tag):
         out = os.path.join(work, tag + ".json")
-        p = subprocess.Popen([sys.executable, os.path.abspath(__file__), *configs[name], "--out", out], cwd=ROOT,
+        before, waited = mac_state(), 0
+        while not a.smoke and before["used_gb"] > TARGET_USED_GB:
+            if waited >= BUSY_WAIT_S:
+                stop(f"memory in use {before['used_gb']} GB above the {TARGET_USED_GB} GB target for 15 min")
+            time.sleep(30)
+            waited += 30
+            before = mac_state()
+        bgb = 0.0 if a.smoke else round(min(BALLOON_GB, TARGET_USED_GB - before["used_gb"]), 2)
+        p = subprocess.Popen([sys.executable, os.path.abspath(__file__), *configs[name], "--balloon-gb", str(bgb),
+                              "--out", out], cwd=ROOT,
                              env=env, stdin=subprocess.DEVNULL, stdout=open(out + ".log", "w"),
                              stderr=subprocess.STDOUT, start_new_session=True)
         t0, killed, peak_extra, swap_max = time.time(), None, 0.0, 0.0
@@ -439,6 +452,7 @@ def main():
                     p.wait()
                 break
         r = {"config": name, "tag": tag, "killed": killed, "exit": p.returncode, "wall_s": round(time.time() - t0, 1),
+             "balloon_gb": bgb, "used_before_gb": before["used_gb"],
              "peak_extra_gb": round(peak_extra, 3), "swap_growth_max_gb": round(swap_max, 3)}
         if killed == "power left AC":
             stop(f"power left AC during {tag}")

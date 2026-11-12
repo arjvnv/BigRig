@@ -1,4 +1,12 @@
-"""Confirm run for card `warm-ahead-confirm-2`: do the climb's two decode speed-ups hold up?
+"""Confirm run for card `warm-ahead-confirm-3`: do the climb's two decode speed-ups hold up?
+
+BALLOON SIZED TO A FIXED TOTAL (why there is a -3): a fixed 8 GB balloon simulates a 16 GB Mac only
+when little else is open. On 2026-11-12 with a browser open (memory in use 10 GB before any run)
+it pushed swap +1.6 GB in 11 minutes and the swap guard stopped the run. So before each balloon
+run the balloon tops memory in use (anonymous + wired + compressed, as lab run counts it) up to
+TARGET_USED_GB, at most 8 GB: the engine and page cache then get the same room whatever else is
+open. 14 GB is about last night's level (quiet Mac + 8 GB balloon; those 18 climb runs grew swap
+by 0 MB). The balloon is started by this harness around the locked eval, which runs --no-balloon.
 
 PLAN PINNED (why there is a -2): BigRig chooses its expert plan from the memory free at start, and
 the reply depends on that plan. A trial on 2026-11-12 with more memory free got 11 slots a layer
@@ -14,7 +22,7 @@ ARMS (bigrig_engine/ exported from git at each commit; nothing else differs)
     warm_fast  0a9bf84  + decode host fast path (climb iter 8, on top of iter 5)
 
 REGIMES (the locked bench/climb_decode.py, unchanged, run once per arm per round)
-    16gb       6.1 GB budget, 8 GB balloon: the page cache a 16 GB Mac would have. 18 rounds.
+    16gb       6.1 GB budget, balloon topping memory in use up to 14 GB (at most 8 GB). 18 rounds.
     24gb_warm  same, --no-balloon: page cache holds most of the weights. No-regression guard. 12 rounds.
 
     Each regime starts with one discarded warm-up round (thermal state, page cache). Round r
@@ -27,7 +35,8 @@ ESTIMATOR (estimator_id below; the card's decision rule reads these numbers)
     97.5% rather than 95% because the card asks two primary questions (Bonferroni).
 
 STOPS (kill criteria): any reply not exact; Mac not on AC power; swap more than 1.5 GB above
-the start; memory pressure critical; the balloon squeezed below 7.5 GB; a run that fails or
+the start; memory pressure critical; the balloon squeezed below 90% of its start; memory in use
+above the target for 15 minutes before a balloon run; a run that fails or
 times out twice in one arm; an arm whose capacity differs; code loaded from the wrong arm.
 """
 import itertools
@@ -43,7 +52,7 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CLIMB = os.path.join(ROOT, "bench", "climb_decode.py")
-CARD = "warm-ahead-confirm-2"
+CARD = "warm-ahead-confirm-3"
 PIN = {"capacity": 8, "full_layers": ()}
 ESTIMATOR_ID = "paired-logratio-t9875-v1"
 ARMS = {
@@ -51,11 +60,15 @@ ARMS = {
     "warm": "1c89e3df5aa4c40ad85fdc642357cbd8dc972091",
     "warm_fast": "0a9bf849f5231711dc070221264ce3addbcb1884",
 }
-REGIMES = [("16gb", [], 18), ("24gb_warm", ["--no-balloon"], 12)]
+# (name, balloon on, scored rounds). The locked eval always runs --no-balloon; the shim holds the balloon.
+REGIMES = [("16gb", True, 18), ("24gb_warm", False, 12)]
+TARGET_USED_GB = 14.0
+BALLOON_MAX_GB = 8.0
+BALLOON_KEEP = 0.9
+BUSY_WAIT_S = 900
 ORDERS = list(itertools.permutations(ARMS))
 RUN_TIMEOUT_S = 420
 SWAP_GROWTH_MAX_GB = 1.5
-BALLOON_MIN_GB = 7.5
 ALPHA = 0.025
 
 # Loads bigrig_engine from the arm's export, then runs the locked eval file unchanged. The
@@ -63,9 +76,14 @@ ALPHA = 0.025
 # every bigrig_engine.* submodule resolves through the already-imported package's __path__.
 SHIM = r"""
 import json, runpy, sys
-arm, prov, climb, pin = sys.argv[1], sys.argv[2], sys.argv[3], json.loads(sys.argv[4])
+import importlib.util
+arm, prov, climb, pin, bgb = sys.argv[1], sys.argv[2], sys.argv[3], json.loads(sys.argv[4]), float(sys.argv[5])
 sys.path.insert(0, arm)
 import bigrig_engine
+from bigrig_engine.calibrate import phys_footprint_gb
+_spec = importlib.util.spec_from_file_location("climb_decode_lib", climb)
+_cdl = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_cdl)
 import bigrig_engine.session as _bs
 _init, _seen = _bs.Session.__init__, []
 
@@ -76,14 +94,21 @@ def _pinned(self, *a, **k):
     _seen.append({"capacity": st.get("capacity"), "full_layers": st.get("full_layers")})
 
 _bs.Session.__init__ = _pinned
-sys.argv = [climb] + sys.argv[5:]
+sys.argv = [climb] + sys.argv[6:]
+balloon, b0 = _cdl.start_balloon(bgb) if bgb > 0 else (None, 0.0)
+b1 = 0.0
 try:
     runpy.run_path(climb, run_name="__main__")
 finally:
+    if balloon is not None:
+        b1 = phys_footprint_gb(balloon.pid)
+        balloon.stdin.close()
+        balloon.wait(timeout=30)
     with open(prov, "w") as f:
         json.dump({"modules": {n: getattr(m, "__file__", None) for n, m in list(sys.modules.items())
                                if n == "bigrig_engine" or n.startswith("bigrig_engine.")},
-                   "plan": _seen}, f)
+                   "plan": _seen, "balloon_gb": bgb, "balloon_start_gb": round(b0, 2),
+                   "balloon_end_gb": round(b1, 2)}, f)
 """
 
 
@@ -112,7 +137,17 @@ def mac_state() -> dict:
     swap = re.search(r"used = ([\d.]+)M", sh(["sysctl", "vm.swapusage"]))
     return {"ac_power": "AC Power" in sh(["pmset", "-g", "batt"]).splitlines()[0],
             "swap_used_gb": round(float(swap.group(1)) / 1024, 3) if swap else None,
-            "pressure": int(sh(["sysctl", "-n", "kern.memorystatus_vm_pressure_level"]).strip() or 0)}
+            "pressure": int(sh(["sysctl", "-n", "kern.memorystatus_vm_pressure_level"]).strip() or 0),
+            "used_gb": round(used_mem_gb(), 3)}
+
+
+def used_mem_gb() -> float:
+    """Anonymous + wired + compressed memory, as `lab run` counts it (file cache excluded)."""
+    out = sh(["vm_stat"])
+    page = int(re.search(r"page size of (\d+)", out).group(1))
+    v = {k.strip(): int(n) for k, n in re.findall(r"^([^:\n]+):\s+(\d+)\.?$", out, re.M)}
+    return (v.get("Anonymous pages", 0) - v.get("Pages purgeable", 0) + v.get("Pages wired down", 0)
+            + v.get("Pages occupied by compressor", 0)) * page / 1e9
 
 
 def export_arms(dest: str) -> dict:
@@ -195,7 +230,8 @@ def main():
     work = os.environ.get("LAB_RUN_DIR") or tempfile.mkdtemp()
     start = mac_state()
     res = {"estimator_id": ESTIMATOR_ID, "card": CARD, "complete": False, "mac_start": start,
-           "regimes": {g: {"flags": f, "rounds": n} for g, f, n in REGIMES}, "rows": []}
+           "regimes": {g: {"balloon": b, "rounds": n} for g, b, n in REGIMES},
+           "target_used_gb": TARGET_USED_GB, "rows": []}
 
     def save():
         with open(res_path, "w") as f:
@@ -215,7 +251,7 @@ def main():
            if not k.startswith("BIGRIG_") and k not in ("LAB_RESULTS", "LAB_RUN_DIR")}
     failures = {}
     capacity = {}
-    for regime, flags, n_rounds in REGIMES:
+    for regime, with_balloon, n_rounds in REGIMES:
         if res["rows"]:
             res["finished_regimes"] = {g: {k: paired(res["rows"], g, n, d) for k, (n, d) in
                                            {"warm_vs_base": ("warm", "base"), "warm_fast_vs_warm": ("warm_fast", "warm")}.items()}
@@ -231,12 +267,22 @@ def main():
                     stop("memory pressure critical")
                 if st["swap_used_gb"] - start["swap_used_gb"] > SWAP_GROWTH_MAX_GB:
                     stop(f"swap grew {st['swap_used_gb'] - start['swap_used_gb']:.2f} GB")
+                bgb = 0.0
+                if with_balloon:
+                    waited = 0
+                    while st["used_gb"] > TARGET_USED_GB:
+                        if waited >= BUSY_WAIT_S:
+                            stop(f"memory in use {st['used_gb']} GB above the {TARGET_USED_GB} GB target for 15 min")
+                        time.sleep(30)
+                        waited += 30
+                        st = mac_state()
+                    bgb = round(min(BALLOON_MAX_GB, TARGET_USED_GB - st["used_gb"]), 2)
                 tag = f"{regime}-r{rd:02d}-{arm}"
                 out, prov = (os.path.join(work, f"{tag}.{x}.json") for x in ("result", "prov"))
                 t0 = time.time()
                 try:
                     p = subprocess.run([sys.executable, "-c", SHIM, res["arms"][arm]["dir"], prov, CLIMB,
-                                        json.dumps(PIN), "--out", out, *flags], cwd=ROOT, env=env, stdin=subprocess.DEVNULL,
+                                        json.dumps(PIN), str(bgb), "--out", out, "--no-balloon"], cwd=ROOT, env=env, stdin=subprocess.DEVNULL,
                                        timeout=RUN_TIMEOUT_S)
                     ok = p.returncode == 0 and os.path.exists(out)
                 except subprocess.TimeoutExpired:
@@ -256,14 +302,15 @@ def main():
                     stop(f"{tag} plan {provj['plan']} is not the pinned one")
                 r = json.load(open(out))
                 row = {"regime": regime, "round": rd, "pos": pos, "arm": arm, "wall_s": wall,
-                       "mac_before": st, "plan": provj["plan"], **r}
+                       "mac_before": st, "plan": provj["plan"], **r,
+                       **{k: provj[k] for k in ("balloon_gb", "balloon_start_gb", "balloon_end_gb")}}
                 res["rows"].append(row)
                 save()
                 print(f"{tag}: {r['decode_tok_s']} tok/s, ttft {r['ttft_s']} s, exact {r['exact']}", flush=True)
                 if r["exact"] != 1:
                     stop(f"{tag} reply not exact")
-                if not flags and r["balloon_end_gb"] < BALLOON_MIN_GB:
-                    stop(f"{tag} balloon squeezed to {r['balloon_end_gb']} GB")
+                if bgb > 0 and provj["balloon_end_gb"] < BALLOON_KEEP * provj["balloon_start_gb"]:
+                    stop(f"{tag} balloon squeezed {provj['balloon_start_gb']} -> {provj['balloon_end_gb']} GB")
                 if capacity.setdefault(regime, r["capacity"]) != r["capacity"]:
                     stop(f"{tag} capacity {r['capacity']} differs from {capacity[regime]}")
     res.update(analyse(res["rows"]))
