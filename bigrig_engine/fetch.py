@@ -100,7 +100,7 @@ def pages_resident(addr: int, length: int) -> bool:
         vec = ctypes.create_string_buffer(n)
         if _libc.mincore(start, n * _PAGE, vec) != 0:
             return True
-        return bool(np.all(np.frombuffer(vec.raw, dtype=np.uint8) & 1))
+        return all(b & 1 for b in vec.raw)
     except Exception:                            # noqa: BLE001 -- never let a hint become a fault
         return True
 

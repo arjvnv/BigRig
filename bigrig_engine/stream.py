@@ -620,10 +620,7 @@ class ExpertPool:
         """Place expert e's packed bytes into a slot and return the slot index."""
         if not self._built:
             raise RuntimeError("build() must run before admit()")
-        want = getattr(self, "_expert_nbytes", None)
-        if want is None:
-            want = self._expert_nbytes = sum(c["nbytes"] for pr in self.spec.values()
-                                             for c in pr.values())
+        want = sum(c["nbytes"] for pr in self.spec.values() for c in pr.values())
         if len(blob) != want:
             # Checked BEFORE any slot is touched. Letting numpy discover it mid-write leaves the
             # slot half-overwritten with one expert's head and another's tail -- still a valid
@@ -659,28 +656,25 @@ class ExpertPool:
         flat = None
         if ZERO_COPY and isinstance(blob, memoryview):
             arr = np.frombuffer(blob, dtype=np.uint8)
-            if (arr.__array_interface__["data"][0] % PAGE_BYTES == 0
-                    and arr.nbytes % PAGE_BYTES == 0):
+            if arr.ctypes.data % PAGE_BYTES == 0 and arr.nbytes % PAGE_BYTES == 0:
                 try:
                     flat = mx.from_dlpack(arr)
                     self.zero_copy_admits += 1
                 except Exception:                 # noqa: BLE001 -- the copy path is always right
                     flat = None
-        metas = getattr(self, "_comp_metas", None)
-        if metas is None:
-            metas = self._comp_metas = [(m["nbytes"], getattr(mx, m["dtype"]), m["shape"])
-                                        for proj in self.projections
-                                        for m in self.spec[proj].values()]
-        for n, dt, shape in metas:
-            if flat is not None:
-                out.append(flat[pos:pos + n].view(dt).reshape(shape))
-            else:
-                # Explicit count, never count=-1: frombuffer with -1 raises whenever the
-                # remaining tail is not a whole multiple of the itemsize, which turns a
-                # benign layout question into a crash mid-generation.
-                raw = np.frombuffer(blob, dtype=np.uint8, count=n, offset=pos)
-                out.append(mx.array(raw).view(dt).reshape(shape))
-            pos += n
+        for proj in self.projections:
+            for comp, meta in self.spec[proj].items():
+                n = meta["nbytes"]
+                dt = getattr(mx, meta["dtype"])
+                if flat is not None:
+                    out.append(flat[pos:pos + n].view(dt).reshape(meta["shape"]))
+                else:
+                    # Explicit count, never count=-1: frombuffer with -1 raises whenever the
+                    # remaining tail is not a whole multiple of the itemsize, which turns a
+                    # benign layout question into a crash mid-generation.
+                    raw = np.frombuffer(blob, dtype=np.uint8, count=n, offset=pos)
+                    out.append(mx.array(raw).view(dt).reshape(meta["shape"]))
+                pos += n
         if pos != len(blob):
             raise ValueError(
                 f"expert {e}: manifest accounts for {pos} bytes but the region is {len(blob)}. "
@@ -1123,46 +1117,6 @@ class StreamingSwitchGLU(nn.Module):
         inv = np.argsort(order, kind="stable")
         return y[mx.array(inv)]
 
-    def _forward_views_one(self, xf, row, arrays_for):
-        """DECODE: one token, k distinct experts, in the caller's order.
-
-        _forward_views sorts the pairs by expert, gathers each expert's rows out of `xf`, and
-        gathers the results back into the caller's order. With one token every expert's rows ARE
-        `xf` and there is nothing to reorder, so this computes each expert straight off `xf` in
-        row order: the same quantized_matmul on the same values, minus a gather per expert, the
-        inverse gather and the numpy sort around them.
-        """
-        pool = self._pool
-        lay = getattr(self, "_views_layout", None)
-        if lay is None:
-            comps = [(p, c) for p in pool.projections for c in pool.spec[p]]
-            lay = {p: tuple(comps.index((p, c)) if (p, c) in comps else None
-                            for c in ("weight", "scales", "biases", "bias"))
-                   for p in pool.projections}
-            self._views_layout = lay
-        quant, q = self._quantized, self._q
-
-        def proj(a, name, inp):
-            iw, isc, ib, ibias = lay[name]
-            if quant:
-                y = mx.quantized_matmul(inp, a[iw], None if isc is None else a[isc],
-                                        None if ib is None else a[ib], transpose=True,
-                                        group_size=q["group_size"], bits=q["bits"],
-                                        mode=q["mode"])
-            else:
-                y = inp @ a[iw].T
-            return y if ibias is None else y + a[ibias]
-
-        outs = []
-        for e in row:
-            a = arrays_for(int(e))
-            if pool.gated:
-                up, gate = proj(a, "up_proj", xf), proj(a, "gate_proj", xf)
-                outs.append(proj(a, "down_proj", self._activation(up, gate)))
-            else:
-                outs.append(proj(a, "fc2", self._activation(proj(a, "fc1", xf))))
-        return mx.concatenate(outs, axis=0)
-
     def _forward_pairs(self, x, slots, arrays=None):
         """The three projections over (token, expert) pairs already grouped by expert.
 
@@ -1309,7 +1263,7 @@ class StreamingSwitchGLU(nn.Module):
         #     it cuts its own spans -- put that loop on the critical path of every prefill call
         #     for nothing. One row's worth of distinct experts fitting in the pool is the whole
         #     question, and `np.unique` answers it in C.
-        if flat.shape[0] == 1 or len(np.unique(flat)) <= C:
+        if len(np.unique(flat)) <= C:
             # ISSUING THE RESIDENT EXPERTS' ROWS BEFORE COPYING THE MISSED ONES IN DOES NOT PAY.
             #     The rows of a gather_qmm are independent -- measured bit-for-bit, one gather
             #     over eight slots equals five-then-three equals eight singles -- so the hits
@@ -1332,11 +1286,7 @@ class StreamingSwitchGLU(nn.Module):
                 if getattr(self, "_warm_after", None):
                     self._fetcher.warm(self._warm_after)
                     self._warm_after = None
-                xf = x.reshape(-1, x.shape[-1])
-                if flat.shape[0] == 1 and len(set(flat[0].tolist())) == k:
-                    y = self._forward_views_one(xf, flat[0], self._pool.views_of)
-                else:
-                    y = self._forward_views(xf, flat, self._pool.views_of)
+                y = self._forward_views(x.reshape(-1, x.shape[-1]), flat, self._pool.views_of)
                 return y.reshape(*gi.shape[:-1], k, y.shape[-1])
             # Unchunked path: byte-for-byte the shape handling of the stock SwitchGLU, so the
             # C == E identity test exercises exactly the code the fast path runs.
