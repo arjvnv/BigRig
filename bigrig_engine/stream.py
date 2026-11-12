@@ -1117,46 +1117,6 @@ class StreamingSwitchGLU(nn.Module):
         inv = np.argsort(order, kind="stable")
         return y[mx.array(inv)]
 
-    def _forward_views_one(self, xf, row, arrays_for):
-        """DECODE: one token, k distinct experts, in the caller's order.
-
-        _forward_views sorts the pairs by expert, gathers each expert's rows out of `xf`, and
-        gathers the results back into the caller's order. With one token every expert's rows ARE
-        `xf` and there is nothing to reorder, so this computes each expert straight off `xf` in
-        row order: the same quantized_matmul on the same values, minus a gather per expert, the
-        inverse gather and the numpy sort around them.
-        """
-        pool = self._pool
-        lay = getattr(self, "_views_layout", None)
-        if lay is None:
-            comps = [(p, c) for p in pool.projections for c in pool.spec[p]]
-            lay = {p: tuple(comps.index((p, c)) if (p, c) in comps else None
-                            for c in ("weight", "scales", "biases", "bias"))
-                   for p in pool.projections}
-            self._views_layout = lay
-        quant, q = self._quantized, self._q
-
-        def proj(a, name, inp):
-            iw, isc, ib, ibias = lay[name]
-            if quant:
-                y = mx.quantized_matmul(inp, a[iw], None if isc is None else a[isc],
-                                        None if ib is None else a[ib], transpose=True,
-                                        group_size=q["group_size"], bits=q["bits"],
-                                        mode=q["mode"])
-            else:
-                y = inp @ a[iw].T
-            return y if ibias is None else y + a[ibias]
-
-        outs = []
-        for e in row:
-            a = arrays_for(int(e))
-            if pool.gated:
-                up, gate = proj(a, "up_proj", xf), proj(a, "gate_proj", xf)
-                outs.append(proj(a, "down_proj", self._activation(up, gate)))
-            else:
-                outs.append(proj(a, "fc2", self._activation(proj(a, "fc1", xf))))
-        return mx.concatenate(outs, axis=0)
-
     def _forward_pairs(self, x, slots, arrays=None):
         """The three projections over (token, expert) pairs already grouped by expert.
 
@@ -1316,11 +1276,7 @@ class StreamingSwitchGLU(nn.Module):
                 # VIEWS MODE: residency is the pool's business as before; the arithmetic runs on
                 # the resident views, one expert at a time. See VIEWS_DECODE.
                 self.ensure(gi)
-                xf = x.reshape(-1, x.shape[-1])
-                if flat.shape[0] == 1 and len(set(flat[0].tolist())) == k:
-                    y = self._forward_views_one(xf, flat[0], self._pool.views_of)
-                else:
-                    y = self._forward_views(xf, flat, self._pool.views_of)
+                y = self._forward_views(x.reshape(-1, x.shape[-1]), flat, self._pool.views_of)
                 return y.reshape(*gi.shape[:-1], k, y.shape[-1])
             # Unchunked path: byte-for-byte the shape handling of the stock SwitchGLU, so the
             # C == E identity test exercises exactly the code the fast path runs.
