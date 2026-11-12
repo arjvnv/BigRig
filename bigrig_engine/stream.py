@@ -1277,6 +1277,10 @@ class StreamingSwitchGLU(nn.Module):
                 # the resident views, one expert at a time. See VIEWS_DECODE.
                 self.ensure(gi)
                 y = self._forward_views(x.reshape(-1, x.shape[-1]), flat, self._pool.views_of)
+                if flat.shape[0] == 1:
+                    # DECODE: start the experts on the GPU now, so they run while the host builds
+                    # the next layer's attention and router instead of after it. Same graph.
+                    mx.async_eval(y)
                 return y.reshape(*gi.shape[:-1], k, y.shape[-1])
             # Unchunked path: byte-for-byte the shape handling of the stock SwitchGLU, so the
             # C == E identity test exercises exactly the code the fast path runs.
