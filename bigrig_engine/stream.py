@@ -1209,8 +1209,7 @@ class StreamingSwitchGLU(nn.Module):
         if STAGING:
             self._stage_predicted()
         pred = None
-        warm = PREFETCH_WARM and x.reshape(-1, x.shape[-1]).shape[0] == 1
-        if (STAGING or warm) and self._next is not None and self._pred_m > 0 and (
+        if STAGING and self._next is not None and self._pred_m > 0 and (
                 self._next_gate is not None or self._pred_w is not None):
             xf = x.reshape(-1, x.shape[-1])[:1]
             if self._next_gate is not None:
@@ -1238,11 +1237,7 @@ class StreamingSwitchGLU(nn.Module):
         gi = np.array(indices, copy=False).astype(np.int64)
         self.sync_seconds += time.perf_counter() - _t
         if pred is not None:
-            p_np = np.array(pred)
-            if warm:
-                nxt = self._next
-                self._fetcher.warm([(nxt.layer, int(e)) for e in p_np if nxt.g2s[int(e)] < 0])
-            self._speculate(p_np)
+            self._speculate(np.array(pred))
         k = gi.shape[-1]
         C = self._pool.capacity
         if k > C:
@@ -1492,13 +1487,6 @@ PAGE_BYTES = int(os.sysconf("SC_PAGESIZE")) if hasattr(os, "sysconf") else 16384
 #     is free, needs no fitted file, and is the right signal if staging is ever worth it.
 #     BIGRIG_STAGE=1 turns it on.
 STAGING = os.environ.get("BIGRIG_STAGE", "0") == "1"
-
-# WARM THE NEXT LAYER'S PAGES IN THE BACKGROUND, IN DECODE. Right after a layer's routing read the
-# next layer's own router has named its likely experts (recall@8 83.6% on Qwen3.6); those not in
-# the next pool are pread into the page cache on a separate small pool while this layer loads its
-# own experts and the next layer's attention runs. Only WHEN pages arrive changes; ensure() still
-# admits exactly what the real router selected. BIGRIG_PREFETCH_WARM=0 turns it off.
-PREFETCH_WARM = os.environ.get("BIGRIG_PREFETCH_WARM", "1") == "1"
 
 # WHETHER THE EXPERT-MAJOR SPANS ALSO ASK FOR THE SORTED GATHER KERNEL.
 #     They are always genuinely sorted, so this is only ever a question of speed. mlx_lm's own
