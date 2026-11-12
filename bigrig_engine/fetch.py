@@ -42,7 +42,6 @@ from dataclasses import dataclass
 F_NOCACHE = 48                 # macOS: read around the unified buffer cache
 DEFAULT_THREADS = 8            # measured optimum on M4; calibrate_threads() re-measures per host
 WARM_THREADS = 4               # background next-layer cache warming (see ExpertFetcher.warm)
-DEFER_COLD = os.environ.get("BIGRIG_DEFER_COLD", "1") == "1"   # see WeightStore.region_view
 DEFAULT_CHUNK = 4 << 20        # per-syscall read size
 
 
@@ -208,18 +207,11 @@ class WeightStore:
                 self.warm_probes += 1
                 if not pages_resident(base + offset, length):
                     self._full_until = n + FULL_AFTER_COLD
-                    later = getattr(self, "read_later", None)
-                    if later is not None:
-                        # DEFERRED: the view needs no bytes yet, only the GPU does, later. Queued
-                        # on the fetcher's defer pool so this caller returns at once.
-                        later(fd, length, offset)
+                    try:
+                        os.pread(fd, length, offset)   # fills the page cache; the bytes are dropped
                         self.warm_reads += 1
-                    else:
-                        try:
-                            os.pread(fd, length, offset)   # fills the page cache; bytes dropped
-                            self.warm_reads += 1
-                        except OSError:
-                            pass                       # the view is still right; it will just fault
+                    except OSError:
+                        pass                           # the view is still right; it will just fault
         return view
 
     @staticmethod
@@ -323,21 +315,6 @@ class ParallelFetcher:
         self.mapped = bool(mapped) and not nocache
         self._pool = ThreadPoolExecutor(max_workers=threads,
                                         thread_name_prefix="bigrig-fetch")
-        # COLD READS DEFERRED OFF THE CALLER (see WeightStore.region_view): a separate pool, so a
-        # deferred read never waits behind the fetch pool's own work or a speculative warm.
-        self._defer_pool = None
-        if self.mapped and DEFER_COLD:
-            self._defer_pool = ThreadPoolExecutor(max_workers=threads,
-                                                  thread_name_prefix="bigrig-defer")
-
-            def _read_later(fd, length, offset, _p=self._defer_pool):
-                def job():
-                    try:
-                        os.pread(fd, length, offset)
-                    except OSError:
-                        pass
-                _p.submit(job)
-            store.read_later = _read_later
         self._inflight: dict = {}
         self._lock = threading.Lock()
         self._closed = False
@@ -558,9 +535,6 @@ class ParallelFetcher:
         wp = getattr(self, "_warm_pool", None)
         if wp is not None:
             wp.shutdown(wait=True)
-        if getattr(self, "_defer_pool", None) is not None:
-            self.store.read_later = None
-            self._defer_pool.shutdown(wait=True)
 
     def __enter__(self):
         return self
