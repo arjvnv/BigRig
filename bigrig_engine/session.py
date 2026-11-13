@@ -243,6 +243,9 @@ PREFILL_ACT_BUDGET_GB = 0.70
 # an order that fetches each layer's experts once per prompt rather than once per chunk, with a
 # bit-identical cache. On unless BIGRIG_LAYERED_PREFILL=0; unsupported models fall back by themselves.
 LAYERED_PREFILL = os.environ.get("BIGRIG_LAYERED_PREFILL", "1") != "0"
+# How many experts per layer to read back into the page cache after a long layer-major prefill
+# (StreamHandle.rewarm): about what the chunked order leaves cached per layer on a 16 GB Mac.
+REWARM_EXPERTS = 96
 
 # What the pool must leave behind for the reply. autoconfig held back a flat 3.0 GB covering the
 # OS, the MLX runtime, the KV cache and activations -- tuned for this model, but a constant, so a
@@ -2158,12 +2161,16 @@ class Session:
                 maybe_quantize_kv_cache(one, quantized_kv_start=self.kv_quant_start,
                                         kv_group_size=KV_GROUP_SIZE, kv_bits=self.kv_bits)
                 cache[i] = one[0]
-        scope, h = None, self.handle
+        scope, h, ahead = None, self.handle, False
         if h is not None:
             ahead = h.routes_to_most_experts(len(tokens))
             scope = lambda li: h.prefill_layer(li, read_ahead=ahead)              # noqa: E731
-        return layered.prefill(self.model, tokens, pc, step, progress=progress, layer_scope=scope,
-                               settle=settle)
+        if not layered.prefill(self.model, tokens, pc, step, progress=progress, layer_scope=scope,
+                               settle=settle):
+            return False
+        if ahead:
+            h.rewarm(REWARM_EXPERTS)             # leave the page cache ready for the reply
+        return True
 
     def _prefill_layer_major(self, pc, prompt_in, gen_kw, prefill_step_size):
         """Read all but the prompt's last token layer by layer (layered.py); return what is left to read.

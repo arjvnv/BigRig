@@ -762,6 +762,7 @@ class StreamingSwitchGLU(nn.Module):
         self._held = None               # expert id -> prefill arrays kept across calls; see holding()
         self._ahead = []                # keys read_ahead() issued for this layer, released by holding()
         self._then = None               # holding()'s once-only hook after the first prefill fetch
+        self.prefill_routed = None      # per-expert routing counts of the last held prefill; see rewarm
         self.sync_seconds = 0.0
         self.bypass = False        # timing control; see __call__
         self._sync_free = False    # set by refresh() once the pool is known to be full
@@ -1097,6 +1098,7 @@ class StreamingSwitchGLU(nn.Module):
         layer's own reads on the fetch pool rather than in front of them.
         """
         self._held, self._then = {}, then
+        self.prefill_routed = np.zeros(self._pool.n_experts, dtype=np.int64)
         try:
             yield
         finally:
@@ -1122,6 +1124,11 @@ class StreamingSwitchGLU(nn.Module):
             return
         self._ahead = keys
 
+    def _count_routing(self, pe) -> None:
+        """Add one prefill call's routing to this layer's counts, inside holding() only."""
+        if self._held is not None:
+            self.prefill_routed += np.bincount(pe, minlength=self._pool.n_experts)
+
     def _prefill_arrays(self, experts):
         """Expert id -> device arrays for one prefill call, from page-cache views (see holding())."""
         pool = self._pool
@@ -1144,6 +1151,7 @@ class StreamingSwitchGLU(nn.Module):
         pool = self._pool
         k = flat.shape[1]
         pe = flat.reshape(-1)
+        self._count_routing(pe)
         order = np.argsort(pe, kind="stable")
         spe = pe[order]
         tok = order // k
@@ -1212,6 +1220,7 @@ class StreamingSwitchGLU(nn.Module):
         C = int(batch or pool.capacity)
         k = flat.shape[1]
         pe = flat.reshape(-1)
+        self._count_routing(pe)
         order = np.argsort(pe, kind="stable")
         spe = pe[order]
         tok = order // k
@@ -1740,6 +1749,26 @@ class StreamHandle:
         self.model, self.pools, self.mods = model, pools, mods
         self.fetcher, self.manifest = fetcher, manifest
         self.full_layers = list(full_layers)
+
+    def rewarm(self, per_layer: int) -> int:
+        """After a layer-major prefill, read each layer's `per_layer` most-routed experts into the
+        page cache, in parallel, before decode starts; returns how many were cold.
+
+        WHY. A layer-major read streams every layer's experts through the page cache in layer
+        order, so when it ends only the last layers' are still there, and the first decode tokens
+        found the rest cold: decode after a long prompt was 3.4% slower (climb iteration 2). The
+        experts a prompt routed to most are the best guess at what its reply will ask for, and
+        reading them here costs one parallel pass at full queue depth instead of one cold read per
+        layer per token. Experts already cached are read too, which marks them recently used so
+        this pass evicts other pages first. Changes no output: it only decides what is cached.
+        """
+        keys = []
+        for m in sorted((m for m in self.mods if m._pool is not None and m.prefill_routed is not None),
+                        key=lambda m: m._pool.layer):
+            counts = m.prefill_routed
+            top = np.argsort(-counts, kind="stable")[:per_layer]
+            keys += [(m._pool.layer, int(e)) for e in top if counts[e] > 0]
+        return self.fetcher.refresh(keys) if keys else 0
 
     def routes_to_most_experts(self, n_tokens: int) -> bool:
         """Whether a prefill of `n_tokens` is expected to route to nearly every expert of a layer.

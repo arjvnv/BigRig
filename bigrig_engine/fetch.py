@@ -209,20 +209,9 @@ class WeightStore:
             real file size, and the map is created once and never grown, so a file that changes
             later cannot silently extend what this hands out.
         """
-        with self._map_lock:
-            ent = self._maps.get(path)
-            if ent is None:
-                fd = os.open(path, os.O_RDONLY)
-                size = os.fstat(fd).st_size
-                if size == 0:
-                    os.close(fd)
-                    return None
-                mm = mmap.mmap(fd, size, access=mmap.ACCESS_READ)
-                # The map's base address, for `mincore`; taken once and the array let go, so
-                # nothing here keeps a buffer export open against `mm.close()`.
-                base = int(np.frombuffer(mm, dtype=np.uint8, count=1).ctypes.data)
-                ent = (mm, size, fd, base)          # the fd stays open for the warm read
-                self._maps[path] = ent
+        ent = self._map(path)
+        if ent is None:
+            return None
         mm, size, fd, base = ent
         view = self._slice(mm, size, offset, length)
         if view is not None and WARM_MODE != "off":
@@ -240,6 +229,39 @@ class WeightStore:
                     except OSError:
                         pass                           # the view is still right; it will just fault
         return view
+
+    def _map(self, path: str):
+        """(mmap, size, fd, base address) for `path`, created on first use; None for an empty file."""
+        with self._map_lock:
+            ent = self._maps.get(path)
+            if ent is None:
+                fd = os.open(path, os.O_RDONLY)
+                size = os.fstat(fd).st_size
+                if size == 0:
+                    os.close(fd)
+                    return None
+                mm = mmap.mmap(fd, size, access=mmap.ACCESS_READ)
+                # The map's base address, for `mincore`; taken once and the array let go, so
+                # nothing here keeps a buffer export open against `mm.close()`.
+                base = int(np.frombuffer(mm, dtype=np.uint8, count=1).ctypes.data)
+                ent = (mm, size, fd, base)          # the fd stays open for the warm read
+                self._maps[path] = ent
+        return ent
+
+    def refresh(self, key) -> int:
+        """Read `key`'s bytes into the page cache now, cold or not; returns how many were cold.
+
+        Pages already cached are read too: a read marks them recently used, so whatever is read
+        next evicts something else first. Returns the count of segments that were not resident.
+        """
+        cold = 0
+        for seg in self.segments(key):
+            ent = self._map(seg.path)
+            if ent is None or seg.offset + seg.length > ent[1]:
+                continue
+            cold += 0 if pages_resident(ent[3] + seg.offset, seg.length) else 1
+            self.fill(ent[2], seg.offset, seg.length)
+        return cold
 
     def fill(self, fd: int, offset: int, length: int) -> None:
         """Read [offset, offset + length) of `fd` into the page cache, dropping the bytes.
@@ -491,6 +513,10 @@ class ParallelFetcher:
             self.seconds += dt
             self.n_fetches += 1
         return out
+
+    def refresh(self, keys) -> int:
+        """WeightStore.refresh for every key, on the fetch pool, and wait; returns how many were cold."""
+        return sum(self._pool.map(self.store.refresh, list(keys)))
 
     def drop(self, keys=None) -> int:
         """Discard prefetched-but-unclaimed buffers. Returns how many were dropped.

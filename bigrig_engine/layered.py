@@ -56,20 +56,12 @@ def prefill(model, tokens, cache, step: int, progress=None, layer_scope=None, se
     `tokens` is everything the chunked loop would have prefilled (the prompt minus its last
     token, which generation then reads on its own). `progress(done, total)` is called after each
     layer with the share of the work finished, scaled to tokens. `layer_scope(i)`, if given,
-    returns a context manager held while layer i reads every chunk but the last (the engine uses
+    returns a context manager held while layer i reads every chunk (the engine uses
     it to keep that layer's expert arrays between chunks); it must not change what a layer
     computes. `settle(cache, i)`, if given,
     runs after each chunk of layer i and may replace cache[i]: the chunked loops quantize the KV
     cache between chunks, entry by entry, each on its own offset, so applying the same rule to
     layer i's entry after the same chunk reproduces it exactly.
-
-    THE LAST CHUNK GOES THROUGH THE WHOLE STACK, AS THE CHUNKED LOOP SENDS IT. Every chunk but the
-    last is read layer-major; the last is then read through layers 0..n-1 in turn. That is still
-    a valid order (each step has its chunk's previous layer and its layer's earlier chunks), so
-    the cache is the same, and it leaves the page cache as the chunked order does: the experts the
-    END of the prompt routed to, fresh in every layer. Those are what the first decode tokens ask
-    for. Read wholly layer-major, only the last few layers' experts survive in the page cache and
-    decode after a long prompt was measured 3.4% slower (climb iteration 2, 2026-11-13).
     """
     m = text_model(model)
     if m is None or len(tokens) == 0 or step < 1 or len(cache) != len(m.layers):
@@ -91,16 +83,12 @@ def prefill(model, tokens, cache, step: int, progress=None, layer_scope=None, se
         # graph never spans more than one (layer, chunk) step.
         mx.eval(hidden[j], cache[li].state)
 
-    n, last = len(m.layers), len(hidden) - 1
+    n = len(m.layers)
     for li in range(n):
-        with layer_scope(li) if layer_scope is not None and last > 0 else contextlib.nullcontext():
-            for j in range(last):
+        with layer_scope(li) if layer_scope is not None else contextlib.nullcontext():
+            for j in range(len(hidden)):
                 run(li, j)
         if progress is not None:
-            progress(len(tokens) * (li + 1) // (2 * n), len(tokens))
-    for li in range(n):
-        run(li, last)
-        if progress is not None:
-            progress(len(tokens) * (n + li + 1) // (2 * n), len(tokens))
+            progress(len(tokens) * (li + 1) // n, len(tokens))
     mx.clear_cache()
     return True
