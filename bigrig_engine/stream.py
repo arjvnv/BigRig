@@ -1277,7 +1277,8 @@ class StreamingSwitchGLU(nn.Module):
         if STAGING:
             self._stage_predicted()
         pred = None
-        if STAGING and self._next is not None and self._pred_m > 0 and (
+        warm = PREFETCH_WARM and x.reshape(-1, x.shape[-1]).shape[0] == 1
+        if (STAGING or warm) and self._next is not None and self._pred_m > 0 and (
                 self._next_gate is not None or self._pred_w is not None):
             xf = x.reshape(-1, x.shape[-1])[:1]
             if self._next_gate is not None:
@@ -1304,8 +1305,15 @@ class StreamingSwitchGLU(nn.Module):
             mx.eval(indices, pred)              # one drain, two answers
         gi = np.array(indices, copy=False).astype(np.int64)
         self.sync_seconds += time.perf_counter() - _t
+        warm_after = None
         if pred is not None:
-            self._speculate(np.array(pred))
+            p_np = np.array(pred)
+            if warm:
+                # Named now, READ LATER: queued only once this layer's own ensure() has its bytes,
+                # so a guess never competes with a read the current layer is waiting on.
+                nxt = self._next
+                warm_after = [(nxt.layer, int(e)) for e in p_np if nxt.g2s[int(e)] < 0]
+            self._speculate(p_np)
         k = gi.shape[-1]
         C = self._pool.capacity
         if k > C:
@@ -1344,6 +1352,8 @@ class StreamingSwitchGLU(nn.Module):
                 # VIEWS MODE: residency is the pool's business as before; the arithmetic runs on
                 # the resident views, one expert at a time. See VIEWS_DECODE.
                 self.ensure(gi)
+                if warm_after:
+                    self._fetcher.warm(warm_after)
                 y = self._forward_views(x.reshape(-1, x.shape[-1]), flat, self._pool.views_of)
                 return y.reshape(*gi.shape[:-1], k, y.shape[-1])
             # Unchunked path: byte-for-byte the shape handling of the stock SwitchGLU, so the
@@ -1555,6 +1565,16 @@ PAGE_BYTES = int(os.sysconf("SC_PAGESIZE")) if hasattr(os, "sysconf") else 16384
 #     is free, needs no fitted file, and is the right signal if staging is ever worth it.
 #     BIGRIG_STAGE=1 turns it on.
 STAGING = os.environ.get("BIGRIG_STAGE", "0") == "1"
+
+# WARM THE NEXT LAYER'S PAGES IN THE BACKGROUND, IN DECODE. Right after a layer's routing read the
+# next layer's own router has named its likely experts (recall@8 83.6% on Qwen3.6); those not in
+# the next pool are read into the page cache on a separate small pool AFTER this layer has loaded
+# its own experts, while its expert math and the next layer's attention run. Only WHEN pages
+# arrive changes; ensure() still admits exactly what the real router selected. Climb 1 measured it
+# at +9% decode on the packed blob; card warm-ahead-confirm-4 found no gain, but its arms read the
+# safetensors shards (no packed blob in ~/.bigrig), a different path. BIGRIG_PREFETCH_WARM=0 turns
+# it off.
+PREFETCH_WARM = os.environ.get("BIGRIG_PREFETCH_WARM", "1") == "1"
 
 # WHETHER THE EXPERT-MAJOR SPANS ALSO ASK FOR THE SORTED GATHER KERNEL.
 #     They are always genuinely sorted, so this is only ever a question of speed. mlx_lm's own
