@@ -24,8 +24,6 @@ WHY THE OUTPUT IS BIT-IDENTICAL
     (arXiv 2510.08055) and Stream-Loading Prefill (arXiv 2606.10493) use the same order for the
     same reason on GPU servers; Edge0 (arXiv 2609.18063) loads whole layers for prefill on a Mac.
 """
-import contextlib
-
 import mlx.core as mx
 from mlx_lm.models.base import create_attention_mask, create_ssm_mask
 
@@ -50,15 +48,12 @@ def text_model(model):
     return m
 
 
-def prefill(model, tokens, cache, step: int, progress=None, layer_scope=None, settle=None) -> bool:
+def prefill(model, tokens, cache, step: int, progress=None, settle=None) -> bool:
     """Run `tokens` through `model` into `cache`, layer by layer. False, untouched, if unsupported.
 
     `tokens` is everything the chunked loop would have prefilled (the prompt minus its last
     token, which generation then reads on its own). `progress(done, total)` is called after each
-    layer with the share of the work finished, scaled to tokens. `layer_scope(i)`, if given,
-    returns a context manager held while layer i reads every chunk but the last (the engine uses
-    it to keep that layer's expert arrays between chunks); it must not change what a layer
-    computes. `settle(cache, i)`, if given,
+    layer with the share of the work finished, scaled to tokens. `settle(cache, i)`, if given,
     runs after each chunk of layer i and may replace cache[i]: the chunked loops quantize the KV
     cache between chunks, entry by entry, each on its own offset, so applying the same rule to
     layer i's entry after the same chunk reproduces it exactly.
@@ -93,9 +88,8 @@ def prefill(model, tokens, cache, step: int, progress=None, layer_scope=None, se
 
     n, last = len(m.layers), len(hidden) - 1
     for li in range(n):
-        with layer_scope(li) if layer_scope is not None and last > 0 else contextlib.nullcontext():
-            for j in range(last):
-                run(li, j)
+        for j in range(last):
+            run(li, j)
         if progress is not None:
             progress(len(tokens) * (li + 1) // (2 * n), len(tokens))
     for li in range(n):
