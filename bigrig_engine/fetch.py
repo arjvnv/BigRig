@@ -89,7 +89,10 @@ FULL_AFTER_COLD = 64
 #     aligned parts issued together on a small pool, so one expert arrives at the deeper queue's
 #     speed. Same file pages either way; the bytes read are dropped, the page cache keeps them.
 #     BIGRIG_SPLIT_READ sets the number of parts (1 turns it off).
-SPLIT_PARTS = max(1, int(os.environ.get("BIGRIG_SPLIT_READ", "4")))
+try:
+    SPLIT_PARTS = max(1, int(os.environ.get("BIGRIG_SPLIT_READ", "4")))
+except ValueError:
+    SPLIT_PARTS = 4                # a malformed setting must not stop the engine importing
 SPLIT_MIN_BYTES = 1 << 20      # below this one request is already short; splitting only adds overhead
 _PAGE = os.sysconf("SC_PAGESIZE")
 _libc = None
@@ -300,7 +303,12 @@ class WeightStore:
                 self._split_pool = ThreadPoolExecutor(max_workers=DEFAULT_THREADS * SPLIT_PARTS,
                                                       thread_name_prefix="bigrig-split")
             pool = self._split_pool
-        for f in [pool.submit(os.pread, fd, n, o) for o, n in parts]:
+        try:
+            futures = [pool.submit(os.pread, fd, n, o) for o, n in parts]
+        except RuntimeError:                           # the pool is shutting down: read it whole
+            os.pread(fd, length, offset)
+            return
+        for f in futures:
             f.result()                                 # re-raises the part's OSError
 
     @staticmethod
@@ -543,9 +551,9 @@ class ParallelFetcher:
         current layer is waiting for. Bounded: past `max_queued` outstanding regions new guesses
         are skipped rather than allowed to build a backlog. Returns how many regions were queued.
         """
-        if self._closed:
-            return 0
         with self._lock:
+            if self._closed:
+                return 0
             if self._warm_pool is None:
                 self._warm_pool = ThreadPoolExecutor(max_workers=WARM_THREADS,
                                                      thread_name_prefix="bigrig-warm")
@@ -566,7 +574,12 @@ class ParallelFetcher:
                     if self._warm_queued >= max_queued:
                         return n
                     self._warm_queued += 1
-                self._warm_pool.submit(job, seg)
+                try:
+                    self._warm_pool.submit(job, seg)
+                except RuntimeError:                   # closed meanwhile; a guess is optional
+                    with self._lock:
+                        self._warm_queued -= 1
+                    return n
                 self.warm_issued += 1
                 n += 1
         return n
@@ -581,13 +594,26 @@ class ParallelFetcher:
         A prefetch that is never fetched holds its bytes forever, so a caller that speculatively
         prefetches -- which is the point -- needs a way to abandon the guesses that were wrong.
         """
+        pending = []
         with self._lock:
             ks = list(self._inflight) if keys is None else [k for k in keys if k in self._inflight]
             for k in ks:
                 f = self._inflight.get(k)
                 if f is not None and f.done():
                     self._inflight.pop(k, None)
-            return len(ks)
+                elif f is not None:
+                    pending.append((k, f))
+        # Still being read: release each the moment it lands, unless a fetch() has claimed or
+        # replaced it by then. Attached outside the lock: a future that finishes in between runs
+        # its callback right here, and _release takes the lock.
+        for k, f in pending:
+            f.add_done_callback(lambda done, k=k: self._release(k, done))
+        return len(ks)
+
+    def _release(self, key, fut) -> None:
+        with self._lock:
+            if self._inflight.get(key) is fut:
+                self._inflight.pop(key, None)
 
     def pending(self) -> int:
         """Keys prefetched and not yet collected."""

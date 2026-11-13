@@ -44,12 +44,32 @@ def text_model(model):
     except ImportError:
         return None
     m = getattr(getattr(model, "language_model", None), "model", None)
-    if not isinstance(m, Qwen3_5TextModel):
+    if not isinstance(m, Qwen3_5TextModel) or _forward_source(Qwen3_5TextModel) != _KNOWN_FORWARD:
         return None
     kinds = [layer.is_linear for layer in m.layers]
+    if True not in kinds or False not in kinds:
+        return None
     if kinds.index(True) != m.ssm_idx or kinds.index(False) != m.fa_idx:
         return None
     return m
+
+
+# The forward pass this schedule reproduces, as mlx_lm 0.31 writes it (embed, one fa mask from
+# cache[fa_idx], one ssm mask from cache[ssm_idx], every layer in order, norm). If an mlx_lm update
+# changes that body, layer-major prefill declines and mlx_lm's own loop reads the prompt, until
+# someone checks the new body and updates this hash (tests/test_layered.py prints it).
+_KNOWN_FORWARD = "99109386bc59da7e79abf9e21efc42200f44b58d394b8161aa24b55a4f08eb35"
+
+
+def _forward_source(cls) -> str:
+    """sha256 of cls.__call__'s source with whitespace normalised; "" if the source is unavailable."""
+    import hashlib
+    import inspect
+    try:
+        src = inspect.getsource(cls.__call__)
+    except (OSError, TypeError):
+        return ""
+    return hashlib.sha256(" ".join(src.split()).encode()).hexdigest()
 
 
 def prefill(model, tokens, cache, step: int, progress=None, layer_scope=None, settle=None) -> bool:
@@ -95,7 +115,7 @@ def prefill(model, tokens, cache, step: int, progress=None, layer_scope=None, se
         with layer_scope(li) if layer_scope is not None else contextlib.nullcontext():
             for j in range(len(hidden)):
                 run(li, j)
+        mx.clear_cache()                          # as the chunked loop does after every chunk
         if progress is not None:
             progress(len(tokens) * (li + 1) // n, len(tokens))
-    mx.clear_cache()
     return True

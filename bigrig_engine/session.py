@@ -2164,11 +2164,17 @@ class Session:
                 cache[i] = one[0]
         scope, h, ahead = None, self.handle, False
         if h is not None:
-            ahead = h.routes_to_most_experts(len(tokens))
+            # Read-ahead and re-warm only where layer-major changes anything: with one chunk the
+            # order is the chunked loop's, and so is what it leaves in the page cache.
+            ahead = len(tokens) > step and h.routes_to_most_experts(len(tokens))
             scope = lambda li: h.prefill_layer(li, read_ahead=ahead)              # noqa: E731
-        if not layered.prefill(self.model, tokens, pc, step, progress=progress, layer_scope=scope,
-                               settle=settle):
-            return False
+        try:
+            if not layered.prefill(self.model, tokens, pc, step, progress=progress,
+                                   layer_scope=scope, settle=settle):
+                return False
+        finally:
+            if h is not None:
+                h.release_prefill()              # read-ahead left unclaimed, even by an abort
         if ahead:
             try:
                 h.rewarm(REWARM_EXPERTS)         # leave the page cache ready for the reply
@@ -2196,6 +2202,7 @@ class Session:
         if cb is not None:
             gen_kw["prompt_progress_callback"] = lambda d, t, _o=cb, _p=read: _o(d + _p, t + _p)
         self._pre_prefill += read
+        self._gen_read = read                   # mlx_lm would have read and reported these
         return prompt_in[-1:]
 
     def stream_text(self, messages=None, prompt: str = "", max_tokens: int = 512,
@@ -2320,6 +2327,7 @@ class Session:
         # only the UNREAD tail as prompt_tokens, so the size the next turn starts from has to be
         # taken from the full token list when there is one. None -> fall back to what mlx_lm says.
         self._this_prompt_full = None
+        self._gen_read = 0                      # prompt tokens _prefill_layer_major read for mlx_lm
         # A REQUEST WITH IMAGES TAKES ITS OWN ROAD (vision.py). The tower turns each image into
         # tokens, they are scattered into the prompt's embeddings, and the full-attention layers
         # are armed with the multimodal positions for this request. No prompt-cache lookup or
@@ -2491,8 +2499,11 @@ class Session:
                 # document a draft should be quoting from is not in it.
                 context_ids=full_ids)
         else:
-            _mcls.__call__ = _capture
+            # Read the prompt BEFORE patching the model class: the patch is undone only by the
+            # `finally` below, and a client hanging up mid-prefill (on_prefill raises) would
+            # otherwise leave it in place, stacking one wrapper per abandoned request.
             prompt_in = self._prefill_layer_major(pc, prompt_in, gen_kw, prefill_step_size)
+            _mcls.__call__ = _capture
             _produce = lambda: stream_generate(                              # noqa: E731
                 self.model, self.tokenizer, prompt_in, max_tokens=max_tokens,
                 sampler=sampler,
@@ -2529,7 +2540,8 @@ class Session:
                                       "remedy": self._quality_remedy(lookahead_asked, temperature)}
                     yield "", {"token": r.token, "finish_reason": "stop", "reasoning_delta": "",
                                "from_draft": False, "tok_s": _sane_tps(r.generation_tps, r.generation_tokens),
-                               "prompt_tokens": r.prompt_tokens, "generation_tokens": r.generation_tokens,
+                               "prompt_tokens": int(r.prompt_tokens or 0) + self._gen_read,
+                               "generation_tokens": r.generation_tokens,
                                "degraded": True, "reasoning_tokens": None, "thinking_cut": False,
                                **self.last_stop}
                     return
@@ -2586,7 +2598,7 @@ class Session:
                         "reasoning_delta": rdelta,
                         "from_draft": bool(getattr(r, "from_draft", False)),
                         "tok_s": _sane_tps(r.generation_tps, r.generation_tokens),
-                        "prompt_tokens": r.prompt_tokens,
+                        "prompt_tokens": int(r.prompt_tokens or 0) + self._gen_read,
                         "generation_tokens": r.generation_tokens, "degraded": flagged,
                         # The thinking budget's account: how many reasoning tokens were spent and
                         # whether the cap, not the model, ended the block. A client can then say

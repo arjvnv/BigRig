@@ -1772,6 +1772,14 @@ class StreamHandle:
         self.fetcher, self.manifest = fetcher, manifest
         self.full_layers = list(full_layers)
 
+    def release_prefill(self) -> None:
+        """Drop any read-ahead no chunk claimed. Called when a layer-major prefill ends, however it
+        ends: a prefill abandoned at layer L has already queued layer L+1's reads."""
+        for m in self.mods:
+            if m._ahead and m._fetcher is not None:
+                m._fetcher.drop(m._ahead)
+            m._ahead = []
+
     def rewarm(self, per_layer: int) -> int:
         """After a layer-major prefill, read each layer's `per_layer` most-routed experts into the
         page cache, in parallel, before decode starts; returns how many were cold.
