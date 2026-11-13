@@ -103,6 +103,22 @@ try:
     os.pread = broken
     check("refresh survives a read error (it only decides what is cached)", store.refresh(("x", 2)) == 1)
     os.pread = spy
+    import threading
+    gate = threading.Event()
+    pf2 = fetch.ParallelFetcher(store, threads=2)
+    real_read = pf2._read_region
+    pf2._read_region = lambda key: (gate.wait(5), real_read(key))[1]
+    pf2.prefetch([("x", 0)])
+    pf2.drop([("x", 0)])
+    held_while_reading = ("x", 0) in pf2._inflight
+    gate.set()
+    for _ in range(100):
+        if ("x", 0) not in pf2._inflight:
+            break
+        threading.Event().wait(0.01)
+    check("a prefetch dropped while still being read is released the moment it lands",
+          held_while_reading and ("x", 0) not in pf2._inflight)
+    pf2.close()
     store.close_maps()
     check("closing the store stops the part pool", store._split_pool is None)
 finally:

@@ -154,6 +154,7 @@ from bigrig_engine import session as _session                            # noqa:
 
 S = _session.Session.__new__(_session.Session)
 S.model, S.kv_bits, S.prefill_step, S._pre_prefill, S.handle = model, None, 16, 0, None
+S._gen_read = 0
 tokens = mx.random.randint(0, 512, (2 * 16 + 5,)).tolist()
 pc = model.make_cache()
 check("a plain cache is read layer by layer", S._read_layer_major(pc, tokens[:-1], 16)
@@ -192,6 +193,7 @@ left = S._prefill_layer_major(pc, list(tokens), {}, None)
 check("generation's prefill reads all but the last token and leaves that one", left == tokens[-1:])
 check("...building the chunked loop's cache", same_state(chunked(model, tokens, 16), pc))
 check("...and counts what it read", S._pre_prefill == len(tokens) - 1)
+check("...and reports it as prompt tokens read for generation (API usage)", S._gen_read == len(tokens) - 1)
 pc = model.make_cache()
 check("input embeddings (images) are left to mlx_lm",
       S._prefill_layer_major(pc, list(tokens), {"input_embeddings": None}, None) == tokens
@@ -245,6 +247,16 @@ class FakeHandle:
         return 0
 
 
+class FakeHandle2(FakeHandle):
+    def __init__(self):
+        super().__init__()
+        self.released = 0
+
+    def release_prefill(self):
+        self.released += 1
+
+
+FakeHandle = FakeHandle2
 S2 = _session.Session.__new__(_session.Session)
 S2.model, S2.kv_bits, S2.prefill_step, S2._pre_prefill, S2.handle = model, None, 16, 0, FakeHandle()
 S2._read_layer_major(model.make_cache(), mx.random.randint(0, 512, (40,)).tolist(), 16)
@@ -252,6 +264,31 @@ check("a long prompt is followed by one re-warm of REWARM_EXPERTS per layer",
       S2.handle.rewarms == [_session.REWARM_EXPERTS], S2.handle.rewarms)
 S2._read_layer_major(model.make_cache(), mx.random.randint(0, 512, (12,)).tolist(), 16)
 check("a short prompt is not", S2.handle.rewarms == [_session.REWARM_EXPERTS], S2.handle.rewarms)
+S2._read_layer_major(model.make_cache(), mx.random.randint(0, 512, (40,)).tolist(), 64)
+check("nor is one that fits in a single chunk (its order, and page cache, are the chunked loop's)",
+      S2.handle.rewarms == [_session.REWARM_EXPERTS], S2.handle.rewarms)
+check("unclaimed read-ahead is released after every layer-major read", S2.handle.released == 3,
+      S2.handle.released)
+
+
+def abort_after_two(done, total, _n=[0]):
+    _n[0] += 1
+    if _n[0] == 2:
+        raise RuntimeError("client hung up")
+
+
+S2.handle = FakeHandle()
+try:
+    S2._read_layer_major(model.make_cache(), mx.random.randint(0, 512, (40,)).tolist(), 16, abort_after_two)
+    aborted = False
+except RuntimeError:
+    aborted = True
+check("an abandoned prefill propagates the abort...", aborted)
+check("...and still releases its read-ahead, with no re-warm", S2.handle.released == 1 and S2.handle.rewarms == [])
+import inspect as _inspect                                               # noqa: E402
+_st = _inspect.getsource(_session.Session.stream_text)
+check("generation's prefill runs before the model class is patched (an abort cannot leave the patch)",
+      _st.index("self._prefill_layer_major(pc, prompt_in") < _st.index("_mcls.__call__ = _capture"))
 
 
 class BrokenHandle(FakeHandle):
@@ -264,6 +301,43 @@ pc = model.make_cache()
 toks = mx.random.randint(0, 512, (40,)).tolist()
 check("a failing re-warm does not fail the prompt: the cache is still read, and identical",
       S2._read_layer_major(pc, toks, 16) and same_state(chunked(model, toks + [0], 16), pc))
+
+print("=" * 78)
+print("6c. AGAINST MLX_LM ITSELF: generate_step on the whole prompt vs layer-major + generate_step")
+print("=" * 78)
+from mlx_lm.generate import generate_step                                # noqa: E402
+
+for kv in (None, 4):
+    for n in (37, 130):
+        toks = mx.random.randint(0, 512, (n,)).tolist()
+        kw = {"kv_bits": kv, "kv_group_size": _session.KV_GROUP_SIZE, "quantized_kv_start": 20} if kv else {}
+        ref = [int(t) for t, _ in generate_step(mx.array(toks), model, max_tokens=12, prefill_step_size=16,
+                                               prompt_cache=model.make_cache(), **kw)]
+        S.kv_bits, S.kv_quant_start, S.handle = kv, 20, None
+        pc = model.make_cache()
+        left = S._prefill_layer_major(pc, list(toks), {}, 16)
+        got = [int(t) for t, _ in generate_step(mx.array(left), model, max_tokens=12, prefill_step_size=16,
+                                               prompt_cache=pc, **kw)]
+        check(f"{n} tokens, KV {'4-bit from 20' if kv else 'full precision'}: 12 tokens identical to mlx_lm's own loop",
+              got == ref, (got, ref))
+S.kv_bits = None
+
+print("=" * 78)
+print("6d. DECLINED, NEVER RAISED, WHEN THE SCHEDULE IS NOT KNOWN TO BE EXACT")
+print("=" * 78)
+print(f"        mlx_lm's Qwen3_5TextModel.__call__ hashes to {layered._forward_source(layered.text_model(model).__class__)}")
+saved = layered._KNOWN_FORWARD
+layered._KNOWN_FORWARD = "a different forward pass"
+check("a changed mlx_lm forward body is declined (mlx_lm's own loop reads the prompt)", layered.text_model(model) is None)
+layered._KNOWN_FORWARD = saved
+check("...and the installed one is accepted", layered.text_model(model) is not None)
+tm = layered.text_model(model)
+flags = [layer.is_linear for layer in tm.layers]
+for layer in tm.layers:
+    layer.is_linear = True
+check("a stack with no full-attention layer is declined, not an exception", layered.text_model(model) is None)
+for layer, f_ in zip(tm.layers, flags):
+    layer.is_linear = f_
 
 print("=" * 78)
 print("7. layer_scope: ONE BLOCK PER LAYER, IN ORDER, AND NO EFFECT ON THE CACHE")

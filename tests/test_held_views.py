@@ -169,6 +169,13 @@ with h.prefill_layer(1, read_ahead=True):
     h.mods[1]._forward_views(*CHUNKS[0])
 check("layer 1's block, ending, releases the read-ahead keys no chunk claimed",
       f.events[-1] == ("drop", [(1, e) for e in range(E)]), f.events[-1][:1])
+f2 = _Fetcher()
+hh = stream.StreamHandle.__new__(stream.StreamHandle)
+hh.manifest, hh.mods = {"top_k": K}, [module(0, f2), module(1, f2)]
+hh.mods[1].read_ahead()                              # queued, then the prefill is abandoned
+hh.release_prefill()
+check("release_prefill drops read-ahead no chunk claimed (an abandoned prefill)",
+      f2.events[-1] == ("drop", [(1, e) for e in range(E)]) and hh.mods[1]._ahead == [])
 check("...and the last layer reads nothing further ahead",
       [ev[0] for ev in f.events].count("prefetch") == 1)
 _, ref = run("_forward_views", hold=False)
