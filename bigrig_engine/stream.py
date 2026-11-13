@@ -935,17 +935,14 @@ class StreamingSwitchGLU(nn.Module):
             return
         keys = [(self._pool.layer, e) for e in ids]
         try:
-            if self._pool.views:
-                blobs = self._fetcher.resident_views(keys)   # cached ones only; never a disk read
-            else:
-                blobs = self._fetcher.fetch(keys)   # views of the page cache; the copy is below
+            blobs = self._fetcher.fetch(keys)       # views of the page cache; the copy is below
         except Exception:                           # noqa: BLE001 -- speculation is optional
             return
         for (layer, e), b in blobs.items():
             self._pool.stage[e] = self._pool.build_arrays(e, b)
             self._pool.stage_issued += 1
 
-    def _speculate(self, predicted, stage: bool | None = None) -> None:
+    def _speculate(self, predicted) -> None:
         """Start reading what the NEXT layer is likely to want, while this one computes.
 
         THIS IS OFF BY DEFAULT AND SHOULD STAY OFF. IT NOW MAKES THE MODEL SLOWER.
@@ -972,16 +969,15 @@ class StreamingSwitchGLU(nn.Module):
         # by pushing a useful one out. Now a guess is only ever copied from memory to the GPU,
         # and only during the wait for this layer's routing, when the host has nothing else to
         # do. It touches no disk and evicts nothing. Only experts not already resident are named.
-        if not (STAGING if stage is None else stage):
+        if not STAGING:
             return
         nxt = self._next
         want = [int(e) for e in predicted if nxt.g2s[int(e)] < 0][:STAGE_MAX]
         # THE BYTE CAP STILL APPLIES TO A MEMCPY. Eight guesses is 14 MB a layer on Qwen3.6 and
         # 106 MB a layer on gpt-oss's 13 MB experts -- 4 ms of copying to hide inside a wait of
-        # under one. A guess must never be able to outweigh the work it is speculating about. A
-        # views-mode guess copies nothing (see STAGE_VIEWS), so the cap does not apply to it.
+        # under one. A guess must never be able to outweigh the work it is speculating about.
         per = getattr(nxt, "bytes_per_expert", 0) or 0
-        if per and self._pred_budget and not getattr(nxt, "views", False):
+        if per and self._pred_budget:
             want = want[:max(1, self._pred_budget // per)]
         nxt.stage_pred = want or None
         self.pred_issued += len(want)
@@ -1278,13 +1274,11 @@ class StreamingSwitchGLU(nn.Module):
         #     committed to the GPU in batches of eight ops and is running. The host would spend
         #     that time waiting at the read below. It spends it here instead, on the memcpy that
         #     would otherwise follow the read on the critical path.
-        n_rows = x.reshape(-1, x.shape[-1]).shape[0]
-        stage = STAGING or (STAGE_VIEWS and self._pool.views and n_rows == 1)
-        if stage:
+        if STAGING:
             self._stage_predicted()
         pred = None
-        warm = PREFETCH_WARM and n_rows == 1
-        if (stage or warm) and self._next is not None and self._pred_m > 0 and (
+        warm = PREFETCH_WARM and x.reshape(-1, x.shape[-1]).shape[0] == 1
+        if (STAGING or warm) and self._next is not None and self._pred_m > 0 and (
                 self._next_gate is not None or self._pred_w is not None):
             xf = x.reshape(-1, x.shape[-1])[:1]
             if self._next_gate is not None:
@@ -1319,7 +1313,7 @@ class StreamingSwitchGLU(nn.Module):
                 # so a guess never competes with a read the current layer is waiting on.
                 nxt = self._next
                 warm_after = [(nxt.layer, int(e)) for e in p_np if nxt.g2s[int(e)] < 0]
-            self._speculate(p_np, stage)
+            self._speculate(p_np)
         k = gi.shape[-1]
         C = self._pool.capacity
         if k > C:
@@ -1571,14 +1565,6 @@ PAGE_BYTES = int(os.sysconf("SC_PAGESIZE")) if hasattr(os, "sysconf") else 16384
 #     is free, needs no fitted file, and is the right signal if staging is ever worth it.
 #     BIGRIG_STAGE=1 turns it on.
 STAGING = os.environ.get("BIGRIG_STAGE", "0") == "1"
-# STAGING IN VIEWS MODE IS A WRAP, NOT A COPY, AND IS ON. The measurement above priced staging as
-# a memcpy competing with the GPU's weight reads. In views mode a staged expert is a zero-copy
-# view of pages already in the page cache, so staging costs the wrap (~50 us an expert) and
-# nothing else, and it happens before the routing read, while the GPU is still on this layer's
-# attention, instead of after it with the GPU idle. Only experts already resident are staged
-# (StreamingSwitchGLU._stage_predicted): a cold guess is left to the warm pool and ensure(), so
-# staging never reads the disk on the critical path. Decode only. BIGRIG_STAGE_VIEWS=0 turns it off.
-STAGE_VIEWS = os.environ.get("BIGRIG_STAGE_VIEWS", "1") == "1"
 
 # WARM THE NEXT LAYER'S PAGES IN THE BACKGROUND, IN DECODE. Right after a layer's routing read the
 # next layer's own router has named its likely experts (recall@8 83.6% on Qwen3.6); those not in

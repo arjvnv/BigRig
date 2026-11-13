@@ -264,19 +264,6 @@ class WeightStore:
             self.fill(ent[2], seg.offset, seg.length)
         return cold
 
-    def resident_view(self, path: str, offset: int, length: int):
-        """A zero-copy view of one region if every page of it is in the page cache, else None.
-
-        Never reads: a region that is not resident is the caller's to read on its own terms.
-        """
-        ent = self._map(path)
-        if ent is None:
-            return None
-        mm, size, _fd, base = ent
-        if offset + length > size or not pages_resident(base + offset, length):
-            return None
-        return self._slice(mm, size, offset, length)
-
     def warm_region(self, path: str, offset: int, length: int) -> bool:
         """Pull one region's pages into the page cache if they are not there. True if it read.
 
@@ -544,22 +531,6 @@ class ParallelFetcher:
             self.bytes_read += sum(len(v) for v in out.values())
             self.seconds += dt
             self.n_fetches += 1
-        return out
-
-    def resident_views(self, keys) -> dict:
-        """{key: view} for the keys whose bytes are one region already in the page cache.
-
-        On the caller's thread and without reading anything: the staging path asks this while the
-        GPU is busy, and a disk read there would be a wait it cannot afford. Keys that span several
-        segments, or are not resident, are left out.
-        """
-        out = {}
-        for k in keys:
-            segs = self.store.segments(k)
-            if len(segs) == 1:
-                v = self.store.resident_view(segs[0].path, segs[0].offset, segs[0].length)
-                if v is not None:
-                    out[k] = v
         return out
 
     def warm(self, keys, max_queued: int = 64) -> int:
