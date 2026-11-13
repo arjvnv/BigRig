@@ -27,6 +27,9 @@ WHY THE OUTPUT IS BIT-IDENTICAL
     same reason on GPU servers; Edge0 (arXiv 2609.18063) loads whole layers for prefill on a Mac.
 """
 import contextlib
+import functools
+import hashlib
+import inspect
 
 import mlx.core as mx
 from mlx_lm.models.base import create_attention_mask, create_ssm_mask
@@ -44,7 +47,7 @@ def text_model(model):
     except ImportError:
         return None
     m = getattr(getattr(model, "language_model", None), "model", None)
-    if not isinstance(m, Qwen3_5TextModel) or _forward_source(Qwen3_5TextModel) != _KNOWN_FORWARD:
+    if not isinstance(m, Qwen3_5TextModel) or _forward_source(type(m)) != _KNOWN_FORWARD:
         return None
     kinds = [layer.is_linear for layer in m.layers]
     if True not in kinds or False not in kinds:
@@ -61,12 +64,19 @@ def text_model(model):
 _KNOWN_FORWARD = "99109386bc59da7e79abf9e21efc42200f44b58d394b8161aa24b55a4f08eb35"
 
 
+@functools.lru_cache(maxsize=None)
 def _forward_source(cls) -> str:
-    """sha256 of cls.__call__'s source with whitespace normalised; "" if the source is unavailable."""
-    import hashlib
-    import inspect
+    """sha256 of the forward pass `cls` actually runs, whitespace normalised; "" if it cannot be read.
+
+    The class's own `__call__` (a subclass that overrides it hashes differently), and "" for a
+    wrapped one: getsource follows __wrapped__ and would hash the original, not the wrapper.
+    Cached per class; the source does not change while the process runs.
+    """
+    fn = cls.__call__
+    if hasattr(fn, "__wrapped__"):
+        return ""
     try:
-        src = inspect.getsource(cls.__call__)
+        src = inspect.getsource(fn)
     except (OSError, TypeError):
         return ""
     return hashlib.sha256(" ".join(src.split()).encode()).hexdigest()

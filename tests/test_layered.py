@@ -331,6 +331,30 @@ layered._KNOWN_FORWARD = "a different forward pass"
 check("a changed mlx_lm forward body is declined (mlx_lm's own loop reads the prompt)", layered.text_model(model) is None)
 layered._KNOWN_FORWARD = saved
 check("...and the installed one is accepted", layered.text_model(model) is not None)
+
+
+class Overridden(type(layered.text_model(model))):
+    def __call__(self, *a, **k):                    # a different forward pass on a subclass
+        return super().__call__(*a, **k)
+
+
+tm_ = layered.text_model(model)
+real_cls = type(tm_)
+tm_.__class__ = Overridden
+check("a subclass that overrides __call__ is declined (the hash is of the class actually run)",
+      layered.text_model(model) is None)
+tm_.__class__ = real_cls
+import functools as _ft                                                  # noqa: E402
+
+
+class Wrapped(real_cls):
+    @_ft.wraps(real_cls.__call__)
+    def __call__(self, *a, **k):
+        return real_cls.__call__(self, *a, **k)
+
+
+check("a functools.wraps wrapper is declined, not hashed as the original",
+      layered._forward_source(Wrapped) == "")
 tm = layered.text_model(model)
 flags = [layer.is_linear for layer in tm.layers]
 for layer in tm.layers:
