@@ -34,6 +34,9 @@ import textwrap
 import types
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Every temporary folder this file makes, the harnesses' scratch homes included, goes in a folder of
+# its own, so the leak check at the end never sees, or removes, a real harness's scratch home.
+tempfile.tempdir = tempfile.mkdtemp(prefix="test_bench_home_")
 FAIL = []
 MODEL_NAME = "Qwen3.6-35B-A3B-4bit"
 
@@ -121,8 +124,6 @@ def developer_shell():
 
 
 ct = load("climb_turn")
-_tmpdir = tempfile.gettempdir()
-LEFT_BEFORE = {n for n in os.listdir(_tmpdir) if n.startswith("bigrig_home_")}
 
 print("=" * 78)
 print("0. scratch_home AND engine_reads_blob, FOR REAL")
@@ -371,10 +372,9 @@ with tempfile.TemporaryDirectory() as tmp:
 print("=" * 78)
 print("5. NOTHING LEFT BEHIND")
 print("=" * 78)
-left = {n for n in os.listdir(_tmpdir) if n.startswith("bigrig_home_")} - LEFT_BEFORE
-check("every scratch home made in this file was removed (refusals and kills included)", not left, sorted(left))
-for n in left:
-    shutil.rmtree(os.path.join(_tmpdir, n), ignore_errors=True)
+left = sorted(n for n in os.listdir(tempfile.tempdir) if n.startswith("bigrig_home_"))
+check("every scratch home made in this file was removed (refusals and kills included)", not left, left)
+shutil.rmtree(tempfile.tempdir, ignore_errors=True)
 
 print("\n" + "=" * 78)
 print(f"{'ALL TESTS PASSED' if not FAIL else str(len(FAIL)) + ' FAILURES: ' + ', '.join(FAIL)}")
