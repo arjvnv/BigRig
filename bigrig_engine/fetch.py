@@ -80,6 +80,16 @@ class Region:
 WARM_MODE = {"1": "on", "0": "off"}.get(os.environ.get("BIGRIG_WARM_READ", ""), "auto")
 PROBE_EVERY = 8
 FULL_AFTER_COLD = 64
+# ONE COLD EXPERT, READ AS SEVERAL REQUESTS AT ONCE.
+#     Decode finds about one expert per layer missing from the page cache (measured 31-40 of ~195
+#     admits a token on Qwen3.6 at a 6.1 GB budget beside a 5 GB balloon), and the GPU waits for
+#     that one read: a single 1.77 MB pread runs at queue depth 1, ~3.4 GB/s on this SSD, against
+#     ~6 GB/s with several requests in flight (module docstring). The read is split into page-
+#     aligned parts issued together on a small pool, so one expert arrives at the deeper queue's
+#     speed. Same file pages either way; the bytes read are dropped, the page cache keeps them.
+#     BIGRIG_SPLIT_READ sets the number of parts (1 turns it off).
+SPLIT_PARTS = max(1, int(os.environ.get("BIGRIG_SPLIT_READ", "4")))
+SPLIT_MIN_BYTES = 1 << 20      # below this one request is already short; splitting only adds overhead
 _PAGE = os.sysconf("SC_PAGESIZE")
 _libc = None
 
@@ -102,6 +112,23 @@ def pages_resident(addr: int, length: int) -> bool:
         return all(b & 1 for b in vec.raw)
     except Exception:                            # noqa: BLE001 -- never let a hint become a fault
         return True
+
+
+def split_ranges(offset: int, length: int, parts: int, page: int = 16384) -> list:
+    """[(offset, length)] covering [offset, offset + length) in `parts` pieces (one more when the
+    region starts mid-page; packed experts never do), every cut on a `page` boundary of the file,
+    so no page is read by two parts and none is skipped."""
+    if parts <= 1 or length <= page:
+        return [(offset, length)]
+    step = -(-length // parts)
+    step = -(-step // page) * page
+    end = offset + length
+    out, o = [], offset
+    while o < end:
+        cut = min(end, (o // page) * page + step)
+        out.append((o, cut - o))
+        o = cut
+    return out
 
 
 class WeightStore:
@@ -129,6 +156,7 @@ class WeightStore:
         self.warm_probes = 0                  # residency checks made
         self._view_n = 0                      # admits seen, for the sampled probe
         self._full_until = 0                  # probe every admit until this count
+        self._split_pool = None               # reads the parts of one cold region; see SPLIT_PARTS
         if verify:
             sizes = {}
             for k in self.layout:
@@ -207,11 +235,31 @@ class WeightStore:
                 if not pages_resident(base + offset, length):
                     self._full_until = n + FULL_AFTER_COLD
                     try:
-                        os.pread(fd, length, offset)   # fills the page cache; the bytes are dropped
+                        self.fill(fd, offset, length)  # into the page cache; the bytes are dropped
                         self.warm_reads += 1
                     except OSError:
                         pass                           # the view is still right; it will just fault
         return view
+
+    def fill(self, fd: int, offset: int, length: int) -> None:
+        """Read [offset, offset + length) of `fd` into the page cache, dropping the bytes.
+
+        A region of at least SPLIT_MIN_BYTES is read as SPLIT_PARTS page-aligned parts issued at
+        once (see SPLIT_PARTS); a shorter one, or SPLIT_PARTS == 1, with one pread. Raises OSError
+        like pread does.
+        """
+        parts = split_ranges(offset, length, SPLIT_PARTS if length >= SPLIT_MIN_BYTES else 1)
+        if len(parts) == 1:
+            os.pread(fd, length, offset)
+            return
+        with self._map_lock:
+            if self._split_pool is None:
+                # Enough for every fetch-pool thread to have one region's parts in flight.
+                self._split_pool = ThreadPoolExecutor(max_workers=DEFAULT_THREADS * SPLIT_PARTS,
+                                                      thread_name_prefix="bigrig-split")
+            pool = self._split_pool
+        for f in [pool.submit(os.pread, fd, n, o) for o, n in parts]:
+            f.result()                                 # re-raises the part's OSError
 
     @staticmethod
     def _slice(mm, size: int, offset: int, length: int):
@@ -227,6 +275,9 @@ class WeightStore:
 
     def close_maps(self) -> None:
         with self._map_lock:
+            if self._split_pool is not None:
+                self._split_pool.shutdown(wait=True)
+                self._split_pool = None
             for mm, _size, fd, _base in self._maps.values():
                 try:
                     mm.close()
