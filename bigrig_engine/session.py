@@ -1311,7 +1311,8 @@ class Session:
             self.model, self.tokenizer, self.handle = stream.load_streaming(
                 self.model_dir, use_blob, capacity=cap, policy=policy, full_layers=full,
                 threads=threads, verbose=verbose and announce, manifest=man, warm=warm,
-                predictors=self.predictor, reroute=reroute, nocache=nocache)
+                predictors=self.predictor, reroute=reroute, nocache=nocache,
+                same_answers=(mode == "stream"))      # see stream.SAME_ANSWERS: stream mode only
             self.reroute_tol = float(reroute or 0.0)
             self.streamed = True
             # KEEP THE INPUT EMBEDDING ON DISK. Bit-identical -- a row gather plus the model's own
@@ -3035,6 +3036,7 @@ class Session:
             h = self.handle.stats()
             s.update({"capacity": h["capacity"], "n_experts": h["n_experts"],
                       "full_layers": h.get("sync_free", 0),
+                      "same_answers": bool(h.get("same_answers", False)),
                       "planned_from": getattr(self, "planned_from", None),
                       # For the pre-measurement speed verdict, which is a bytes-per-token sum.
                       "n_layers": int(self.plan.get("n_layers") or 0),
