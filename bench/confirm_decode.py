@@ -31,17 +31,23 @@ the start; memory pressure critical; the balloon squeezed below 90% of its start
 times out twice in one arm; an arm whose capacity differs; code loaded from the wrong arm.
 
 ENGINE HOME (fixed 2026-11-13, after card warm-ahead-confirm-4 ran)
-    Every run's engine home is this checkout (worker_env). The arms are `git archive` exports with
-    no pyproject.toml beside them, so bigrig_engine.home() would otherwise resolve to ~/.bigrig,
-    which has no packed blob, and the engine would read experts from the safetensors shards: a
-    slower path with other kernels, which users never run. Card warm-ahead-confirm-4 ran before
-    this fix, so its numbers describe that path, not the packed blob's.
+    The arms are `git archive` exports with no pyproject.toml beside them, so bigrig_engine.home()
+    resolved to ~/.bigrig, which has no packed blob, and the engine read experts from the
+    safetensors shards: a slower path with other kernels than the packed blob the CLI sets up.
+    Card warm-ahead-confirm-4 ran before this fix, so its numbers describe that path. Every run
+    now gets a throwaway engine home (climb_turn.scratch_home: the checkout's blobs and results
+    linked in, empty saved conversations, so the developer's are never touched), and each arm's
+    own code is asked whether it will read the packed blob (climb_turn.engine_reads_blob) before
+    any run.
 """
+import atexit
+import importlib.util
 import itertools
 import json
 import math
 import os
 import re
+import shutil
 import statistics
 import subprocess
 import sys
@@ -50,7 +56,6 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CLIMB = os.path.join(ROOT, "bench", "climb_decode.py")
-BLOB = os.path.join(ROOT, "data", "blobs", "Qwen3.6-35B-A3B-4bit.experts")
 CARD = "warm-ahead-confirm-4"
 PIN = {"capacity": 8, "full_layers": ()}
 ESTIMATOR_ID = "paired-logratio-t9875-v1"
@@ -222,12 +227,22 @@ def analyse(rows) -> dict:
     return out
 
 
-def worker_env() -> dict:
+def _load(name: str):
+    spec = importlib.util.spec_from_file_location(name, os.path.join(ROOT, "bench", name + ".py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+ct = _load("climb_turn")      # scratch_home and engine_reads_blob, shared with the locked eval
+
+
+def worker_env(home: str) -> dict:
     """Each run's environment: this process's without BigRig switches or lab paths, so no arm
-    inherits a setting the others lack, and with the engine home pinned to this checkout."""
+    inherits a setting the others lack, and with `home` as the engine home."""
     env = {k: v for k, v in os.environ.items()
            if not k.startswith("BIGRIG_") and k not in ("LAB_RESULTS", "LAB_RUN_DIR")}
-    env["BIGRIG_HOME"] = ROOT
+    env["BIGRIG_HOME"] = home
     return env
 
 
@@ -252,10 +267,14 @@ def main():
 
     if not start["ac_power"]:
         stop("not on AC power (battery throttles the GPU about 1.7x)")
-    if not os.path.exists(BLOB):
-        stop(f"no packed blob at {BLOB}: run from the checkout that holds it")
+    home = ct.scratch_home(ROOT)
+    atexit.register(shutil.rmtree, home, ignore_errors=True)
     res["arms"] = export_arms(os.path.join(work, "arms"))
-    env = worker_env()
+    env = worker_env(home)
+    for arm, info in res["arms"].items():
+        if not ct.engine_reads_blob(info["dir"], env):
+            stop(f"arm {arm} would not read the packed blob in {os.path.join(ROOT, 'data', 'blobs')} "
+                 "(missing, incomplete or outdated): run from the checkout that holds a current one")
     failures = {}
     capacity = {}
     for regime, with_balloon, n_rounds in REGIMES:

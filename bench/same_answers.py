@@ -11,9 +11,16 @@ WHAT IT RUNS (the card is the authority; this file implements it)
     cache; turn 2 is also read once with turn 1 still cached (P5_hit, reported, not decided on).
 
     Candidate (the branch head, exported from git): every condition twice, the second pass in
-    reverse order. Base (released 6e87fcd): five cells once, to record today's behaviour and
-    prove the comparison catches a real difference. Then the speed guard: 6 rounds of the locked
-    climb_turn workload at 6.1 GB with the 5 GB balloon, base and candidate alternating.
+    reverse order. Base (--base, by default released 6e87fcd; the card names the commit the
+    candidate would replace): five cells once, to record its behaviour and prove the comparison
+    catches a real difference. Then the speed guard: 6 rounds of the locked climb_turn workload at
+    6.1 GB with the 5 GB balloon, base and candidate alternating, so it prices the candidate's
+    change against exactly the code it would replace.
+
+    Every worker runs under a throwaway engine home (climb_turn.scratch_home): the checkout's
+    blobs and measured results linked in, empty saved conversations, so a restored conversation
+    from an earlier run cannot serve a prompt and the developer's are never touched. Before any
+    run, each arm's own code is asked whether it will read each model's packed blob.
 
 ESTIMATOR (same-answers-v1)
     Primary: per model and prompt, the reply token ids of every candidate cell against the first
@@ -284,6 +291,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--out", default=os.environ.get("LAB_RESULTS"))
     ap.add_argument("--candidate", default=CANDIDATE_REF, help="commit or branch to test")
+    ap.add_argument("--base", default=BASE_COMMIT, help="commit or branch it is compared with")
     ap.add_argument("--worker", nargs=4, help=argparse.SUPPRESS)
     a = ap.parse_args()
     if a.worker:
@@ -292,25 +300,36 @@ def main() -> None:
         return
     if not a.out:
         sys.exit("set LAB_RESULTS or --out")
-    # THE ENGINE'S HOME, PINNED FOR EVERY WORKER. Each arm is a `git archive` export with no
+    # THE ENGINE'S HOME, ONE THROWAWAY PER JOB. Each arm is a `git archive` export with no
     # pyproject.toml beside it, so bigrig_engine.home() would resolve to ~/.bigrig: no packed blob
     # there, so the engine would read experts from the safetensors shards, a slower path with
-    # different kernels that users never run (the CLI packs on first run). Found 2026-11-13 when
-    # two identical engines scored 2.08x apart in the climb_turn baseline. Workers inherit this,
-    # including climb_turn.run_arm's for the speed guard; cell_problems stops on a cell without
-    # the blob.
-    os.environ["BIGRIG_HOME"] = ROOT
-    ct.wait_quiet()
-    cand_commit = ct.sh(["git", "-C", ROOT, "rev-parse", a.candidate]).strip()
+    # different kernels than the packed blob the CLI sets up. Found 2026-11-13 when two identical
+    # engines scored 2.08x apart in the climb_turn baseline. The checkout itself is no better a
+    # home: Session restores and saves conversations under it, deleting ones it did not write.
+    # Workers inherit this, including climb_turn.run_arm's for the speed guard; cell_problems
+    # still stops on a cell that read the shards.
+    for k in [k for k in os.environ if k.startswith("BIGRIG_")]:
+        del os.environ[k]                     # a switch in the caller's shell is not part of either arm
+    home = ct.scratch_home(ROOT)
+    os.environ["BIGRIG_HOME"] = home
+    rev = lambda ref: ct.sh(["git", "-C", ROOT, "rev-parse", ref]).strip()   # noqa: E731
+    cand_commit, base_commit = rev(a.candidate), rev(a.base)
     tmp = tempfile.mkdtemp(prefix="same_answers_")
     try:
-        res = run_job(ct.export_tree(BASE_COMMIT, os.path.join(tmp, "base")),
-                      ct.export_tree(cand_commit, os.path.join(tmp, "cand")))
+        base = ct.export_tree(base_commit, os.path.join(tmp, "base"))
+        cand = ct.export_tree(cand_commit, os.path.join(tmp, "cand"))
+        for arm in (base, cand):
+            for m in MODELS.values():
+                if not ct.engine_reads_blob(arm, dict(os.environ), m["dir"]):
+                    sys.exit(f"the engine in {arm} would not read the packed blob of {m['dir']} "
+                             "(missing, incomplete or outdated): run from the checkout that holds current ones")
+        ct.wait_quiet()
+        res = run_job(base, cand)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    res.update(candidate_commit=cand_commit,
-               candidate_tree=ct.sh(["git", "-C", ROOT, "rev-parse", f"{cand_commit}:bigrig_engine"]).strip(),
-               base_commit=BASE_COMMIT)
+        shutil.rmtree(home, ignore_errors=True)
+    res.update(candidate_commit=cand_commit, candidate_tree=rev(f"{cand_commit}:bigrig_engine"),
+               base_commit=base_commit, base_tree=rev(f"{base_commit}:bigrig_engine"))
     with open(a.out, "w") as f:
         json.dump(res, f, indent=1)
     print(json.dumps({k: res[k] for k in ("decision", "cells_compared", "cells_differing", "healthy", "speed")}))

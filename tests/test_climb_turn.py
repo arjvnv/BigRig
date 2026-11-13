@@ -108,17 +108,22 @@ except ValueError:
 print("=" * 78)
 print("3. END TO END ON FAKE ENGINES (real processes, no model)")
 print("=" * 78)
+# The fake reports the pinned plan only when its engine home is the one the caller set, so a
+# worker that does not inherit BIGRIG_HOME fails plan_ok (run_arm's launch feeds climb_turn,
+# confirm_turn and same_answers' speed guard alike).
 FAKE_SESSION = textwrap.dedent('''
-    import time
+    import os, time
     TEXT = {"Summarize": %r, "heat": %r, "Fibonacci": %r, "9:40": %r, "rivers": "Danube, Rhine and Seine."}
     DELAY = %r
+    HOME = %r
 
     class Session:
         def __init__(self, model_dir, budget_gb=None, capacity=None, full_layers=None, verbose=True):
             self.capacity, self.full = capacity, tuple(full_layers or ())
 
         def stats(self):
-            return {"capacity": self.capacity, "full_layers": len(self.full)}
+            home_ok = os.environ.get("BIGRIG_HOME") == HOME
+            return {"capacity": self.capacity if home_ok else -1, "full_layers": len(self.full)}
 
         def stream_text(self, messages, max_tokens=128, temperature=0.0, seed=0, think=False):
             prompt = messages[-1]["content"]
@@ -139,15 +144,20 @@ def fake_arm(parent, name, delay):
     os.makedirs(pkg)
     open(os.path.join(pkg, "__init__.py"), "w").close()
     with open(os.path.join(pkg, "session.py"), "w") as f:
-        f.write(FAKE_SESSION % (LONG_TEXT, *SHORT_TEXTS, delay))
+        f.write(FAKE_SESSION % (LONG_TEXT, *SHORT_TEXTS, delay, CALLER_HOME))
     return os.path.join(parent, name)
 
 
+CALLER_HOME = "/the/engine/home/the/caller/set"
+saved_home = os.environ.get("BIGRIG_HOME")
+os.environ["BIGRIG_HOME"] = CALLER_HOME
 with tempfile.TemporaryDirectory() as tmp:
     base, cand = fake_arm(tmp, "base", 0.004), fake_arm(tmp, "cand", 0.002)
     res = ct.run_eval(base, cand, balloon_gb=0, python=sys.executable)
     check("gates pass end to end", (res["exact"], res["healthy"], res["plan_ok"]) == (1, 1, 1),
           {k: res[k] for k in ("exact", "healthy", "plan_ok")})
+    check("...so every worker inherited the caller's engine home (the fake's plan depends on it)",
+          res["plan_ok"] == 1)
     check("a 2x faster fake measures between 1.4x and 2.6x", 1.4 < res["speedup"] < 2.6, res["speedup"])
     check("runs happen in base/cand/cand/base order", [r["tag"] for r in res["runs"]] == list(ct.ORDER))
     real = {os.path.realpath(base), os.path.realpath(cand)}
@@ -158,6 +168,12 @@ with tempfile.TemporaryDirectory() as tmp:
     with open(os.path.join(cand, "bigrig_engine", "session.py"), "w") as f:
         f.write(src.replace("3 hours and 35 minutes", "3 hours and 36 minutes"))
     check("end to end, a changed reply fails exact", ct.run_eval(base, cand, balloon_gb=0)["exact"] == 0)
+    os.environ["BIGRIG_HOME"] = "/a/different/home"
+    check("a worker under another engine home fails plan_ok", ct.run_eval(base, cand, balloon_gb=0)["plan_ok"] == 0)
+if saved_home is None:
+    os.environ.pop("BIGRIG_HOME", None)
+else:
+    os.environ["BIGRIG_HOME"] = saved_home
 
 print("\n" + "=" * 78)
 print(f"{'ALL TESTS PASSED' if not FAIL else str(len(FAIL)) + ' FAILURES: ' + ', '.join(FAIL)}")

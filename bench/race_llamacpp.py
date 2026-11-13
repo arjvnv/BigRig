@@ -31,19 +31,24 @@ MAC SAFETY
     AC, or 900 s. In the sweep a killed setting is unhealthy and skipped; in the race it stops all.
 
 ENGINE HOME (fixed 2026-11-13, after card llamacpp-race-16gb-3 ran)
-    Every BigRig run's engine home is this checkout (worker_env). The BigRig arm is a `git archive`
-    export with no pyproject.toml beside it, so bigrig_engine.home() would otherwise resolve to
-    ~/.bigrig, which has no packed blob, and BigRig would read experts from the safetensors shards:
-    a slower path with other kernels, which users never run. Card llamacpp-race-16gb-3 ran before
-    this fix, so its BigRig numbers describe that path, not the packed blob's.
+    The BigRig arm is a `git archive` export with no pyproject.toml beside it, so
+    bigrig_engine.home() resolved to ~/.bigrig, which has no packed blob, and BigRig read experts
+    from the safetensors shards: a slower path with other kernels than the packed blob the CLI
+    sets up. Card llamacpp-race-16gb-3 ran before this fix, so its BigRig numbers describe that
+    path. Every run now gets a throwaway engine home (climb_turn.scratch_home: the checkout's
+    blobs and results linked in, empty saved conversations, so the developer's are never
+    touched), and the arm's own code is asked whether it will read the packed blob
+    (climb_turn.engine_reads_blob) before any run.
 """
 import argparse
+import atexit
 import http.client
 import importlib.util
 import json
 import math
 import os
 import re
+import shutil
 import signal
 import statistics
 import subprocess
@@ -55,7 +60,6 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CARD = "llamacpp-race-16gb-3"
 ESTIMATOR_ID = "race-paired-logratio-t95-v1"
 MODEL = os.path.join(ROOT, "models", "Qwen3.6-35B-A3B-4bit")
-BLOB = os.path.join(ROOT, "data", "blobs", os.path.basename(MODEL) + ".experts")
 GGUF = os.path.join(ROOT, "models", "Qwen3.6-35B-A3B-GGUF", "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf")
 GGUF_BYTES = 22360456160
 LLAMA = "/opt/homebrew/bin/llama-server"
@@ -100,6 +104,9 @@ def _load(name, path):
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+ct = _load("climb_turn", os.path.join(ROOT, "bench", "climb_turn.py"))   # scratch_home, engine_reads_blob
 
 
 def sh(cmd, **kw):
@@ -352,13 +359,13 @@ def decide(dec: dict, ttft: dict) -> dict:
     return {"decision": d, "decision_ttft_long": t}
 
 
-def worker_env() -> dict:
+def worker_env(home: str) -> dict:
     """Each run's environment: this process's without BigRig or llama.cpp switches or lab paths,
-    offline, and with BigRig's engine home pinned to this checkout."""
+    offline, and with `home` as BigRig's engine home."""
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(("BIGRIG_", "LLAMA_")) and k not in ("LAB_RESULTS", "LAB_RUN_DIR")}
     env["HF_HUB_OFFLINE"] = "1"
-    env["BIGRIG_HOME"] = ROOT
+    env["BIGRIG_HOME"] = home
     return env
 
 
@@ -399,8 +406,6 @@ def main():
         stop(f"llama-server is not {LLAMA_VERSION}")
     if os.path.getsize(GGUF) != GGUF_BYTES:
         stop("GGUF size changed")
-    if not os.path.exists(BLOB):
-        stop(f"no packed blob at {BLOB}: run from the checkout that holds it")
     run, arm, commit = "fixed", "base", BIGRIG_COMMITS["base"]
     arm_dir = os.path.realpath(os.path.join(work, "bigrig_arm"))
     os.makedirs(arm_dir)
@@ -409,7 +414,12 @@ def main():
     res["bigrig"] = {"arm": arm, "commit": commit, "from_run": run,
                      "engine_tree": sh(["git", "-C", ROOT, "rev-parse", f"{commit}:bigrig_engine"]).strip()}
     res["llama"] = {"version": LLAMA_VERSION, "gguf": os.path.basename(GGUF), "common_flags": LLAMA_COMMON}
-    env = worker_env()
+    home = ct.scratch_home(ROOT)
+    atexit.register(shutil.rmtree, home, ignore_errors=True)
+    env = worker_env(home)
+    if not ct.engine_reads_blob(arm_dir, env):
+        stop(f"BigRig would not read the packed blob in {os.path.join(ROOT, 'data', 'blobs')} "
+             "(missing, incomplete or outdated): run from the checkout that holds a current one")
     configs = {n: ["--worker", "bigrig", "--arm-dir", arm_dir, "--budget", str(b)] for n, b in BIGRIG_GRID}
     configs.update({n: ["--worker", "llama", "--flags", json.dumps(f)] for n, f in LLAMA_GRID})
     res["balloon_gb"] = 0.0 if a.smoke else BALLOON_GB

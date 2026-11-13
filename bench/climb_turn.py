@@ -43,12 +43,19 @@ WHY A FIXED PLAN AND A BALLOON
     else is open. The 5 GB balloon holds back page cache so that streamed reads cost what they
     would on a 16 GB Mac (card warm-ahead-confirm-4 explains why 5 GB and not 8).
 
-WHY THE ENGINE HOME IS PINNED (fixed 2026-11-13, after climb 2)
+WHY EACH EVAL GETS ITS OWN ENGINE HOME (fixed 2026-11-13, after climb 2)
     The base arm is a `git archive` export with no pyproject.toml beside it, so without
     BIGRIG_HOME its bigrig_engine.home() resolves to ~/.bigrig, which has no packed blob, and the
     base reads experts from the safetensors shards while the candidate (this checkout) reads the
-    blob: two identical engines scored 2.08x apart. main() pins the home to this checkout for
-    every worker and refuses to start without the blob. Climb 2 set BIGRIG_HOME in its eval_cmd.
+    blob: two identical engines scored 2.08x apart. Climb 2 set BIGRIG_HOME to the checkout in
+    its eval_cmd. Pointing it at the checkout has a cost of its own: each worker's Session
+    restores and saves conversations under home/data/sessions, deleting ones it did not write,
+    so evals overwrote the developer's saved conversations and each run reloaded the previous
+    run's. main() therefore runs both arms under scratch_home(): the checkout's blobs and
+    measured results linked in, an empty sessions folder of its own. It also drops BigRig
+    switches inherited from the caller's shell, and asks each arm's own code whether it will
+    read the packed blob (engine_reads_blob) before any run. bench/confirm_turn.py, frozen with
+    its card, calls run_eval itself and still uses the checkout as home.
 """
 import argparse
 import ctypes
@@ -190,6 +197,34 @@ def export_tree(commit: str, dest: str) -> str:
     tar = subprocess.run(["git", "-C", ROOT, "archive", commit, "bigrig_engine"], capture_output=True, check=True)
     subprocess.run(["tar", "-x", "-C", dest], input=tar.stdout, check=True)
     return dest
+
+
+def scratch_home(root: str) -> str:
+    """A throwaway engine home for one eval: `root`'s packed blobs, measured results (the planner
+    reads them), corpora and traces linked in, and an empty data/sessions of its own, so the
+    engine's saved conversations neither come from nor go to the developer's checkout. Records
+    the engine writes under data/results still land in `root`'s. Remove it with shutil.rmtree."""
+    home = tempfile.mkdtemp(prefix="bigrig_home_")
+    os.makedirs(os.path.join(home, "data", "sessions"))
+    for sub in ("blobs", "results", "corpora", "traces"):
+        src = os.path.join(root, "data", sub)
+        if os.path.isdir(src):
+            os.symlink(src, os.path.join(home, "data", sub))
+    return home
+
+
+def engine_reads_blob(arm: str, env: dict, model: str = MODEL) -> bool:
+    """Whether the engine in `arm`, run with `env`, would read `model`'s experts from its packed blob.
+
+    Asks the arm's own expert_source, which also wants the manifest, a size equal to its
+    total_bytes and a current version: a file-exists check passes an incomplete or outdated blob,
+    and the engine then reads the shards without saying so."""
+    code = ("import sys; sys.path.insert(0, sys.argv[1]); import bigrig_engine; "
+            "from bigrig_engine import stream; print(stream.expert_source(sys.argv[2])[1])")
+    p = subprocess.run([sys.executable, "-c", code, arm, model], env=env, capture_output=True, text=True,
+                       stdin=subprocess.DEVNULL)
+    lines = p.stdout.strip().splitlines()
+    return p.returncode == 0 and bool(lines) and lines[-1].endswith(".experts")
 
 
 # ---------------------------------------------------------------- worker (fresh process per run)
@@ -366,16 +401,23 @@ def main() -> None:
         return
     if not a.out:
         sys.exit("set LAB_RESULTS or --out")
-    blob = os.path.join(ROOT, "data", "blobs", os.path.basename(MODEL) + ".experts")
-    if not os.path.exists(blob):
-        sys.exit(f"no packed blob at {blob}: run from the checkout that holds it")
-    os.environ["BIGRIG_HOME"] = ROOT          # inherited by both workers; see the module docstring
-    wait_quiet()
+    for k in [k for k in os.environ if k.startswith("BIGRIG_")]:
+        del os.environ[k]                     # a switch in the caller's shell is not part of either arm
+    home = scratch_home(ROOT)
+    os.environ["BIGRIG_HOME"] = home          # inherited by both workers; see the module docstring
     tmp = tempfile.mkdtemp(prefix="climb_turn_")
     try:
-        res = run_eval(export_tree(BASE_COMMIT, os.path.join(tmp, "base")), ROOT)
+        base = export_tree(BASE_COMMIT, os.path.join(tmp, "base"))
+        for arm in (base, ROOT):
+            if not engine_reads_blob(arm, dict(os.environ)):
+                sys.exit(f"the engine in {arm} would not read the packed blob under "
+                         f"{os.path.join(ROOT, 'data', 'blobs')} (missing, incomplete or outdated): "
+                         "run from the checkout that holds a current one")
+        wait_quiet()
+        res = run_eval(base, ROOT)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+        shutil.rmtree(home, ignore_errors=True)
     res["cand_commit"] = sh(["git", "-C", ROOT, "rev-parse", "HEAD"]).strip()
     with open(a.out, "w") as f:
         json.dump(res, f, indent=1)
