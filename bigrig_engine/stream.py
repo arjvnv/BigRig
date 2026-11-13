@@ -543,6 +543,16 @@ class ExpertPool:
         """The resident arrays of expert e in views mode. KeyError if it is not resident."""
         return self._views[int(e)]
 
+    def expert_arrays(self, e: int) -> tuple:
+        """Resident expert e's arrays in build_arrays order, in either mode: its views, or its
+        slice of the slot tensors. KeyError if it is not resident."""
+        if self.views:
+            return self.views_of(e)
+        slot = int(self.g2s[int(e)])
+        if slot < 0:
+            raise KeyError(e)
+        return tuple(self._slots[(proj, comp)][slot] for proj in self.projections for comp in self.spec[proj])
+
     # -- residency ----------------------------------------------------------
     def slot_of(self, e: int) -> int:
         return int(self.g2s[e])
@@ -1249,7 +1259,17 @@ class StreamingSwitchGLU(nn.Module):
             # slot ids -- one gather, on device. No np.array(indices), so MLX keeps pipelining
             # instead of draining the queue. Measured: each per-layer drain costs about 2 ms on
             # this model, against 0.44 ms of actual GPU work for the whole layer.
-            return self._forward(x, mx.take(self._pool.g2s_device(), indices.astype(mx.uint32)))
+            if not (SAME_ANSWERS and VIEWS_PREFILL and x.reshape(-1, x.shape[-1]).shape[0] > 1):
+                return self._forward(x, mx.take(self._pool.g2s_device(), indices.astype(mx.uint32)))
+            # A PROMPT CHUNK ON A WHOLE LAYER TAKES THE STREAMED LAYERS' ARITHMETIC (SAME_ANSWERS):
+            # one quantized_matmul per expert over the rows routed to it, on that expert's slice
+            # of the slots. Costs one host read per layer per chunk, in prefill only; decode
+            # (one row) keeps the sync-free gather above, which equals that arithmetic bit for
+            # bit at one row per expert.
+            gi = np.array(indices, copy=False).astype(np.int64)
+            k = gi.shape[-1]
+            y = self._forward_views(x.reshape(-1, x.shape[-1]), gi.reshape(-1, k), self._pool.expert_arrays)
+            return y.reshape(*gi.shape[:-1], k, y.shape[-1])
         if self.bypass:
             # MEASUREMENT ONLY -- OUTPUT IS DELIBERATELY WRONG.
             # Everything stays on device: no host read, so MLX pipelines all 48 layers exactly
@@ -1362,8 +1382,8 @@ class StreamingSwitchGLU(nn.Module):
             return self._forward(x, mx.array(self.ensure(gi)))
         self.chunked_calls += 1
         xf = x.reshape(-1, x.shape[-1])
-        if VIEWS_PREFILL and (flat.shape[0] >= VIEWS_MIN_TOKENS
-                              and len(np.unique(flat)) >= VIEWS_MIN_SHARE * self._pool.n_experts):
+        if VIEWS_PREFILL and (SAME_ANSWERS or (flat.shape[0] >= VIEWS_MIN_TOKENS
+                              and len(np.unique(flat)) >= VIEWS_MIN_SHARE * self._pool.n_experts)):
             self.views_calls += 1
             y = self._forward_views(xf, flat)          # fast, and not the pool path's arithmetic
             return y.reshape(*gi.shape[:-1], k, y.shape[-1])
@@ -1515,6 +1535,18 @@ PREFILL_EVAL_EVERY = 8
 #     same class of difference chunk width already causes -- and the two benchmarks say that is
 #     not a quality loss. `--slot-pool` (or BIGRIG_VIEWS_PREFILL=0) restores the copy path.
 VIEWS_PREFILL = os.environ.get("BIGRIG_VIEWS_PREFILL", "1") == "1"
+
+# ONE ARITHMETIC FOR EVERY MEMORY BUDGET (card same-answers-every-budget).
+#     Without this the reply depended on the expert plan the budget produced (measured 2026-11-12:
+#     11 slots + 3 whole layers left the 8-slot reply at about token 15). Two paths disagreed with
+#     the per-expert arithmetic above: short prompt chunks went through `_forward_views_exact`,
+#     whose sorted gathers are cut at the pool's capacity, and whole layers ran prompt chunks
+#     through one sorted gather over all their experts. With this on, every multi-row MoE call --
+#     streamed or whole layer, any capacity, any chunk size -- is one quantized_matmul per expert
+#     over the rows routed to it, so what a row computes depends on the prompt and the chunk, never
+#     on the plan. Decode already agreed (one row per expert, bit-identical either way). Needs
+#     VIEWS_PREFILL; BIGRIG_SAME_ANSWERS=0 restores the capacity-cut path.
+SAME_ANSWERS = os.environ.get("BIGRIG_SAME_ANSWERS", "1") == "1"
 # THE FILE AS THE POOL, FOR DECODE: RESIDENT EXPERTS ARE LIVE VIEWS, NOT COPIES.
 #     In views mode a streamed layer's pool holds no slot tensors. Admitting an expert wraps its
 #     page-cache bytes as a zero-copy view and keeps the view alive; Metal wires those pages while
