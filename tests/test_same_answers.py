@@ -123,6 +123,12 @@ check("code loaded from outside the arm is a stop", any("outside" in w for w in 
 c = cell("qwen3.6", "x")
 c["rows"]["P2"]["text"] = "no keyword here " * 20
 check("a Qwen reply without its keyword is a stop", "unhealthy P2" in sa.cell_problems(c))
+c = cell("qwen3.6", "x")
+c["blob"] = ""
+check("a cell that read the safetensors shards instead of the packed blob is a stop",
+      any("packed blob" in w for w in sa.cell_problems(c)), sa.cell_problems(c))
+c["blob"] = "/x/data/blobs/m.experts"
+check("...and one that read the packed blob is not", sa.cell_problems(c) == [], sa.cell_problems(c))
 c = cell("olmoe", "x")
 c["rows"]["P2"]["text"] = "no keyword here " * 20
 check("OLMoE (base model) only needs 16 tokens", sa.cell_problems(c) == [], sa.cell_problems(c))

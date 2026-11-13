@@ -103,8 +103,13 @@ def worker(arm: str, model: str, cond: dict, out: str) -> None:
     s.close()
     modules = {n: getattr(mod, "__file__", None) for n, mod in list(sys.modules.items())
                if n == "bigrig_engine" or n.startswith("bigrig_engine.")}
+    try:
+        from bigrig_engine import stream
+        blob = stream.expert_source(MODELS[model]["dir"])[1]   # the session's own choice of source
+    except ImportError:                                    # the tests' fake engines have no stream
+        blob = None
     with open(out, "w") as f:
-        json.dump({"rows": rows, "modules": modules,
+        json.dump({"rows": rows, "modules": modules, "blob": blob,
                    "plan": {"capacity": st.get("capacity"), "full_layers": st.get("full_layers")}}, f)
 
 
@@ -163,6 +168,8 @@ def cell_problems(cell: dict) -> list:
     arm = os.path.realpath(cell["arm"])
     if not cell["modules"] or any(f and not os.path.realpath(f).startswith(arm + os.sep) for f in cell["modules"].values()):
         why.append("bigrig_engine loaded from outside its arm")
+    if cell.get("blob") == "":
+        why.append("experts read from the safetensors shards, not the packed blob users run")
     why += [f"unhealthy {n}" for n, row in cell["rows"].items() if not healthy(cell["model"], n, row)]
     return why
 
@@ -285,6 +292,14 @@ def main() -> None:
         return
     if not a.out:
         sys.exit("set LAB_RESULTS or --out")
+    # THE ENGINE'S HOME, PINNED FOR EVERY WORKER. Each arm is a `git archive` export with no
+    # pyproject.toml beside it, so bigrig_engine.home() would resolve to ~/.bigrig: no packed blob
+    # there, so the engine would read experts from the safetensors shards, a slower path with
+    # different kernels that users never run (the CLI packs on first run). Found 2026-11-13 when
+    # two identical engines scored 2.08x apart in the climb_turn baseline. Workers inherit this,
+    # including climb_turn.run_arm's for the speed guard; cell_problems stops on a cell without
+    # the blob.
+    os.environ["BIGRIG_HOME"] = ROOT
     ct.wait_quiet()
     cand_commit = ct.sh(["git", "-C", ROOT, "rev-parse", a.candidate]).strip()
     tmp = tempfile.mkdtemp(prefix="same_answers_")
