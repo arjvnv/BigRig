@@ -17,10 +17,10 @@ WHAT IT RUNS (the card is the authority; this file implements it)
     6.1 GB with the 5 GB balloon, base and candidate alternating, so it prices the candidate's
     change against exactly the code it would replace.
 
-    Every worker runs under a throwaway engine home (climb_turn.scratch_home): the checkout's
-    blobs and measured results linked in, empty saved conversations, so a restored conversation
-    from an earlier run cannot serve a prompt and the developer's are never touched. Before any
-    run, each arm's own code is asked whether it will read each model's packed blob.
+    Every worker runs under one throwaway engine home (climb_turn.scratch_home): the checkout's
+    blobs and measured results linked in, an empty read-only sessions folder, so no run restores
+    or saves a conversation and the developer's are never touched. Before any run, each arm's own
+    code is asked whether it will read each model's packed blob.
 
 ESTIMATOR (same-answers-v1)
     Primary: per model and prompt, the reply token ids of every candidate cell against the first
@@ -308,12 +308,18 @@ def main() -> None:
     # home: Session restores and saves conversations under it, deleting ones it did not write.
     # Workers inherit this, including climb_turn.run_arm's for the speed guard; cell_problems
     # still stops on a cell that read the shards.
+    rev = lambda ref: ct.sh(["git", "-C", ROOT, "rev-parse", ref]).strip()   # noqa: E731
+
+    def commit_of(ref: str) -> str:
+        c = ct.sh(["git", "-C", ROOT, "rev-parse", "--verify", "--quiet", ref + "^{commit}"]).strip()
+        if not c:
+            sys.exit(f"not a commit: {ref}")
+        return c
+    cand_commit, base_commit = commit_of(a.candidate), commit_of(a.base)
     for k in [k for k in os.environ if k.startswith("BIGRIG_")]:
         del os.environ[k]                     # a switch in the caller's shell is not part of either arm
     home = ct.scratch_home(ROOT)
     os.environ["BIGRIG_HOME"] = home
-    rev = lambda ref: ct.sh(["git", "-C", ROOT, "rev-parse", ref]).strip()   # noqa: E731
-    cand_commit, base_commit = rev(a.candidate), rev(a.base)
     tmp = tempfile.mkdtemp(prefix="same_answers_")
     try:
         base = ct.export_tree(base_commit, os.path.join(tmp, "base"))

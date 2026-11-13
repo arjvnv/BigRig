@@ -21,10 +21,13 @@ WHY THIS FILE EXISTS
 
 Run: .venv/bin/python tests/test_bench_home.py
 """
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import shutil
+import signal
 import sys
 import tempfile
 import textwrap
@@ -118,6 +121,8 @@ def developer_shell():
 
 
 ct = load("climb_turn")
+_tmpdir = tempfile.gettempdir()
+LEFT_BEFORE = {n for n in os.listdir(_tmpdir) if n.startswith("bigrig_home_")}
 
 print("=" * 78)
 print("0. scratch_home AND engine_reads_blob, FOR REAL")
@@ -128,7 +133,12 @@ with tempfile.TemporaryDirectory() as tmp:
     check("a scratch home links the checkout's blobs and results and has its own empty sessions",
           is_scratch_of(h, c) and os.listdir(os.path.join(h, "data", "sessions")) == []
           and os.path.exists(os.path.join(h, "data", "results", "sync_curve.json")))
-    open(os.path.join(h, "data", "sessions", "written-by-a-run"), "w").close()
+    try:
+        open(os.path.join(h, "data", "sessions", "written-by-a-run"), "w").close()
+        writable = True
+    except PermissionError:
+        writable = False
+    check("its sessions folder is read-only, so no run restores or saves a conversation", not writable)
     shutil.rmtree(h)
     check("removing it leaves the checkout's blobs, results and saved conversations alone",
           not os.path.exists(h) and sorted(os.listdir(os.path.join(c, "data", "sessions"))) == ["my-saved-conversation"]
@@ -154,8 +164,11 @@ with tempfile.TemporaryDirectory() as tmp:
           not ct.engine_reads_blob(arm, {**os.environ, "BIGRIG_HOME": os.path.join(tmp, "empty")}, model))
     with open(os.path.join(arm, "bigrig_engine", "stream.py"), "a") as f:
         f.write("\nraise RuntimeError('broken engine')\n")
-    check("...and no when the arm's engine cannot even be imported",
-          not ct.engine_reads_blob(arm, {**os.environ, "BIGRIG_HOME": h}, model))
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        broken = ct.engine_reads_blob(arm, {**os.environ, "BIGRIG_HOME": h}, model)
+    check("...and no when the arm's engine cannot even be imported, saying why rather than 'no blob'",
+          not broken and "broken engine" in err.getvalue(), err.getvalue()[-200:])
     shutil.rmtree(h)
 
 print("=" * 78)
@@ -214,6 +227,9 @@ cd.export_arms = lambda dest: (exported.append(dest),
                                 for a, k in cd.ARMS.items()})[1]
 answer = [True]
 cd.ct.engine_reads_blob = lambda arm, env, model=None: (asked.append((arm, env.get("BIGRIG_HOME"))), answer[0])[1]
+registered, handlers = [], []
+cd.atexit = types.SimpleNamespace(register=lambda f, *a, **k: registered.append((f, a)))
+cd.signal = types.SimpleNamespace(signal=lambda sig, fn: handlers.append((sig, fn)), SIGTERM=signal.SIGTERM)
 with tempfile.TemporaryDirectory() as tmp:
     c = checkout(tmp)
     cd.ROOT = c
@@ -233,6 +249,15 @@ with tempfile.TemporaryDirectory() as tmp:
     check("every worker got a scratch home holding the checkout's blobs, and no other BigRig switch",
           len(envs) >= 2 and all(is_scratch_of(e.get("BIGRIG_HOME"), c) and set(bigrig_keys(e)) == {"BIGRIG_HOME"}
                                  for e in envs), [bigrig_keys(e) for e in envs])
+    check("its removal is registered for exit, and a SIGTERM exits through it",
+          registered[:1] == [(shutil.rmtree, (envs[0]["BIGRIG_HOME"],))] and handlers[0][0] == signal.SIGTERM,
+          (registered, handlers))
+    try:
+        handlers[0][1](signal.SIGTERM, None)
+        exited = None
+    except SystemExit as e:
+        exited = e.code
+    check("...(the handler exits with 143)", exited == 143, exited)
     envs.clear()
     asked.clear()
     answer[0] = False
@@ -244,6 +269,8 @@ with tempfile.TemporaryDirectory() as tmp:
     check("when an arm's engine would not read the blob, it stops before starting a worker",
           refused and not envs and len(asked) == 1, (refused, len(envs), len(asked)))
     os.environ.pop("LAB_RUN_DIR")
+    for _, a in registered:
+        shutil.rmtree(a[0], ignore_errors=True)
 
 print("=" * 78)
 print("3. bench/race_llamacpp.py (smoke mode: one BigRig run, one llama.cpp run)")
@@ -259,6 +286,10 @@ ra.subprocess = fake_subprocess(envs, llama_version=ra.LLAMA_VERSION)
 ra.mac_state = quiet_mac
 answer = [True]
 ra.ct.engine_reads_blob = lambda arm, env, model=None: (asked.append((arm, env.get("BIGRIG_HOME"))), answer[0])[1]
+registered, handlers = [], []
+ra.atexit = types.SimpleNamespace(register=lambda f, *a, **k: registered.append((f, a)))
+ra.signal = types.SimpleNamespace(signal=lambda sig, fn: handlers.append((sig, fn)), SIGTERM=signal.SIGTERM,
+                                  SIGKILL=signal.SIGKILL)
 with tempfile.TemporaryDirectory() as tmp:
     c = checkout(tmp)
     ra.ROOT = c
@@ -276,6 +307,9 @@ with tempfile.TemporaryDirectory() as tmp:
     check("both workers got a scratch home holding the checkout's blobs, and no other BigRig switch",
           len(envs) == 2 and all(is_scratch_of(e.get("BIGRIG_HOME"), c) and set(bigrig_keys(e)) == {"BIGRIG_HOME"}
                                  for e in envs), [bigrig_keys(e) for e in envs])
+    check("its removal is registered for exit, and a SIGTERM exits through it",
+          registered[:1] == [(shutil.rmtree, (envs[0]["BIGRIG_HOME"],))] and handlers[0][0] == signal.SIGTERM,
+          (registered, handlers))
     envs.clear()
     asked.clear()
     answer[0] = False
@@ -288,6 +322,8 @@ with tempfile.TemporaryDirectory() as tmp:
         refused = "would not read the packed blob" in json.load(open(os.path.join(tmp, "two", "res.json"))).get("stopped_reason", "")
     check("when the BigRig arm would not read the blob, it stops before starting a worker",
           refused and not envs and len(asked) == 1, (refused, len(envs)))
+    for _, a in registered:
+        shutil.rmtree(a[0], ignore_errors=True)
 
 print("=" * 78)
 print("4. bench/same_answers.py main(): --base, and the engine home")
@@ -297,7 +333,8 @@ sa = load("same_answers")
 seen, asked, exported = [], [], []
 sa.ct.wait_quiet = lambda *a, **k: quiet_mac()
 sa.ct.export_tree = lambda commit, dest: (exported.append(commit), dest)[1]
-sa.ct.sh = lambda cmd, **kw: ("sha-of-" + cmd[-1] + "\n")
+sa.ct.sh = lambda cmd, **kw: ("\n" if cmd[-1].startswith("bad-ref")
+                              else "sha-of-" + cmd[-1].removesuffix("^{commit}") + "\n")
 sa.ct.engine_reads_blob = lambda arm, env, model=None: (asked.append((arm, env.get("BIGRIG_HOME"), model)), True)[1]
 sa.run_job = lambda base, cand: (seen.append({**os.environ, "_layout": layout(os.environ.get("BIGRIG_HOME"))}),
                                  {"decision": "ships", "cells_compared": 0, "cells_differing": 0, "healthy": 1, "speed": {}})[1]
@@ -322,6 +359,22 @@ with tempfile.TemporaryDirectory() as tmp:
     sa.main()
     check("without --base it compares with the released engine, as before",
           exported[0] == "sha-of-" + sa.BASE_COMMIT, exported)
+    exported.clear()
+    sys.argv = ["same_answers.py", "--out", out, "--candidate", "bad-ref-typo"]
+    try:
+        sa.main()
+        refused = False
+    except SystemExit as e:
+        refused = "not a commit: bad-ref-typo" in str(e)
+    check("a ref that is not a commit is refused before anything is exported", refused and not exported, exported)
+
+print("=" * 78)
+print("5. NOTHING LEFT BEHIND")
+print("=" * 78)
+left = {n for n in os.listdir(_tmpdir) if n.startswith("bigrig_home_")} - LEFT_BEFORE
+check("every scratch home made in this file was removed (refusals and kills included)", not left, sorted(left))
+for n in left:
+    shutil.rmtree(os.path.join(_tmpdir, n), ignore_errors=True)
 
 print("\n" + "=" * 78)
 print(f"{'ALL TESTS PASSED' if not FAIL else str(len(FAIL)) + ' FAILURES: ' + ', '.join(FAIL)}")

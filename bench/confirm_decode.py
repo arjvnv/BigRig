@@ -48,6 +48,7 @@ import math
 import os
 import re
 import shutil
+import signal
 import statistics
 import subprocess
 import sys
@@ -269,6 +270,7 @@ def main():
         stop("not on AC power (battery throttles the GPU about 1.7x)")
     home = ct.scratch_home(ROOT)
     atexit.register(shutil.rmtree, home, ignore_errors=True)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))   # a kill still runs the cleanup above
     res["arms"] = export_arms(os.path.join(work, "arms"))
     env = worker_env(home)
     for arm, info in res["arms"].items():

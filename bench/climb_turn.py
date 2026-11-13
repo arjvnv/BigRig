@@ -52,7 +52,8 @@ WHY EACH EVAL GETS ITS OWN ENGINE HOME (fixed 2026-11-13, after climb 2)
     restores and saves conversations under home/data/sessions, deleting ones it did not write,
     so evals overwrote the developer's saved conversations and each run reloaded the previous
     run's. main() therefore runs both arms under scratch_home(): the checkout's blobs and
-    measured results linked in, an empty sessions folder of its own. It also drops BigRig
+    measured results linked in, an empty read-only sessions folder, so no run restores or
+    saves a conversation (Session's save already swallows the write error). It also drops BigRig
     switches inherited from the caller's shell, and asks each arm's own code whether it will
     read the packed blob (engine_reads_blob) before any run. bench/confirm_turn.py, frozen with
     its card, calls run_eval itself and still uses the checkout as home.
@@ -200,12 +201,17 @@ def export_tree(commit: str, dest: str) -> str:
 
 
 def scratch_home(root: str) -> str:
-    """A throwaway engine home for one eval: `root`'s packed blobs, measured results (the planner
-    reads them), corpora and traces linked in, and an empty data/sessions of its own, so the
-    engine's saved conversations neither come from nor go to the developer's checkout. Records
-    the engine writes under data/results still land in `root`'s. Remove it with shutil.rmtree."""
+    """A throwaway engine home for one harness invocation: `root`'s packed blobs, measured results
+    (the planner reads them), corpora and traces linked in, and an empty, read-only data/sessions,
+    so no run restores or saves a conversation (every run starts with an empty prompt cache, the
+    developer's saved conversations are never touched, and Session's save swallows the write
+    error, as at every commit these harnesses export). Records the engine writes under
+    data/results still land in `root`'s. Remove it with shutil.rmtree: it unlinks the links,
+    never what they point to."""
     home = tempfile.mkdtemp(prefix="bigrig_home_")
-    os.makedirs(os.path.join(home, "data", "sessions"))
+    sessions = os.path.join(home, "data", "sessions")
+    os.makedirs(sessions)
+    os.chmod(sessions, 0o555)
     for sub in ("blobs", "results", "corpora", "traces"):
         src = os.path.join(root, "data", sub)
         if os.path.isdir(src):
@@ -221,8 +227,15 @@ def engine_reads_blob(arm: str, env: dict, model: str = MODEL) -> bool:
     and the engine then reads the shards without saying so."""
     code = ("import sys; sys.path.insert(0, sys.argv[1]); import bigrig_engine; "
             "from bigrig_engine import stream; print(stream.expert_source(sys.argv[2])[1])")
-    p = subprocess.run([sys.executable, "-c", code, arm, model], env=env, capture_output=True, text=True,
-                       stdin=subprocess.DEVNULL)
+    try:
+        p = subprocess.run([sys.executable, "-c", code, arm, model], env=env, capture_output=True,
+                           text=True, stdin=subprocess.DEVNULL, timeout=120)
+    except subprocess.TimeoutExpired:
+        print(f"engine_reads_blob: the engine in {arm} did not answer within 120 s", file=sys.stderr)
+        return False
+    if p.returncode != 0:                     # a broken import is not a missing blob: say which
+        print(f"engine_reads_blob: the engine in {arm} failed: "
+              + " | ".join(p.stderr.strip().splitlines()[-3:]), file=sys.stderr)
     lines = p.stdout.strip().splitlines()
     return p.returncode == 0 and bool(lines) and lines[-1].endswith(".experts")
 

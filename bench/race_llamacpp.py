@@ -416,6 +416,7 @@ def main():
     res["llama"] = {"version": LLAMA_VERSION, "gguf": os.path.basename(GGUF), "common_flags": LLAMA_COMMON}
     home = ct.scratch_home(ROOT)
     atexit.register(shutil.rmtree, home, ignore_errors=True)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))   # a kill still runs the cleanup above
     env = worker_env(home)
     if not ct.engine_reads_blob(arm_dir, env):
         stop(f"BigRig would not read the packed blob in {os.path.join(ROOT, 'data', 'blobs')} "
