@@ -105,6 +105,8 @@ for path in ("_forward_views", "_forward_views_exact"):
           len(m1._fetcher.asked) == DISTINCT and len(set(m1._fetcher.asked)) == DISTINCT,
           len(m1._fetcher.asked))
     check(f"{path}: nothing is held after the block", m1._held is None)
+    check(f"{path}: prefill reads bypass the pool: nothing admitted, held or not",
+          m0._pool._resident == 0 and m1._pool._resident == 0, (m0._pool._resident, m1._pool._resident))
 
 # The reference itself: a chunk computed by hand from the experts' weights, so "identical with and
 # without holding" cannot pass by both sides being wrong in the same way.
@@ -191,6 +193,40 @@ m.read_ahead()
 check("a refused read-ahead (pending cap) is skipped, not raised, and holds nothing", m._ahead == [])
 check("short prompts do not read ahead: 15 tokens x top-3 < 4 x 12 experts",
       not h.routes_to_most_experts(15) and h.routes_to_most_experts(16))
+
+# A WHOLE LAYER BETWEEN TWO STREAMED ONES (a plan with whole layers). Its experts are resident
+# copies, so nothing may read its file pages ahead, and it must not swallow the read-ahead of the
+# streamed layer after it (it never fetches, so a held block's `then` would never run).
+
+
+class _RefreshFetcher(_Fetcher):
+    def refresh(self, keys):
+        self.events.append(("refresh", list(keys)))
+        return 0
+
+
+f = _RefreshFetcher()
+whole = stream.StreamingSwitchGLU(stream.ExpertPool(1, _SG(), E, E, SPEC, policy="lfuda", views=False).build(),
+                                  f, lambda up, gate: nn.silu(gate) * up, quantized=False, qparams={})
+h = stream.StreamHandle.__new__(stream.StreamHandle)
+h.manifest, h.fetcher = {"top_k": K}, f
+h.mods = [module(0, f), whole, module(2, f)]
+with h.prefill_layer(0, read_ahead=True):
+    for x, fl in CHUNKS:
+        h.mods[0]._forward_views(x, fl)
+check("the streamed layer before a whole layer reads none of the whole layer's experts ahead",
+      all(k[0] != 1 for ev in f.events for k in ev[1]), [ev[0] for ev in f.events])
+f.events.clear()
+with h.prefill_layer(1, read_ahead=True):
+    entered, held_inside = list(f.events), whole._held
+check("a whole layer gets a no-op block (nothing held, nothing counted)",
+      held_inside is None and whole.prefill_routed is None)
+check("...and the next streamed layer's read-ahead starts as the whole layer begins",
+      entered == [("prefetch", [(2, e) for e in range(E)])], entered[:1])
+h.rewarm(3)
+rk = f.events[-1][1] if f.events and f.events[-1][0] == "refresh" else []
+check("rewarm reads the streamed layer's experts and never a whole layer's",
+      len(rk) == 3 and all(k[0] == 0 for k in rk), rk)
 
 print("=" * 78)
 print("5. REWARM: EACH LAYER'S MOST-ROUTED EXPERTS, COUNTED ONLY DURING LAYER-MAJOR PREFILL")

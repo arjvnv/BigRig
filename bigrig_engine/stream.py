@@ -1818,9 +1818,20 @@ class StreamHandle:
         Keeps that layer's prefill expert arrays between chunks (StreamingSwitchGLU.holding) and,
         with `read_ahead`, starts reading the next layer's experts so they arrive while this layer
         computes (StreamingSwitchGLU.read_ahead). A layer the engine does not stream gets a no-op
-        block.
+        block, and if the next layer streams, its read-ahead starts at once.
+
+        WHOLE LAYERS ARE NOT STREAMED HERE. A whole layer (capacity == experts) holds every expert
+        as a resident copy and runs prompt chunks without reading the file, so it has nothing to
+        hold, and it never reaches the point where a held block starts the next layer's
+        read-ahead. Treating it as streamed cost every plan with whole layers the read-ahead of
+        its first streamed layer on each long prompt (the planner puts whole layers first; found
+        2026-11-13, after PR #2, whose confirm run pinned a plan without whole layers). A plan
+        with a streamed layer before a whole one (only through the Python API's `full_layers`)
+        also read all of the whole layer's experts ahead: up to 453 MB of pages nothing uses,
+        evicting streamed layers' experts. Changes no output: only which reads happen, and when.
         """
-        by_layer = {m._pool.layer: m for m in self.mods if m._pool is not None}
+        by_layer = {m._pool.layer: m for m in self.mods
+                    if m._pool is not None and m._pool.capacity < m._pool.n_experts}
         m, nxt = by_layer.get(layer), by_layer.get(layer + 1) if read_ahead else None
         if m is None:
             if nxt is not None:
