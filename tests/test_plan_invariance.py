@@ -177,6 +177,93 @@ check("some plan's prompt chunk differs from capacity 8's (the bug this fixes is
 check("...but never on a one-row (decode) chunk, which was already plan-invariant",
       not any(d[0] for d in differs.values()), differs)
 
+print("=" * 78)
+print("3. OUTSIDE STREAM MODE A WHOLE LAYER KEEPS THE OLD GATHER (attach(same_answers=False))")
+print("=" * 78)
+# Compress mode holds every layer whole on requantised weights: nothing streamed to agree with, so
+# the per-expert path would only cost time. Session passes same_answers only in stream mode.
+m_off = whole()
+m_off.same_answers = False
+y_off = [m_off(x, mx.array(idx)) for x, idx in CHUNKS]
+mx.eval(y_off)
+whole_name = "whole layer (capacity 64 = every expert)"
+check("a whole layer with same_answers off computes exactly the old gather",
+      all(mx.array_equal(a, b).item() for a, b in zip(y_off, off[whole_name])))
+check("...which is not the shared per-expert answer (the switch does something)",
+      not all(mx.array_equal(a, b).item() for a, b in zip(y_off, res[ref_name][1])))
+m_soff = streamed(8)
+m_soff.same_answers = False
+y_soff = [m_soff(x, mx.array(idx)) for x, idx in CHUNKS]
+mx.eval(y_soff)
+check("a streamed layer with same_answers off also keeps the old paths (the capacity-cut gather)",
+      all(mx.array_equal(a, b).item() for a, b in zip(y_soff, off[ref_name])))
+
+print("=" * 78)
+print("4. ONE ROW PER EXPERT: THE GATHER EQUALS PER-EXPERT quantized_matmul AT REAL SHAPES")
+print("=" * 78)
+# Decode relies on this: a whole layer's sync-free gather and a streamed layer's per-expert matmul
+# agree bit for bit at one row per expert. Checked here at Qwen3.6's projection shapes (2048 -> 512,
+# 512 -> 2048) and OLMoE's (2048 -> 1024, 1024 -> 2048), so an MLX upgrade that breaks it fails here.
+for d_in, d_out in ((2048, 512), (512, 2048), (2048, 1024), (1024, 2048)):
+    ne, rng2 = 4, np.random.default_rng(d_in + d_out)
+    w = mx.array(rng2.standard_normal((ne, d_out, d_in)).astype(np.float32) * 0.02).astype(mx.bfloat16)
+    wq, sc, bi = mx.quantize(w, group_size=GS, bits=BITS)
+    x1 = mx.array(rng2.standard_normal((ne, 1, 1, d_in)).astype(np.float32)).astype(mx.bfloat16)
+    got = mx.gather_qmm(x1, wq, sc, bi, rhs_indices=mx.arange(ne).reshape(ne, 1), transpose=True,
+                        group_size=GS, bits=BITS)
+    ref1 = mx.stack([mx.quantized_matmul(x1[e, 0], wq[e], sc[e], bi[e], transpose=True,
+                                         group_size=GS, bits=BITS) for e in range(ne)])
+    mx.eval(got, ref1)
+    check(f"one row per expert, {d_in} -> {d_out}: gather == per-expert, bit for bit",
+          mx.array_equal(got.reshape(ref1.shape), ref1).item())
+
+print("=" * 78)
+print("5. THE SESSION PASSES same_answers ONLY IN STREAM MODE")
+print("=" * 78)
+OLMOE = os.path.join(ROOT, "models", "OLMoE-1B-7B-0125-4bit")
+if not (os.path.isdir(OLMOE) and os.path.exists(os.path.join(ROOT, "data", "blobs", "OLMoE-1B-7B-0125-4bit.experts"))):
+    print("  SKIPPED - needs models/OLMoE-1B-7B-0125-4bit and its packed blob (no weights are loaded).")
+else:
+    from bigrig_engine import precision, session as _session
+
+    class _Stop(Exception):
+        pass
+
+    seen = []
+
+    def _no_load(*a, **k):
+        seen.append(k.get("same_answers"))
+        raise _Stop()
+
+    saved = stream.load_streaming, precision.ensure_compressed
+    stream.load_streaming = _no_load
+    precision.ensure_compressed = lambda blob, *a, **k: blob     # no requantised copy is written
+    try:
+        for budget, pref in ((4.9, None), (6.0, "compress")):
+            try:
+                _session.Session(OLMOE, budget_gb=budget, preference=pref, verbose=False, persist=False,
+                                 monitor=False)
+            except _Stop:
+                pass
+    finally:
+        stream.load_streaming, precision.ensure_compressed = saved
+    check("stream mode (OLMoE at 4.9 GB) attaches with same_answers on, compress mode (6.0 GB) with it off",
+          seen == [True, False], seen)
+
+handed = []
+saved = stream.load_lenient, stream.attach
+stream.load_lenient = lambda *a, **k: (None, None)
+stream.attach = lambda *a, **k: (handed.append(k.get("same_answers")), (_ for _ in ()).throw(KeyError("stop")))[1]
+try:
+    for flag in (True, False):
+        try:
+            stream.load_streaming("model", "blob", same_answers=flag)
+        except KeyError:
+            pass
+finally:
+    stream.load_lenient, stream.attach = saved
+check("load_streaming hands same_answers to attach", handed == [True, False], handed)
+
 print("\n" + "=" * 78)
 print(f"{'ALL TESTS PASSED' if not FAIL else str(len(FAIL)) + ' FAILURES: ' + ', '.join(FAIL)}")
 print("=" * 78)
