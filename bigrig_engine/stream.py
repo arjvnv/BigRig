@@ -31,6 +31,7 @@ THE INVARIANT THIS MODULE LIVES OR DIES BY
 """
 from __future__ import annotations
 
+import contextlib
 import inspect
 import json
 import os
@@ -758,6 +759,7 @@ class StreamingSwitchGLU(nn.Module):
         self.fetch_bytes = 0
         self.chunked_calls = 0
         self.views_calls = 0            # prefill chunks served straight from page-cache views
+        self._held = None               # expert id -> prefill arrays kept across calls; see holding()
         self.sync_seconds = 0.0
         self.bypass = False        # timing control; see __call__
         self._sync_free = False    # set by refresh() once the pool is known to be full
@@ -1076,6 +1078,35 @@ class StreamingSwitchGLU(nn.Module):
             out = _scatter_unsort(out, inv, slots.shape)
         return out.squeeze(-2)
 
+    @contextlib.contextmanager
+    def holding(self):
+        """Keep the expert arrays prefill builds for this layer until the block ends.
+
+        Layer-major prefill (layered.py) runs every chunk of a prompt through this layer back to
+        back. Without this, each chunk fetches, probes and wraps the same ~220 experts again, and
+        Metal imports the same pages as new buffers again: work per chunk that buys nothing. Inside
+        the block an expert's arrays are built the first time a chunk routes to it and reused by
+        later chunks. They are the same pages wrapped the same way, so every product is unchanged.
+        At most the layer's whole expert region (453 MB on Qwen3.6) is held at once, about what a
+        single chunk already wires, and it is all released when the block ends.
+        """
+        self._held = {}
+        try:
+            yield
+        finally:
+            self._held = None
+
+    def _prefill_arrays(self, experts):
+        """Expert id -> device arrays for one prefill call, from page-cache views (see holding())."""
+        pool = self._pool
+        held = self._held if self._held is not None else {}
+        new = [int(e) for e in experts if int(e) not in held]
+        if new:
+            blobs = self._fetcher.fetch([(pool.layer, e) for e in new])
+            for e in new:
+                held[e] = pool.build_arrays(e, blobs[(pool.layer, e)])
+        return lambda e: held[int(e)]
+
     def _forward_views(self, xf, flat, arrays_for=None):
         """Every (token, expert) pair of this chunk, computed per expert on a zero-copy view of
         that expert's bytes. Returns rows in the caller's (token, k) order. `arrays_for(e)`
@@ -1090,8 +1121,7 @@ class StreamingSwitchGLU(nn.Module):
         experts, starts = np.unique(spe, return_index=True)
         ends = np.append(starts[1:], len(spe))
         if arrays_for is None:
-            blobs = self._fetcher.fetch([(pool.layer, int(e)) for e in experts])
-            arrays_for = lambda e: pool.build_arrays(int(e), blobs[(pool.layer, int(e))])  # noqa: E731
+            arrays_for = self._prefill_arrays(experts)
         comps = [(proj, comp) for proj in pool.projections for comp in pool.spec[proj]]
         outs = []
         for e, lo, hi in zip(experts, starts, ends):
@@ -1156,12 +1186,12 @@ class StreamingSwitchGLU(nn.Module):
         order = np.argsort(pe, kind="stable")
         spe = pe[order]
         tok = order // k
-        blobs = self._fetcher.fetch([(pool.layer, int(e)) for e in np.unique(spe)])
+        arrays_for = self._prefill_arrays(np.unique(spe))
         comps = [(proj, comp) for proj in pool.projections for comp in pool.spec[proj]]
         outs = []
         for lo, hi in self._pair_chunks(spe, C):
             group = np.unique(spe[lo:hi])
-            per = [pool.build_arrays(int(e), blobs[(pool.layer, int(e))]) for e in group]
+            per = [arrays_for(e) for e in group]
             stacked = {key: mx.stack([per[j][i] for j in range(len(group))])
                        for i, key in enumerate(comps)}
             arrays = {proj: (stacked[(proj, "weight")], stacked.get((proj, "scales")),
@@ -1681,6 +1711,16 @@ class StreamHandle:
         self.model, self.pools, self.mods = model, pools, mods
         self.fetcher, self.manifest = fetcher, manifest
         self.full_layers = list(full_layers)
+
+    def prefill_layer(self, layer: int):
+        """Context held while layer-major prefill runs every chunk through decoder layer `layer`.
+
+        Keeps that layer's prefill expert arrays between chunks (StreamingSwitchGLU.holding). A
+        layer the engine does not stream gets a no-op block.
+        """
+        by_layer = {m._pool.layer: m for m in self.mods if m._pool is not None}
+        m = by_layer.get(layer)
+        return m.holding() if m is not None else contextlib.nullcontext()
 
     def warm(self, mode="auto"):
         """Fill the pools before generation, or deliberately do not.

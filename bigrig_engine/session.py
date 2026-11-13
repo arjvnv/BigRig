@@ -2158,7 +2158,9 @@ class Session:
                 maybe_quantize_kv_cache(one, quantized_kv_start=self.kv_quant_start,
                                         kv_group_size=KV_GROUP_SIZE, kv_bits=self.kv_bits)
                 cache[i] = one[0]
-        return layered.prefill(self.model, tokens, pc, step, progress=progress, settle=settle)
+        scope = self.handle.prefill_layer if self.handle is not None else None
+        return layered.prefill(self.model, tokens, pc, step, progress=progress, layer_scope=scope,
+                               settle=settle)
 
     def _prefill_layer_major(self, pc, prompt_in, gen_kw, prefill_step_size):
         """Read all but the prompt's last token layer by layer (layered.py); return what is left to read.
