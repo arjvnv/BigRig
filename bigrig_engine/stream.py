@@ -31,6 +31,7 @@ THE INVARIANT THIS MODULE LIVES OR DIES BY
 """
 from __future__ import annotations
 
+import contextlib
 import inspect
 import json
 import os
@@ -758,6 +759,10 @@ class StreamingSwitchGLU(nn.Module):
         self.fetch_bytes = 0
         self.chunked_calls = 0
         self.views_calls = 0            # prefill chunks served straight from page-cache views
+        self._held = None               # expert id -> prefill arrays kept across calls; see holding()
+        self._ahead = []                # keys read_ahead() issued for this layer, released by holding()
+        self._then = None               # holding()'s once-only hook after the first prefill fetch
+        self.prefill_routed = None      # per-expert routing counts of the last held prefill; see rewarm
         self.sync_seconds = 0.0
         self.bypass = False        # timing control; see __call__
         self._sync_free = False    # set by refresh() once the pool is known to be full
@@ -1076,6 +1081,69 @@ class StreamingSwitchGLU(nn.Module):
             out = _scatter_unsort(out, inv, slots.shape)
         return out.squeeze(-2)
 
+    @contextlib.contextmanager
+    def holding(self, then=None):
+        """Keep the expert arrays prefill builds for this layer until the block ends.
+
+        Layer-major prefill (layered.py) runs every chunk of a prompt through this layer back to
+        back. Without this, each chunk fetches, probes and wraps the same experts again (110-230 a
+        chunk on Qwen3.6), and
+        Metal imports the same pages as new buffers again: work per chunk that buys nothing. Inside
+        the block an expert's arrays are built the first time a chunk routes to it and reused by
+        later chunks. They are the same pages wrapped the same way, so every product is unchanged.
+        At most the layer's whole expert region (453 MB on Qwen3.6) is held at once, about what a
+        single chunk already wires, and it is all released when the block ends.
+
+        `then`, if given, is called once, right after the block's first chunk has fetched its
+        experts: the moment to start reading the next layer (see read_ahead), queued behind this
+        layer's own reads on the fetch pool rather than in front of them.
+        """
+        self._held, self._then = {}, then
+        self.prefill_routed = np.zeros(self._pool.n_experts, dtype=np.int64)
+        try:
+            yield
+        finally:
+            self._held, self._then = None, None
+            if self._ahead:
+                self._fetcher.drop(self._ahead)     # experts read ahead that no chunk routed to
+                self._ahead = []
+
+    def read_ahead(self) -> None:
+        """Start reading every expert of this layer on the fetch pool, and return at once (prefill).
+
+        Called by layer-major prefill while the PREVIOUS layer computes (StreamHandle.prefill_layer),
+        so this layer's first chunk finds its experts already in the page cache instead of waiting
+        on the SSD with the GPU idle. Only for prompts long enough to route to nearly every expert:
+        the reads are the ones the chunks would issue anyway, moved earlier. The first chunk's
+        fetch() collects them; whatever no chunk claims is released when this layer's block ends.
+        Changes no output: the bytes are the same file pages, whoever reads them first.
+        """
+        keys = [(self._pool.layer, e) for e in range(self._pool.n_experts)]
+        try:
+            self._fetcher.prefetch(keys)
+        except RuntimeError:            # the pending cap is a memory guard; reading late is correct
+            return
+        self._ahead = keys
+
+    def _count_routing(self, pe) -> None:
+        """Add one prefill call's routing to this layer's counts, inside holding() only."""
+        if self._held is not None:
+            self.prefill_routed += np.bincount(pe, minlength=self._pool.n_experts)
+
+    def _prefill_arrays(self, experts):
+        """Expert id -> device arrays for one prefill call, from page-cache views (see holding())."""
+        pool = self._pool
+        held = self._held if self._held is not None else {}
+        new = [int(e) for e in experts if int(e) not in held]
+        if new:
+            blobs = self._fetcher.fetch([(pool.layer, e) for e in new])
+            for e in new:
+                held[e] = pool.build_arrays(e, blobs[(pool.layer, e)])
+        if self._then is not None:
+            then, self._then = self._then, None
+            then()
+        return lambda e: held[int(e)]
+
     def _forward_views(self, xf, flat, arrays_for=None):
         """Every (token, expert) pair of this chunk, computed per expert on a zero-copy view of
         that expert's bytes. Returns rows in the caller's (token, k) order. `arrays_for(e)`
@@ -1084,14 +1152,14 @@ class StreamingSwitchGLU(nn.Module):
         pool = self._pool
         k = flat.shape[1]
         pe = flat.reshape(-1)
+        self._count_routing(pe)
         order = np.argsort(pe, kind="stable")
         spe = pe[order]
         tok = order // k
         experts, starts = np.unique(spe, return_index=True)
         ends = np.append(starts[1:], len(spe))
         if arrays_for is None:
-            blobs = self._fetcher.fetch([(pool.layer, int(e)) for e in experts])
-            arrays_for = lambda e: pool.build_arrays(int(e), blobs[(pool.layer, int(e))])  # noqa: E731
+            arrays_for = self._prefill_arrays(experts)
         comps = [(proj, comp) for proj in pool.projections for comp in pool.spec[proj]]
         outs = []
         for e, lo, hi in zip(experts, starts, ends):
@@ -1153,15 +1221,16 @@ class StreamingSwitchGLU(nn.Module):
         C = int(batch or pool.capacity)
         k = flat.shape[1]
         pe = flat.reshape(-1)
+        self._count_routing(pe)
         order = np.argsort(pe, kind="stable")
         spe = pe[order]
         tok = order // k
-        blobs = self._fetcher.fetch([(pool.layer, int(e)) for e in np.unique(spe)])
+        arrays_for = self._prefill_arrays(np.unique(spe))
         comps = [(proj, comp) for proj in pool.projections for comp in pool.spec[proj]]
         outs = []
         for lo, hi in self._pair_chunks(spe, C):
             group = np.unique(spe[lo:hi])
-            per = [pool.build_arrays(int(e), blobs[(pool.layer, int(e))]) for e in group]
+            per = [arrays_for(e) for e in group]
             stacked = {key: mx.stack([per[j][i] for j in range(len(group))])
                        for i, key in enumerate(comps)}
             arrays = {proj: (stacked[(proj, "weight")], stacked.get((proj, "scales")),
@@ -1209,7 +1278,8 @@ class StreamingSwitchGLU(nn.Module):
         if STAGING:
             self._stage_predicted()
         pred = None
-        if STAGING and self._next is not None and self._pred_m > 0 and (
+        warm = PREFETCH_WARM and x.reshape(-1, x.shape[-1]).shape[0] == 1
+        if (STAGING or warm) and self._next is not None and self._pred_m > 0 and (
                 self._next_gate is not None or self._pred_w is not None):
             xf = x.reshape(-1, x.shape[-1])[:1]
             if self._next_gate is not None:
@@ -1236,8 +1306,15 @@ class StreamingSwitchGLU(nn.Module):
             mx.eval(indices, pred)              # one drain, two answers
         gi = np.array(indices, copy=False).astype(np.int64)
         self.sync_seconds += time.perf_counter() - _t
+        warm_after = None
         if pred is not None:
-            self._speculate(np.array(pred))
+            p_np = np.array(pred)
+            if warm:
+                # Named now, READ LATER: queued only once this layer's own ensure() has its bytes,
+                # so a guess never competes with a read the current layer is waiting on.
+                nxt = self._next
+                warm_after = [(nxt.layer, int(e)) for e in p_np if nxt.g2s[int(e)] < 0]
+            self._speculate(p_np)
         k = gi.shape[-1]
         C = self._pool.capacity
         if k > C:
@@ -1276,6 +1353,8 @@ class StreamingSwitchGLU(nn.Module):
                 # VIEWS MODE: residency is the pool's business as before; the arithmetic runs on
                 # the resident views, one expert at a time. See VIEWS_DECODE.
                 self.ensure(gi)
+                if warm_after:
+                    self._fetcher.warm(warm_after)
                 y = self._forward_views(x.reshape(-1, x.shape[-1]), flat, self._pool.views_of)
                 return y.reshape(*gi.shape[:-1], k, y.shape[-1])
             # Unchunked path: byte-for-byte the shape handling of the stock SwitchGLU, so the
@@ -1488,6 +1567,17 @@ PAGE_BYTES = int(os.sysconf("SC_PAGESIZE")) if hasattr(os, "sysconf") else 16384
 #     BIGRIG_STAGE=1 turns it on.
 STAGING = os.environ.get("BIGRIG_STAGE", "0") == "1"
 
+# WARM THE NEXT LAYER'S PAGES IN THE BACKGROUND, IN DECODE. Right after a layer's routing read the
+# next layer's own router has named its likely experts (recall@8 83.6% on Qwen3.6); those not in
+# the next pool are read into the page cache on a separate small pool AFTER this layer has loaded
+# its own experts, while its expert math and the next layer's attention run. Only WHEN pages
+# arrive changes; ensure() still admits exactly what the real router selected. Measured on the
+# packed blob in the climb's paired eval (iteration 8, 2026-11-13): decode against released BigRig
+# 1.039x -> 1.142x, replies token-identical. Card warm-ahead-confirm-4 found no gain, but its arms
+# read the safetensors shards (no packed blob in ~/.bigrig), a different fetch path. Wider nets
+# measured worse: the top 16 guesses gave 1.015x (iteration 11). BIGRIG_PREFETCH_WARM=0 turns it off.
+PREFETCH_WARM = os.environ.get("BIGRIG_PREFETCH_WARM", "1") == "1"
+
 # WHETHER THE EXPERT-MAJOR SPANS ALSO ASK FOR THE SORTED GATHER KERNEL.
 #     They are always genuinely sorted, so this is only ever a question of speed. mlx_lm's own
 #     heuristic says do not bother under 64 rows, and a span at capacity 11 carries about 46, so
@@ -1681,6 +1771,62 @@ class StreamHandle:
         self.model, self.pools, self.mods = model, pools, mods
         self.fetcher, self.manifest = fetcher, manifest
         self.full_layers = list(full_layers)
+
+    def release_prefill(self) -> None:
+        """Drop any read-ahead no chunk claimed. Called when a layer-major prefill ends, however it
+        ends: a prefill abandoned at layer L has already queued layer L+1's reads."""
+        for m in self.mods:
+            if m._ahead and m._fetcher is not None:
+                m._fetcher.drop(m._ahead)
+            m._ahead = []
+
+    def rewarm(self, per_layer: int) -> int:
+        """After a layer-major prefill, read each layer's `per_layer` most-routed experts into the
+        page cache, in parallel, before decode starts; returns how many were cold.
+
+        WHY. A layer-major read streams every layer's experts through the page cache in layer
+        order, so when it ends only the last layers' are still there, and the first decode tokens
+        found the rest cold: decode after a long prompt was 3.4% slower (climb iteration 2). The
+        experts a prompt routed to most are the best guess at what its reply will ask for, and
+        reading them here costs one parallel pass at full queue depth instead of one cold read per
+        layer per token. Experts already cached are read too, which marks them recently used so
+        this pass evicts other pages first. Changes no output: it only decides what is cached.
+        """
+        keys = []
+        for m in sorted((m for m in self.mods if m._pool is not None and m.prefill_routed is not None),
+                        key=lambda m: m._pool.layer):
+            counts = m.prefill_routed
+            top = np.argsort(-counts, kind="stable")[:per_layer]
+            keys += [(m._pool.layer, int(e)) for e in top if counts[e] > 0]
+        return self.fetcher.refresh(keys) if keys else 0
+
+    def routes_to_most_experts(self, n_tokens: int) -> bool:
+        """Whether a prefill of `n_tokens` is expected to route to nearly every expert of a layer.
+
+        n tokens draw n x top-k experts from E; under uniform routing they touch 1 - exp(-n k / E)
+        of them, and n k >= 4 E is 98%. Real routing is skewed, so the true share is lower; the
+        threshold only keeps short prompts, which touch a fraction of each layer, from reading
+        whole layers ahead.
+        """
+        top_k = int(self.manifest.get("top_k") or 8)
+        n_experts = max((m._pool.n_experts for m in self.mods if m._pool is not None), default=0)
+        return n_experts > 0 and n_tokens * top_k >= 4 * n_experts
+
+    def prefill_layer(self, layer: int, read_ahead: bool = False):
+        """Context held while layer-major prefill runs every chunk through decoder layer `layer`.
+
+        Keeps that layer's prefill expert arrays between chunks (StreamingSwitchGLU.holding) and,
+        with `read_ahead`, starts reading the next layer's experts so they arrive while this layer
+        computes (StreamingSwitchGLU.read_ahead). A layer the engine does not stream gets a no-op
+        block.
+        """
+        by_layer = {m._pool.layer: m for m in self.mods if m._pool is not None}
+        m, nxt = by_layer.get(layer), by_layer.get(layer + 1) if read_ahead else None
+        if m is None:
+            if nxt is not None:
+                nxt.read_ahead()
+            return contextlib.nullcontext()
+        return m.holding(then=nxt.read_ahead if nxt is not None else None)
 
     def warm(self, mode="auto"):
         """Fill the pools before generation, or deliberately do not.

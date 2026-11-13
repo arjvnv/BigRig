@@ -41,6 +41,7 @@ from dataclasses import dataclass
 
 F_NOCACHE = 48                 # macOS: read around the unified buffer cache
 DEFAULT_THREADS = 8            # measured optimum on M4; calibrate_threads() re-measures per host
+WARM_THREADS = 4               # background next-layer cache warming (see ParallelFetcher.warm)
 DEFAULT_CHUNK = 4 << 20        # per-syscall read size
 
 
@@ -80,6 +81,19 @@ class Region:
 WARM_MODE = {"1": "on", "0": "off"}.get(os.environ.get("BIGRIG_WARM_READ", ""), "auto")
 PROBE_EVERY = 8
 FULL_AFTER_COLD = 64
+# ONE COLD EXPERT, READ AS SEVERAL REQUESTS AT ONCE.
+#     Decode finds about one expert per layer missing from the page cache (measured 31-40 of ~195
+#     admits a token on Qwen3.6 at a 6.1 GB budget beside a 5 GB balloon), and the GPU waits for
+#     that one read: a single 1.77 MB pread runs at queue depth 1, ~3.4 GB/s on this SSD, against
+#     ~6 GB/s with several requests in flight (module docstring). The read is split into page-
+#     aligned parts issued together on a small pool, so one expert arrives at the deeper queue's
+#     speed. Same file pages either way; the bytes read are dropped, the page cache keeps them.
+#     BIGRIG_SPLIT_READ sets the number of parts (1 turns it off).
+try:
+    SPLIT_PARTS = max(1, int(os.environ.get("BIGRIG_SPLIT_READ", "4")))
+except ValueError:
+    SPLIT_PARTS = 4                # a malformed setting must not stop the engine importing
+SPLIT_MIN_BYTES = 1 << 20      # below this one request is already short; splitting only adds overhead
 _PAGE = os.sysconf("SC_PAGESIZE")
 _libc = None
 
@@ -102,6 +116,23 @@ def pages_resident(addr: int, length: int) -> bool:
         return all(b & 1 for b in vec.raw)
     except Exception:                            # noqa: BLE001 -- never let a hint become a fault
         return True
+
+
+def split_ranges(offset: int, length: int, parts: int, page: int = _PAGE) -> list:
+    """[(offset, length)] covering [offset, offset + length) in `parts` pieces (one more when the
+    region starts mid-page; packed experts never do), every cut on a `page` boundary of the file,
+    so no page is read by two parts and none is skipped."""
+    if parts <= 1 or length <= page:
+        return [(offset, length)]
+    step = -(-length // parts)
+    step = -(-step // page) * page
+    end = offset + length
+    out, o = [], offset
+    while o < end:
+        cut = min(end, (o // page) * page + step)
+        out.append((o, cut - o))
+        o = cut
+    return out
 
 
 class WeightStore:
@@ -129,6 +160,7 @@ class WeightStore:
         self.warm_probes = 0                  # residency checks made
         self._view_n = 0                      # admits seen, for the sampled probe
         self._full_until = 0                  # probe every admit until this count
+        self._split_pool = None               # reads the parts of one cold region; see SPLIT_PARTS
         if verify:
             sizes = {}
             for k in self.layout:
@@ -181,6 +213,29 @@ class WeightStore:
             real file size, and the map is created once and never grown, so a file that changes
             later cannot silently extend what this hands out.
         """
+        ent = self._map(path)
+        if ent is None:
+            return None
+        mm, size, fd, base = ent
+        view = self._slice(mm, size, offset, length)
+        if view is not None and WARM_MODE != "off":
+            # Counters are approximate under the fetch pool's threads, and that is fine: they
+            # decide how often to look, never what bytes are handed out.
+            self._view_n += 1
+            n = self._view_n
+            if WARM_MODE == "on" or n <= self._full_until or n % PROBE_EVERY == 0:
+                self.warm_probes += 1
+                if not pages_resident(base + offset, length):
+                    self._full_until = n + FULL_AFTER_COLD
+                    try:
+                        self.fill(fd, offset, length)  # into the page cache; the bytes are dropped
+                        self.warm_reads += 1
+                    except OSError:
+                        pass                           # the view is still right; it will just fault
+        return view
+
+    def _map(self, path: str):
+        """(mmap, size, fd, base address) for `path`, created on first use; None for an empty file."""
         with self._map_lock:
             ent = self._maps.get(path)
             if ent is None:
@@ -195,23 +250,66 @@ class WeightStore:
                 base = int(np.frombuffer(mm, dtype=np.uint8, count=1).ctypes.data)
                 ent = (mm, size, fd, base)          # the fd stays open for the warm read
                 self._maps[path] = ent
-        mm, size, fd, base = ent
-        view = self._slice(mm, size, offset, length)
-        if view is not None and WARM_MODE != "off":
-            # Counters are approximate under the fetch pool's threads, and that is fine: they
-            # decide how often to look, never what bytes are handed out.
-            self._view_n += 1
-            n = self._view_n
-            if WARM_MODE == "on" or n <= self._full_until or n % PROBE_EVERY == 0:
-                self.warm_probes += 1
-                if not pages_resident(base + offset, length):
-                    self._full_until = n + FULL_AFTER_COLD
-                    try:
-                        os.pread(fd, length, offset)   # fills the page cache; the bytes are dropped
-                        self.warm_reads += 1
-                    except OSError:
-                        pass                           # the view is still right; it will just fault
-        return view
+        return ent
+
+    def refresh(self, key) -> int:
+        """Read `key`'s bytes into the page cache now, cold or not; returns how many were cold.
+
+        Pages already cached are read too: a read marks them recently used, so whatever is read
+        next evicts something else first. Returns the count of segments that were not resident.
+        """
+        cold = 0
+        for seg in self.segments(key):
+            ent = self._map(seg.path)
+            if ent is None or seg.offset + seg.length > ent[1]:
+                continue
+            cold += 0 if pages_resident(ent[3] + seg.offset, seg.length) else 1
+            try:
+                self.fill(ent[2], seg.offset, seg.length)
+            except OSError:
+                pass                                   # caching only; a later view still reads right
+        return cold
+
+    def warm_region(self, path: str, offset: int, length: int) -> bool:
+        """Pull one region's pages into the page cache if they are not there. True if it read.
+
+        The background half of decode's next-layer warming (ParallelFetcher.warm): the same file,
+        offset and length as the view ensure() will later wrap, so the only effect is WHEN the
+        pages arrive.
+        """
+        ent = self._map(path)
+        if ent is None or offset + length > ent[1] or pages_resident(ent[3] + offset, length):
+            return False
+        try:
+            self.fill(ent[2], offset, length)
+            return True
+        except OSError:
+            return False
+
+    def fill(self, fd: int, offset: int, length: int) -> None:
+        """Read [offset, offset + length) of `fd` into the page cache, dropping the bytes.
+
+        A region of at least SPLIT_MIN_BYTES is read as SPLIT_PARTS page-aligned parts issued at
+        once (see SPLIT_PARTS); a shorter one, or SPLIT_PARTS == 1, with one pread. Raises OSError
+        like pread does.
+        """
+        parts = split_ranges(offset, length, SPLIT_PARTS if length >= SPLIT_MIN_BYTES else 1)
+        if len(parts) == 1:
+            os.pread(fd, length, offset)
+            return
+        with self._map_lock:
+            if self._split_pool is None:
+                # Enough for every fetch-pool thread to have one region's parts in flight.
+                self._split_pool = ThreadPoolExecutor(max_workers=DEFAULT_THREADS * SPLIT_PARTS,
+                                                      thread_name_prefix="bigrig-split")
+            pool = self._split_pool
+        try:
+            futures = [pool.submit(os.pread, fd, n, o) for o, n in parts]
+        except RuntimeError:                           # the pool is shutting down: read it whole
+            os.pread(fd, length, offset)
+            return
+        for f in futures:
+            f.result()                                 # re-raises the part's OSError
 
     @staticmethod
     def _slice(mm, size: int, offset: int, length: int):
@@ -227,6 +325,9 @@ class WeightStore:
 
     def close_maps(self) -> None:
         with self._map_lock:
+            if self._split_pool is not None:
+                self._split_pool.shutdown(wait=True)
+                self._split_pool = None
             for mm, _size, fd, _base in self._maps.values():
                 try:
                     mm.close()
@@ -295,6 +396,8 @@ class ParallelFetcher:
         self._inflight: dict = {}
         self._lock = threading.Lock()
         self._closed = False
+        self._warm_pool = None                  # see warm(); created on first use
+        self._warm_queued = self.warm_issued = self.warm_read = 0
         self.bytes_read = 0
         self.seconds = 0.0
         self.n_fetches = 0
@@ -441,19 +544,76 @@ class ParallelFetcher:
             self.n_fetches += 1
         return out
 
+    def warm(self, keys, max_queued: int = 64) -> int:
+        """Warm these keys' pages into the page cache on a separate pool; return at once.
+
+        A SEPARATE POOL, so a guess about the next layer is never queued ahead of a read the
+        current layer is waiting for. Bounded: past `max_queued` outstanding regions new guesses
+        are skipped rather than allowed to build a backlog. Returns how many regions were queued.
+        """
+        with self._lock:
+            if self._closed:
+                return 0
+            if self._warm_pool is None:
+                self._warm_pool = ThreadPoolExecutor(max_workers=WARM_THREADS,
+                                                     thread_name_prefix="bigrig-warm")
+
+        def job(seg):
+            read = False
+            try:
+                read = self.store.warm_region(seg.path, seg.offset, seg.length)
+            finally:
+                with self._lock:
+                    self._warm_queued -= 1
+                    self.warm_read += int(read)
+
+        n = 0
+        for k in keys:
+            for seg in self.store.segments(k):
+                with self._lock:
+                    if self._warm_queued >= max_queued:
+                        return n
+                    self._warm_queued += 1
+                try:
+                    self._warm_pool.submit(job, seg)
+                except RuntimeError:                   # closed meanwhile; a guess is optional
+                    with self._lock:
+                        self._warm_queued -= 1
+                    return n
+                self.warm_issued += 1
+                n += 1
+        return n
+
+    def refresh(self, keys) -> int:
+        """WeightStore.refresh for every key, on the fetch pool, and wait; returns how many were cold."""
+        return sum(self._pool.map(self.store.refresh, list(keys)))
+
     def drop(self, keys=None) -> int:
         """Discard prefetched-but-unclaimed buffers. Returns how many were dropped.
 
         A prefetch that is never fetched holds its bytes forever, so a caller that speculatively
         prefetches -- which is the point -- needs a way to abandon the guesses that were wrong.
         """
+        pending = []
         with self._lock:
             ks = list(self._inflight) if keys is None else [k for k in keys if k in self._inflight]
             for k in ks:
                 f = self._inflight.get(k)
                 if f is not None and f.done():
                     self._inflight.pop(k, None)
-            return len(ks)
+                elif f is not None:
+                    pending.append((k, f))
+        # Still being read: release each the moment it lands, unless a fetch() has claimed or
+        # replaced it by then. Attached outside the lock: a future that finishes in between runs
+        # its callback right here, and _release takes the lock.
+        for k, f in pending:
+            f.add_done_callback(lambda done, k=k: self._release(k, done))
+        return len(ks)
+
+    def _release(self, key, fut) -> None:
+        with self._lock:
+            if self._inflight.get(key) is fut:
+                self._inflight.pop(key, None)
 
     def pending(self) -> int:
         """Keys prefetched and not yet collected."""
@@ -473,6 +633,8 @@ class ParallelFetcher:
                 return
             self._closed = True
         self._pool.shutdown(wait=True)
+        if self._warm_pool is not None:
+            self._warm_pool.shutdown(wait=True)
 
     def __enter__(self):
         return self

@@ -92,8 +92,8 @@ check("...and its measured recall on this model is written beside it", "83.6%" i
 check("the next router is wired for every streamed layer without needing a fitted file",
       "mod._next_gate = gate" in inspect.getsource(stream.attach))
 check("...and both are evaluated in a single drain", "mx.eval(indices, pred)" in _c)
-check("with staging off, or nothing to predict for, the original path runs untouched",
-      "if STAGING and self._next is not None and self._pred_m > 0 and (" in _c)
+check("with staging and warming off, or nothing to predict for, the original path runs untouched",
+      "if (STAGING or warm) and self._next is not None and self._pred_m > 0 and (" in _c)
 
 print("\n" + "=" * 84); print("4. WHAT IT ASKS FOR"); print("=" * 84)
 
