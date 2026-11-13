@@ -1293,7 +1293,8 @@ class StreamingSwitchGLU(nn.Module):
                 scores = mx.softmax(self._next_gate(xf), axis=-1, precise=True)[0]
             else:
                 scores = (xf @ self._pred_w)[0]
-            pred = mx.argpartition(-scores, self._pred_m - 1)[:self._pred_m]
+            m = WARM_WIDTH if (warm and not STAGING) else self._pred_m
+            pred = mx.argpartition(-scores, m - 1)[:m]
         _t = time.perf_counter()
         # A BLOCKING EVALUATION, ON PURPOSE. Starting the drain in the non-blocking form and
         # staging inside the wait read well and measured badly: with nothing at all to stage,
@@ -1575,6 +1576,10 @@ STAGING = os.environ.get("BIGRIG_STAGE", "0") == "1"
 # safetensors shards (no packed blob in ~/.bigrig), a different path. BIGRIG_PREFETCH_WARM=0 turns
 # it off.
 PREFETCH_WARM = os.environ.get("BIGRIG_PREFETCH_WARM", "1") == "1"
+# How many of the next router's top choices decode warms. Staging copies at most the router's
+# top-k (STAGE_MAX); warming only reads pages, so it can afford a wider net: recall of the true
+# next-layer experts is 83.6% at 8 and 96.8% at 16 on Qwen3.6 (measured over 65 decode steps).
+WARM_WIDTH = 16
 
 # WHETHER THE EXPERT-MAJOR SPANS ALSO ASK FOR THE SORTED GATHER KERNEL.
 #     They are always genuinely sorted, so this is only ever a question of speed. mlx_lm's own
