@@ -42,6 +42,13 @@ WHY A FIXED PLAN AND A BALLOON
     capacity 8 with no whole layers makes base and candidate comparable token for token whatever
     else is open. The 5 GB balloon holds back page cache so that streamed reads cost what they
     would on a 16 GB Mac (card warm-ahead-confirm-4 explains why 5 GB and not 8).
+
+WHY THE ENGINE HOME IS PINNED (fixed 2026-11-13, after climb 2)
+    The base arm is a `git archive` export with no pyproject.toml beside it, so without
+    BIGRIG_HOME its bigrig_engine.home() resolves to ~/.bigrig, which has no packed blob, and the
+    base reads experts from the safetensors shards while the candidate (this checkout) reads the
+    blob: two identical engines scored 2.08x apart. main() pins the home to this checkout for
+    every worker and refuses to start without the blob. Climb 2 set BIGRIG_HOME in its eval_cmd.
 """
 import argparse
 import ctypes
@@ -359,6 +366,10 @@ def main() -> None:
         return
     if not a.out:
         sys.exit("set LAB_RESULTS or --out")
+    blob = os.path.join(ROOT, "data", "blobs", os.path.basename(MODEL) + ".experts")
+    if not os.path.exists(blob):
+        sys.exit(f"no packed blob at {blob}: run from the checkout that holds it")
+    os.environ["BIGRIG_HOME"] = ROOT          # inherited by both workers; see the module docstring
     wait_quiet()
     tmp = tempfile.mkdtemp(prefix="climb_turn_")
     try:

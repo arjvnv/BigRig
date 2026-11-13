@@ -29,6 +29,13 @@ ESTIMATOR (estimator_id below; the card's decision rule reads these numbers)
 STOPS (kill criteria): any reply not exact; Mac not on AC power; swap more than 1.5 GB above
 the start; memory pressure critical; the balloon squeezed below 90% of its start; a run that fails or
 times out twice in one arm; an arm whose capacity differs; code loaded from the wrong arm.
+
+ENGINE HOME (fixed 2026-11-13, after card warm-ahead-confirm-4 ran)
+    Every run's engine home is this checkout (worker_env). The arms are `git archive` exports with
+    no pyproject.toml beside them, so bigrig_engine.home() would otherwise resolve to ~/.bigrig,
+    which has no packed blob, and the engine would read experts from the safetensors shards: a
+    slower path with other kernels, which users never run. Card warm-ahead-confirm-4 ran before
+    this fix, so its numbers describe that path, not the packed blob's.
 """
 import itertools
 import json
@@ -43,6 +50,7 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CLIMB = os.path.join(ROOT, "bench", "climb_decode.py")
+BLOB = os.path.join(ROOT, "data", "blobs", "Qwen3.6-35B-A3B-4bit.experts")
 CARD = "warm-ahead-confirm-4"
 PIN = {"capacity": 8, "full_layers": ()}
 ESTIMATOR_ID = "paired-logratio-t9875-v1"
@@ -214,6 +222,15 @@ def analyse(rows) -> dict:
     return out
 
 
+def worker_env() -> dict:
+    """Each run's environment: this process's without BigRig switches or lab paths, so no arm
+    inherits a setting the others lack, and with the engine home pinned to this checkout."""
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("BIGRIG_") and k not in ("LAB_RESULTS", "LAB_RUN_DIR")}
+    env["BIGRIG_HOME"] = ROOT
+    return env
+
+
 def main():
     res_path = os.environ.get("LAB_RESULTS") or sys.argv[1]
     work = os.environ.get("LAB_RUN_DIR") or tempfile.mkdtemp()
@@ -235,9 +252,10 @@ def main():
 
     if not start["ac_power"]:
         stop("not on AC power (battery throttles the GPU about 1.7x)")
+    if not os.path.exists(BLOB):
+        stop(f"no packed blob at {BLOB}: run from the checkout that holds it")
     res["arms"] = export_arms(os.path.join(work, "arms"))
-    env = {k: v for k, v in os.environ.items()
-           if not k.startswith("BIGRIG_") and k not in ("LAB_RESULTS", "LAB_RUN_DIR")}
+    env = worker_env()
     failures = {}
     capacity = {}
     for regime, with_balloon, n_rounds in REGIMES:
