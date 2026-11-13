@@ -927,6 +927,15 @@ class StreamingSwitchGLU(nn.Module):
                 return []
         return keys
 
+    def _issue_warm(self, keys) -> None:
+        """Queue the next layer's guesses for the page cache (ParallelFetcher.warm), if any.
+
+        Called only once this layer's own expert bytes are in hand, so a guess never competes with
+        a read the current layer is waiting on. Page cache only; the arithmetic never sees it.
+        """
+        if keys:
+            self._fetcher.warm(keys)
+
     def _stage_predicted(self) -> None:
         """Copy the experts the previous layer named for this one onto the GPU, if any."""
         ids = self._pool.stage_pred
@@ -1277,10 +1286,13 @@ class StreamingSwitchGLU(nn.Module):
         if STAGING:
             self._stage_predicted()
         pred = None
-        warm = PREFETCH_WARM and x.reshape(-1, x.shape[-1]).shape[0] == 1
+        n_rows = x.reshape(-1, x.shape[-1]).shape[0]
+        warm = PREFETCH_WARM and (n_rows == 1 or (PREFILL_WARM and n_rows <= PREFILL_WARM_MAX_ROWS))
         if (STAGING or warm) and self._next is not None and self._pred_m > 0 and (
                 self._next_gate is not None or self._pred_w is not None):
-            xf = x.reshape(-1, x.shape[-1])[:1]
+            # Decode predicts from its one row. A short prefill chunk predicts from every row and
+            # names the union of their top choices (see PREFILL_WARM); staging only uses row 0.
+            xf = x.reshape(-1, x.shape[-1])[:(n_rows if warm else 1)]
             if self._next_gate is not None:
                 # THE NEXT LAYER'S OWN ROUTER, ONE LAYER EARLY. Measured on Qwen3.6-35B-A3B-4bit
                 # over 65 decode steps against the true routing at the next layer:
@@ -1290,10 +1302,10 @@ class StreamingSwitchGLU(nn.Module):
                 # layer's input mostly agrees with itself applied to its own -- the signal two
                 # 2025-26 offloading papers report at 85-90%, confirmed here. Nothing to fit,
                 # nothing to download, one 2048x256 matmul a layer that rides the existing drain.
-                scores = mx.softmax(self._next_gate(xf), axis=-1, precise=True)[0]
+                scores = mx.softmax(self._next_gate(xf), axis=-1, precise=True)
             else:
-                scores = (xf @ self._pred_w)[0]
-            pred = mx.argpartition(-scores, self._pred_m - 1)[:self._pred_m]
+                scores = xf @ self._pred_w
+            pred = mx.argpartition(-scores, self._pred_m - 1, axis=-1)[:, :self._pred_m]
         _t = time.perf_counter()
         # A BLOCKING EVALUATION, ON PURPOSE. Starting the drain in the non-blocking form and
         # staging inside the wait read well and measured badly: with nothing at all to stage,
@@ -1308,6 +1320,9 @@ class StreamingSwitchGLU(nn.Module):
         warm_after = None
         if pred is not None:
             p_np = np.array(pred)
+            # Row 0's guesses first (all staging may use), then the other rows' new ones.
+            p_np = np.concatenate([p_np[0], np.setdiff1d(np.unique(p_np[1:]), p_np[0])]) \
+                if p_np.shape[0] > 1 else p_np[0]
             if warm:
                 # Named now, READ LATER: queued only once this layer's own ensure() has its bytes,
                 # so a guess never competes with a read the current layer is waiting on.
@@ -1352,8 +1367,7 @@ class StreamingSwitchGLU(nn.Module):
                 # VIEWS MODE: residency is the pool's business as before; the arithmetic runs on
                 # the resident views, one expert at a time. See VIEWS_DECODE.
                 self.ensure(gi)
-                if warm_after:
-                    self._fetcher.warm(warm_after)
+                self._issue_warm(warm_after)
                 y = self._forward_views(x.reshape(-1, x.shape[-1]), flat, self._pool.views_of)
                 return y.reshape(*gi.shape[:-1], k, y.shape[-1])
             # Unchunked path: byte-for-byte the shape handling of the stock SwitchGLU, so the
@@ -1365,10 +1379,12 @@ class StreamingSwitchGLU(nn.Module):
                               and len(np.unique(flat)) >= VIEWS_MIN_SHARE * self._pool.n_experts):
             self.views_calls += 1
             y = self._forward_views(xf, flat)          # fast, and not the pool path's arithmetic
+            self._issue_warm(warm_after)               # its own fetch is done (inside the call)
             return y.reshape(*gi.shape[:-1], k, y.shape[-1])
         if self._pool.views:
             self.views_calls += 1
             y = self._forward_views_exact(xf, flat)    # exact: the pool path's own kernel
+            self._issue_warm(warm_after)
             return y.reshape(*gi.shape[:-1], k, y.shape[-1])
         outs, issued = [], []
         if EXPERT_SORTED_PREFILL:
@@ -1575,6 +1591,14 @@ STAGING = os.environ.get("BIGRIG_STAGE", "0") == "1"
 # safetensors shards (no packed blob in ~/.bigrig), a different path. BIGRIG_PREFETCH_WARM=0 turns
 # it off.
 PREFETCH_WARM = os.environ.get("BIGRIG_PREFETCH_WARM", "1") == "1"
+
+# THE SAME WARMING FOR A SHORT PREFILL CHUNK. A short prompt is read in one chunk, and every layer
+# of it fetches the experts its rows route to on the critical path. Applied to every row, the next
+# router names the union of their likely experts; those not resident are queued for the page cache
+# once this layer's own fetch is done, exactly as in decode. Long prompts are covered by layered
+# prefill's whole-layer read-ahead instead, hence the row limit. BIGRIG_PREFILL_WARM=0 turns it off.
+PREFILL_WARM = os.environ.get("BIGRIG_PREFILL_WARM", "1") == "1"
+PREFILL_WARM_MAX_ROWS = 64
 
 # WHETHER THE EXPERT-MAJOR SPANS ALSO ASK FOR THE SORTED GATHER KERNEL.
 #     They are always genuinely sorted, so this is only ever a question of speed. mlx_lm's own
