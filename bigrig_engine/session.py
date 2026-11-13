@@ -23,7 +23,7 @@ import time
 
 import mlx.core as mx
 
-from . import autoconfig, calibrate, consent, precision, predict, stream, synccal
+from . import autoconfig, calibrate, consent, layered, precision, predict, stream, synccal
 from . import knee as _knee
 from . import workmem as _workmem
 
@@ -238,6 +238,11 @@ PREFILL_ACT_BYTES_PER_UNIT = 1628
 # says -- that is the whole reason this constant exists rather than a capacity-derived formula --
 # so it stays where it was measured, and the headroom is simply headroom.
 PREFILL_ACT_BUDGET_GB = 0.70
+
+# Read prompts one layer at a time instead of one chunk at a time (layered.py): the same work in
+# an order that fetches each layer's experts once per prompt rather than once per chunk, with a
+# bit-identical cache. On unless BIGRIG_LAYERED_PREFILL=0; unsupported models fall back by themselves.
+LAYERED_PREFILL = os.environ.get("BIGRIG_LAYERED_PREFILL", "1") != "0"
 
 # What the pool must leave behind for the reply. autoconfig held back a flat 3.0 GB covering the
 # OS, the MLX runtime, the KV cache and activations -- tuned for this model, but a constant, so a
@@ -2105,17 +2110,21 @@ class Session:
         done, total = 0, len(prompt_in)
         # A failure here is a failure of the same forward pass generation was about to run, and
         # it propagates as one; the half-advanced cache is never stored or handed on.
-        for i in range(0, len(seg), self.prefill_step):
-            chunk = mx.array(seg[i:i + self.prefill_step])
-            self.model(chunk[None], cache=pc)
-            if self.kv_bits:
-                maybe_quantize_kv_cache(pc, quantized_kv_start=self.kv_quant_start,
-                                        kv_group_size=KV_GROUP_SIZE, kv_bits=self.kv_bits)
-            mx.eval([c.state for c in pc])
-            done += int(chunk.shape[0])
-            if cb is not None:
-                cb(done, total)
-            mx.clear_cache()
+        if self._read_layer_major(pc, seg, self.prefill_step,
+                                  (lambda d, _t: cb(d, total)) if cb is not None else None):
+            done = len(seg)
+        else:
+            for i in range(0, len(seg), self.prefill_step):
+                chunk = mx.array(seg[i:i + self.prefill_step])
+                self.model(chunk[None], cache=pc)
+                if self.kv_bits:
+                    maybe_quantize_kv_cache(pc, quantized_kv_start=self.kv_quant_start,
+                                            kv_group_size=KV_GROUP_SIZE, kv_bits=self.kv_bits)
+                mx.eval([c.state for c in pc])
+                done += int(chunk.shape[0])
+                if cb is not None:
+                    cb(done, total)
+                mx.clear_cache()
         segment = self._prompt_cache.protected if self._cache_proven else self._prompt_cache.probation
         nbytes = sum(int(c.nbytes) for c in pc)
         if nbytes <= int(segment.max_bytes):
@@ -2128,6 +2137,40 @@ class Session:
             gen_kw["prompt_progress_callback"] = lambda d, t, _o=cb, _p=done: _o(d + _p, t + _p)
         self._pre_prefill = len(seg)
         return list(full_ids[b:])
+
+    def _read_layer_major(self, pc, tokens, step, progress=None) -> bool:
+        """Read `tokens` into `pc` one layer at a time (layered.py); False if the caller must read
+        them chunk by chunk instead, with `pc` untouched.
+
+        Only where the result is the cache the chunked loop would build: a cache to fill, no KV
+        quantization (both chunked loops quantize between chunks, which a layer-at-a-time read
+        cannot reproduce), and a model layered.py knows to be exact.
+        """
+        if not LAYERED_PREFILL or pc is None or self.kv_bits or not tokens:
+            return False
+        return layered.prefill(self.model, tokens, pc, step, progress=progress)
+
+    def _prefill_layer_major(self, pc, prompt_in, gen_kw, prefill_step_size):
+        """Read all but the prompt's last token layer by layer (layered.py); return what is left to read.
+
+        Generation's own prefill, for the prompts _snapshot_at_history leaves to it. Only token
+        ids (no input embeddings: images go to mlx_lm as before). The last token is left for
+        generation, exactly as mlx_lm leaves it; if the read is declined, `prompt_in` comes back
+        unchanged and mlx_lm reads all of it.
+        """
+        if "input_embeddings" in gen_kw or not isinstance(prompt_in, list) or len(prompt_in) < 2:
+            return prompt_in
+        step = self.prefill_step if prefill_step_size is None else int(prefill_step_size)
+        cb = gen_kw.get("prompt_progress_callback")
+        total = len(prompt_in)
+        progress = (lambda done, _t: cb(done, total)) if cb is not None else None
+        if not self._read_layer_major(pc, prompt_in[:-1], step, progress):
+            return prompt_in
+        read = total - 1
+        if cb is not None:
+            gen_kw["prompt_progress_callback"] = lambda d, t, _o=cb, _p=read: _o(d + _p, t + _p)
+        self._pre_prefill += read
+        return prompt_in[-1:]
 
     def stream_text(self, messages=None, prompt: str = "", max_tokens: int = 512,
                     temperature: float = 0.7, top_p: float = 0.95, seed: int | None = None,
@@ -2423,6 +2466,7 @@ class Session:
                 context_ids=full_ids)
         else:
             _mcls.__call__ = _capture
+            prompt_in = self._prefill_layer_major(pc, prompt_in, gen_kw, prefill_step_size)
             _produce = lambda: stream_generate(                              # noqa: E731
                 self.model, self.tokenizer, prompt_in, max_tokens=max_tokens,
                 sampler=sampler,
