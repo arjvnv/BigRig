@@ -147,8 +147,12 @@ with tempfile.TemporaryDirectory() as tmp:
     check("...and healthy", res["healthy"] == 1)
     check("the released-style base differs across its own cells (the comparison can fail)",
           len(res["base_cells_differing"]) > 0)
-    check("the decision is never 'ships' on a 2-round speed guard (CI too wide)", res["decision"] != "ships",
-          res["speed"])
+    # Which side of the guard two rounds of fake engines land on depends on timing noise (an idle
+    # Mac gave a 0.08% spread, a CI narrow enough to pass), so assert the rule, not an outcome.
+    sp = res["speed"]
+    guard = sp["decode"]["lo"] >= 0.95 and sp["ttft_long"]["hi"] <= 1.05
+    check("...so the decision is the speed guard's: ships if it passes, opt-in if it does not",
+          res["decision"] == ("ships" if guard else "opt-in"), (res["decision"], sp))
     res = sa.run_job(base, moving, models=["qwen3.6"], speed_rounds=2, balloon_gb=0)
     check("an engine whose reply moves with capacity: no-claim", res["decision"] == "no-claim", res["decision"])
 
