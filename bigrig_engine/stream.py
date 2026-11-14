@@ -543,6 +543,16 @@ class ExpertPool:
         """The resident arrays of expert e in views mode. KeyError if it is not resident."""
         return self._views[int(e)]
 
+    def expert_arrays(self, e: int) -> tuple:
+        """Resident expert e's arrays in build_arrays order, in either mode: its views, or its
+        slice of the slot tensors. KeyError if it is not resident."""
+        if self.views:
+            return self.views_of(e)
+        slot = int(self.g2s[int(e)])
+        if slot < 0:
+            raise KeyError(e)
+        return tuple(self._slots[(proj, comp)][slot] for proj in self.projections for comp in self.spec[proj])
+
     # -- residency ----------------------------------------------------------
     def slot_of(self, e: int) -> int:
         return int(self.g2s[e])
@@ -766,6 +776,7 @@ class StreamingSwitchGLU(nn.Module):
         self.sync_seconds = 0.0
         self.bypass = False        # timing control; see __call__
         self._sync_free = False    # set by refresh() once the pool is known to be full
+        self.same_answers = SAME_ANSWERS   # attach() turns it off outside stream mode; see SAME_ANSWERS
         # Prefetch, driven by a predictor over this layer's hidden state. See predict.py for why
         # the hidden state works where the routing history does not, and why being wrong is safe.
         self._pred_w = None        # (hidden, n_experts) weights, on device (fitted predictor)
@@ -1249,7 +1260,17 @@ class StreamingSwitchGLU(nn.Module):
             # slot ids -- one gather, on device. No np.array(indices), so MLX keeps pipelining
             # instead of draining the queue. Measured: each per-layer drain costs about 2 ms on
             # this model, against 0.44 ms of actual GPU work for the whole layer.
-            return self._forward(x, mx.take(self._pool.g2s_device(), indices.astype(mx.uint32)))
+            if not (self.same_answers and VIEWS_PREFILL and x.reshape(-1, x.shape[-1]).shape[0] > 1):
+                return self._forward(x, mx.take(self._pool.g2s_device(), indices.astype(mx.uint32)))
+            # A PROMPT CHUNK ON A WHOLE LAYER TAKES THE STREAMED LAYERS' ARITHMETIC (SAME_ANSWERS):
+            # one quantized_matmul per expert over the rows routed to it, on that expert's slice
+            # of the slots. Costs one host read per layer per chunk, in prefill only; decode
+            # (one row) keeps the sync-free gather above, which equals that arithmetic bit for
+            # bit at one row per expert.
+            gi = np.array(indices, copy=False).astype(np.int64)
+            k = gi.shape[-1]
+            y = self._forward_views(x.reshape(-1, x.shape[-1]), gi.reshape(-1, k), self._pool.expert_arrays)
+            return y.reshape(*gi.shape[:-1], k, y.shape[-1])
         if self.bypass:
             # MEASUREMENT ONLY -- OUTPUT IS DELIBERATELY WRONG.
             # Everything stays on device: no host read, so MLX pipelines all 48 layers exactly
@@ -1362,8 +1383,8 @@ class StreamingSwitchGLU(nn.Module):
             return self._forward(x, mx.array(self.ensure(gi)))
         self.chunked_calls += 1
         xf = x.reshape(-1, x.shape[-1])
-        if VIEWS_PREFILL and (flat.shape[0] >= VIEWS_MIN_TOKENS
-                              and len(np.unique(flat)) >= VIEWS_MIN_SHARE * self._pool.n_experts):
+        if VIEWS_PREFILL and (self.same_answers or (flat.shape[0] >= VIEWS_MIN_TOKENS
+                              and len(np.unique(flat)) >= VIEWS_MIN_SHARE * self._pool.n_experts)):
             self.views_calls += 1
             y = self._forward_views(xf, flat)          # fast, and not the pool path's arithmetic
             return y.reshape(*gi.shape[:-1], k, y.shape[-1])
@@ -1515,6 +1536,30 @@ PREFILL_EVAL_EVERY = 8
 #     same class of difference chunk width already causes -- and the two benchmarks say that is
 #     not a quality loss. `--slot-pool` (or BIGRIG_VIEWS_PREFILL=0) restores the copy path.
 VIEWS_PREFILL = os.environ.get("BIGRIG_VIEWS_PREFILL", "1") == "1"
+
+# ONE ARITHMETIC FOR EVERY MEMORY BUDGET (card same-answers-every-budget).
+#     Without this the reply depended on the expert plan the budget produced (measured 2026-11-12:
+#     11 slots + 3 whole layers left the 8-slot reply at about token 15). Two paths disagreed with
+#     the per-expert arithmetic above: short prompt chunks went through `_forward_views_exact`,
+#     whose sorted gathers are cut at the pool's capacity, and whole layers ran prompt chunks
+#     through one sorted gather over all their experts. With this on, every multi-row MoE call --
+#     streamed or whole layer, any capacity, any chunk size -- is one quantized_matmul per expert
+#     over the rows routed to it, so what a row computes depends on the prompt and the chunk, never
+#     on the plan. Decode already agreed (one row per expert, bit-identical either way).
+#     BIGRIG_SAME_ANSWERS=0 restores the old paths.
+#
+#     SCOPE: stream mode with the default file pool (VIEWS_PREFILL and views decode). Compress mode
+#     (every layer whole, weights requantised) has no streamed layer to agree with, so attach()
+#     leaves it on the old, faster whole-layer gather (Session passes same_answers only in stream
+#     mode); native mode never attaches. With --slot-pool or BIGRIG_VIEWS_DECODE=0 the unchunked
+#     path still gathers, so replies can differ across plans there.
+#
+#     COST, measured on synthetic weights at Qwen3.6's shapes, per whole-layer call: 2 rows 0.48 ->
+#     1.18 ms, 128 rows 10.8 -> 17.0 ms, 512 rows 19.1 -> 35.3 ms, plus one host read of the routing.
+#     Multi-row decode (--mtp and --draft verification, server batching) also takes it on whole
+#     layers, which then pay a host read per step instead of being sync-free; those modes are not
+#     exact by design or not covered by the claim.
+SAME_ANSWERS = os.environ.get("BIGRIG_SAME_ANSWERS", "1") == "1"
 # THE FILE AS THE POOL, FOR DECODE: RESIDENT EXPERTS ARE LIVE VIEWS, NOT COPIES.
 #     In views mode a streamed layer's pool holds no slot tensors. Admitting an expert wraps its
 #     page-cache bytes as a zero-copy view and keeps the view alive; Metal wires those pages while
@@ -1652,8 +1697,11 @@ def _quant_params(sg) -> tuple:
 def attach(model, blob_path: str, capacity, policy: str = "lfuda", threads: int = 8,
            predictors: dict | None = None, reroute: float = 0.0,
            nocache: bool = False, warm: bool = True, verbose: bool = True, full_layers=(),
-           manifest: dict | None = None):
+           manifest: dict | None = None, same_answers: bool = True):
     """Replace every SwitchGLU in `model` with a pool-backed one. Returns a handle.
+
+    `same_answers=False` keeps every layer on the old multi-row paths even when SAME_ANSWERS is on
+    (compress mode: see SAME_ANSWERS).
 
     `capacity` is per layer: an int, or a float in (0, 1] read as a fraction of the expert count.
     """
@@ -1689,6 +1737,7 @@ def attach(model, blob_path: str, capacity, policy: str = "lfuda", threads: int 
         pool = ExpertPool(li, sg, E, C, info["spec"], policy=policy,
                           quant=info.get("quant"), views=bool(VIEWS_DECODE and C < E)).build()
         m = StreamingSwitchGLU(pool, fetcher, sg.activation, quant, qp)
+        m.same_answers = SAME_ANSWERS and bool(same_answers)
         # Put it back exactly where it was found. Hardcoding `.mlp.switch_mlp` here would have
         # raised on gpt-oss rather than failing silently, but only after find_moe_sites had
         # already located the block under a different name.
@@ -1927,6 +1976,7 @@ class StreamHandle:
         return {"layers": len(self.pools),
                 "full_layers": sum(1 for p in self.pools if p.capacity == p.n_experts),
                 "sync_free": sum(1 for m in self.mods if m._sync_free),
+                "same_answers": bool(self.mods) and all(m.same_answers for m in self.mods),
                 "hits": h, "misses": m,
                 "miss_rate": m / (h + m) if (h + m) else 0.0,
                 # THE STREAMED CAPACITY, NOT POOL ZERO'S.
@@ -2197,7 +2247,7 @@ def warm_page_cache(path: str, budget_bytes: int = 0, should_stop=None,
 def load_streaming(model_dir: str, blob_path: str = "", capacity=0.5, policy: str = "lfuda",
                    threads: int = 8, nocache: bool = False, verbose: bool = True,
                    full_layers=(), manifest: dict | None = None, warm=True,
-                   predictors: dict | None = None, reroute: float = 0.0):
+                   predictors: dict | None = None, reroute: float = 0.0, same_answers: bool = True):
     """Load a model whose expert weights are NEVER materialised, then attach the pool.
 
     THE ONE LINE THAT MAKES STREAMING REAL IS `lazy=True`.
@@ -2218,7 +2268,7 @@ def load_streaming(model_dir: str, blob_path: str = "", capacity=0.5, policy: st
     h = attach(model, blob_path, capacity=capacity, policy=policy, threads=threads,
                nocache=nocache, verbose=verbose, full_layers=full_layers, manifest=manifest,
                predictors=predictors, reroute=reroute,
-               warm=warm)
+               warm=warm, same_answers=same_answers)
     mx.eval(model.parameters())      # the non-expert weights only; experts live in the pool
     return model, tok, h
 

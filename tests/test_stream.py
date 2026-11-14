@@ -392,8 +392,10 @@ check("the routing read stays synchronous -- the async form measured 79.5 vs 51.
       "async_eval" not in _attrs and "eval" in _attrs)      # the code, not its comments
 check("...and the whole mechanism is OFF by default, with the interleaved measurement beside it",
       'os.environ.get("BIGRIG_STAGE", "0") == "1"' in _src and "median 0.84x" in _src and "if not STAGING:" in _src)
+_streamed = _src.index("if self.bypass:")      # the streamed path, after the whole-layer branch (no staging there)
 check("staging happens at layer entry, while the GPU is on this layer's attention, before the read",
-      _src.index("self._stage_predicted()") < _src.index("mx.eval(indices, pred)") < _src.index("gi = np.array(indices, copy=False)"))
+      _streamed < _src.index("self._stage_predicted()") < _src.index("mx.eval(indices, pred)")
+      < _src.index("gi = np.array(indices, copy=False)", _streamed))
 check("a staged expert is admitted without a host copy, and the rest are fetched",
       "self._pool.admit_arrays(e, self._pool.stage[e], protect=uniq)" in _src and "if cold:" in _src)
 check("whatever was staged and not used is dropped every step -- a wrong guess holds nothing",

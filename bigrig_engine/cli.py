@@ -636,7 +636,8 @@ def _compress_tuned(a, path, man, blob, bits, group, top_k, non_expert) -> int:
         t0 = time.perf_counter()
         E = man["layers"][sorted(man["layers"], key=int)[0]]["n_experts"]
         model, tok, h = stream.load_streaming(path, blob, capacity=E, manifest=man,
-                                              warm="full", verbose=False)
+                                              warm="full", verbose=False,
+                                              same_answers=False)   # every layer whole: compress's arithmetic
         try:
             ids = evaluate.tokenize_once(tok, {"wiki": a.corpus}, 120_000)["wiki"]
             prof = tune.scan(model, h, ids, evaluate, window=a.window, windows=a.windows,

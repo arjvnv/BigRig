@@ -51,6 +51,12 @@ any setting, it says that too, before you download 40 GB to find out.
   is bit-identical to the same model held resident — checked layer by layer across 4,392 live
   layer computations. Prompt processing matches to the last bit of a float, or one bit off it:
   the same variation mlx_lm itself shows between two prefill widths.
+- **Same answers at any memory budget.** The memory you give BigRig decides how many experts each
+  layer keeps resident and which layers it holds whole, not the reply: every prompt chunk runs
+  the same per-expert arithmetic whatever the plan, so a greedy reply is token-for-token the same
+  at 6 GB as at 9. Across every plan Qwen3.6-35B-A3B (6.1–9.0 GB) and OLMoE-1B-7B (4.9–5.6 GB)
+  reach in streaming mode on an M4 Air, 0 of 190 comparisons differed, at no measurable cost in
+  speed. Compress mode, sampling, batching and speculative decoding are outside that guarantee.
 - **It answers for your machine, not ours.** Speed depends on your chip and your SSD, so BigRig
   measures rather than guesses. `bigrig doctor <model>` reads the model's shape from the hub,
   profiles your Mac, and tells you whether it runs, what memory it needs and roughly how many
