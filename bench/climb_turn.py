@@ -218,7 +218,9 @@ def scratch_home(root: str) -> str:
     if os.path.isdir(os.path.join(root, "data", "blobs")):
         os.symlink(os.path.join(root, "data", "blobs"), os.path.join(data, "blobs"))
     for sub in ("results", "corpora", "traces"):
-        src, dst = os.path.join(root, "data", sub), os.path.join(data, sub)
+        # The folder itself, even if the checkout links it elsewhere: cp -R would copy the link,
+        # and making "the copy" read-only would then make the checkout's own files read-only.
+        src, dst = os.path.realpath(os.path.join(root, "data", sub)), os.path.join(data, sub)
         if not os.path.isdir(src):
             continue
         if subprocess.run(["cp", "-cR", src, dst], capture_output=True).returncode != 0:
@@ -230,6 +232,8 @@ def scratch_home(root: str) -> str:
 
 def _set_writable(top: str, writable: bool) -> None:
     """chmod a copied tree read-only (or back), never following a link out of it."""
+    if os.path.islink(top):
+        return
     for d, dirs, files in os.walk(top, topdown=not writable):
         for name in files:
             p = os.path.join(d, name)

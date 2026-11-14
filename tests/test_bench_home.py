@@ -155,6 +155,24 @@ with tempfile.TemporaryDirectory() as tmp:
           not os.path.exists(h) and sorted(os.listdir(os.path.join(c, "data", "sessions"))) == ["my-saved-conversation"]
           and os.path.exists(os.path.join(c, "data", "blobs", MODEL_NAME + ".experts"))
           and os.path.exists(os.path.join(c, "data", "results", "sync_curve.json")))
+    # A checkout whose data/results is itself a link to a folder elsewhere: the copy must be of
+    # the folder, and making it read-only must not reach the folder the link points to.
+    linked = os.path.join(tmp, "linked")
+    elsewhere = os.path.join(tmp, "results-elsewhere")
+    os.makedirs(os.path.join(linked, "data", "blobs"))
+    os.makedirs(os.path.join(elsewhere, "nested"))
+    open(os.path.join(elsewhere, "nested", "record.json"), "w").close()
+    os.symlink(elsewhere, os.path.join(linked, "data", "results"))
+    h2 = ct.scratch_home(linked)
+    copied = os.path.join(h2, "data", "results")
+    check("a linked results folder is copied as a folder, read-only",
+          os.path.isdir(copied) and not os.path.islink(copied)
+          and os.path.exists(os.path.join(copied, "nested", "record.json"))
+          and not os.access(os.path.join(copied, "nested", "record.json"), os.W_OK))
+    ct.remove_home(h2)
+    check("...and the folder the checkout links to keeps its permissions",
+          os.access(os.path.join(elsewhere, "nested", "record.json"), os.W_OK)
+          and os.access(os.path.join(elsewhere, "nested"), os.W_OK) and not os.path.exists(h2))
     # A fake arm whose expert_source, like the real one, looks for the blob under its home.
     arm = os.path.join(tmp, "arm")
     os.makedirs(os.path.join(arm, "bigrig_engine"))
