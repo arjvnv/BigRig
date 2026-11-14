@@ -20,8 +20,9 @@ WHAT IT RUNS (the card is the authority; this file implements it)
     replace, on the plan a 16 GB Mac gets. Every candidate cell must report same_answers on.
 
     Every worker runs under one throwaway engine home (climb_turn.scratch_home): the checkout's
-    blobs and measured results linked in, an empty read-only sessions folder, so no run restores
-    or saves a conversation and the developer's are never touched. Before any run, each arm's own
+    blobs linked in, its measured results as a read-only copy and an empty read-only sessions
+    folder, so no run restores or saves a conversation or changes the records the planner reads:
+    an unpinned cell plans the same in both passes, and the developer's files are never touched. Before any run, each arm's own
     code is asked whether it will read each model's packed blob.
 
 ESTIMATOR (same-answers-v1)
@@ -352,7 +353,7 @@ def main() -> None:
         res = run_job(base, cand)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-        shutil.rmtree(home, ignore_errors=True)
+        ct.remove_home(home)
     res.update(candidate_commit=cand_commit, candidate_tree=rev(f"{cand_commit}:bigrig_engine"),
                base_commit=base_commit, base_tree=rev(f"{base_commit}:bigrig_engine"))
     with open(a.out, "w") as f:

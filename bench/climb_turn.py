@@ -52,8 +52,9 @@ WHY EACH EVAL GETS ITS OWN ENGINE HOME (fixed 2026-11-13, after climb 2)
     restores and saves conversations under home/data/sessions, deleting ones it did not write,
     so evals overwrote the developer's saved conversations and each run reloaded the previous
     run's. main() therefore runs both arms under scratch_home(): the checkout's blobs and
-    measured results linked in, an empty read-only sessions folder, so no run restores or
-    saves a conversation (Session's save already swallows the write error). It also drops BigRig
+    measured results in as read-only copies, an empty read-only sessions folder, so no run
+    restores or saves a conversation or changes a record the next run plans from (Session
+    swallows the write errors). It also drops BigRig
     switches inherited from the caller's shell, and asks each arm's own code whether it will
     read the packed blob (engine_reads_blob) before any run. bench/confirm_turn.py, frozen with
     its card, calls run_eval itself and still uses the checkout as home.
@@ -201,22 +202,52 @@ def export_tree(commit: str, dest: str) -> str:
 
 
 def scratch_home(root: str) -> str:
-    """A throwaway engine home for one harness invocation: `root`'s packed blobs, measured results
-    (the planner reads them), corpora and traces linked in, and an empty, read-only data/sessions,
-    so no run restores or saves a conversation (every run starts with an empty prompt cache, the
-    developer's saved conversations are never touched, and Session's save swallows the write
-    error, as at every commit these harnesses export). Records the engine writes under
-    data/results still land in `root`'s. Remove it with shutil.rmtree: it unlinks the links,
-    never what they point to."""
+    """A throwaway engine home for one harness invocation, removed with remove_home().
+
+    data/blobs is linked to `root`'s (the packed blobs and their page cache are the thing being
+    measured). data/results, data/corpora and data/traces are read-only copies (APFS clones, so
+    instant and free): the planner reads `root`'s measured records, and no run can change them, so
+    every run of a job plans from the same records and the checkout's stay as they were (a
+    Session records its peak working memory on close, which the next run's planner would read).
+    data/sessions is empty and read-only, so no run restores or saves a conversation. Session
+    swallows both write errors, identically at every commit these harnesses export."""
     home = tempfile.mkdtemp(prefix="bigrig_home_")
-    sessions = os.path.join(home, "data", "sessions")
-    os.makedirs(sessions)
-    os.chmod(sessions, 0o555)
-    for sub in ("blobs", "results", "corpora", "traces"):
-        src = os.path.join(root, "data", sub)
-        if os.path.isdir(src):
-            os.symlink(src, os.path.join(home, "data", sub))
+    data = os.path.join(home, "data")
+    os.makedirs(os.path.join(data, "sessions"))
+    os.chmod(os.path.join(data, "sessions"), 0o555)
+    if os.path.isdir(os.path.join(root, "data", "blobs")):
+        os.symlink(os.path.join(root, "data", "blobs"), os.path.join(data, "blobs"))
+    for sub in ("results", "corpora", "traces"):
+        src, dst = os.path.join(root, "data", sub), os.path.join(data, sub)
+        if not os.path.isdir(src):
+            continue
+        if subprocess.run(["cp", "-cR", src, dst], capture_output=True).returncode != 0:
+            shutil.rmtree(dst, ignore_errors=True)
+            shutil.copytree(src, dst, symlinks=True)         # not APFS: a plain copy
+        _set_writable(dst, False)
     return home
+
+
+def _set_writable(top: str, writable: bool) -> None:
+    """chmod a copied tree read-only (or back), never following a link out of it."""
+    for d, dirs, files in os.walk(top, topdown=not writable):
+        for name in files:
+            p = os.path.join(d, name)
+            if not os.path.islink(p):
+                os.chmod(p, 0o644 if writable else 0o444)
+        if not os.path.islink(d):
+            os.chmod(d, 0o755 if writable else 0o555)
+
+
+def remove_home(home: str) -> None:
+    """Remove a scratch_home(): its read-only copies made writable first; links are unlinked,
+    never followed."""
+    data = os.path.join(home, "data")
+    for sub in ("results", "corpora", "traces", "sessions"):
+        p = os.path.join(data, sub)
+        if os.path.isdir(p) and not os.path.islink(p):
+            _set_writable(p, True)
+    shutil.rmtree(home, ignore_errors=True)
 
 
 def engine_reads_blob(arm: str, env: dict, model: str = MODEL) -> bool:
@@ -437,7 +468,7 @@ def main() -> None:
         res = run_eval(base, ROOT)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-        shutil.rmtree(home, ignore_errors=True)
+        remove_home(home)
     res["cand_commit"] = sh(["git", "-C", ROOT, "rev-parse", "HEAD"]).strip()
     with open(a.out, "w") as f:
         json.dump(res, f, indent=1)

@@ -134,14 +134,24 @@ with tempfile.TemporaryDirectory() as tmp:
     check("a scratch home links the checkout's blobs and results and has its own empty sessions",
           is_scratch_of(h, c) and os.listdir(os.path.join(h, "data", "sessions")) == []
           and os.path.exists(os.path.join(h, "data", "results", "sync_curve.json")))
-    try:
-        open(os.path.join(h, "data", "sessions", "written-by-a-run"), "w").close()
-        writable = True
-    except PermissionError:
-        writable = False
-    check("its sessions folder is read-only, so no run restores or saves a conversation", not writable)
-    shutil.rmtree(h)
-    check("removing it leaves the checkout's blobs, results and saved conversations alone",
+    def refuses(fn):
+        try:
+            fn()
+            return False
+        except PermissionError:
+            return True
+    check("its sessions folder is read-only, so no run restores or saves a conversation",
+          refuses(lambda: open(os.path.join(h, "data", "sessions", "written-by-a-run"), "w").close()))
+    res_dir = os.path.join(h, "data", "results")
+    check("its results are a read-only copy, not a link: no run adds or rewrites a record the next plans from",
+          not os.path.islink(res_dir)
+          and refuses(lambda: open(os.path.join(res_dir, "workmem_new.json"), "w").close())
+          and refuses(lambda: open(os.path.join(res_dir, "sync_curve.json"), "w").close()))
+    check("...and the checkout's results are untouched by the attempts",
+          os.listdir(os.path.join(c, "data", "results")) == ["sync_curve.json"]
+          and os.access(os.path.join(c, "data", "results"), os.W_OK))
+    ct.remove_home(h)
+    check("remove_home removes it and leaves the checkout's blobs, results and saved conversations alone",
           not os.path.exists(h) and sorted(os.listdir(os.path.join(c, "data", "sessions"))) == ["my-saved-conversation"]
           and os.path.exists(os.path.join(c, "data", "blobs", MODEL_NAME + ".experts"))
           and os.path.exists(os.path.join(c, "data", "results", "sync_curve.json")))
@@ -170,7 +180,7 @@ with tempfile.TemporaryDirectory() as tmp:
         broken = ct.engine_reads_blob(arm, {**os.environ, "BIGRIG_HOME": h}, model)
     check("...and no when the arm's engine cannot even be imported, saying why rather than 'no blob'",
           not broken and "broken engine" in err.getvalue(), err.getvalue()[-200:])
-    shutil.rmtree(h)
+    ct.remove_home(h)
 
 print("=" * 78)
 print("1. bench/climb_turn.py main() (the locked eval)")
@@ -251,7 +261,7 @@ with tempfile.TemporaryDirectory() as tmp:
           len(envs) >= 2 and all(is_scratch_of(e.get("BIGRIG_HOME"), c) and set(bigrig_keys(e)) == {"BIGRIG_HOME"}
                                  for e in envs), [bigrig_keys(e) for e in envs])
     check("its removal is registered for exit, and a SIGTERM exits through it",
-          registered[:1] == [(shutil.rmtree, (envs[0]["BIGRIG_HOME"],))] and handlers[0][0] == signal.SIGTERM,
+          registered[:1] == [(cd.ct.remove_home, (envs[0]["BIGRIG_HOME"],))] and handlers[0][0] == signal.SIGTERM,
           (registered, handlers))
     try:
         handlers[0][1](signal.SIGTERM, None)
@@ -271,7 +281,7 @@ with tempfile.TemporaryDirectory() as tmp:
           refused and not envs and len(asked) == 1, (refused, len(envs), len(asked)))
     os.environ.pop("LAB_RUN_DIR")
     for _, a in registered:
-        shutil.rmtree(a[0], ignore_errors=True)
+        ct.remove_home(a[0])
 
 print("=" * 78)
 print("3. bench/race_llamacpp.py (smoke mode: one BigRig run, one llama.cpp run)")
@@ -309,7 +319,7 @@ with tempfile.TemporaryDirectory() as tmp:
           len(envs) == 2 and all(is_scratch_of(e.get("BIGRIG_HOME"), c) and set(bigrig_keys(e)) == {"BIGRIG_HOME"}
                                  for e in envs), [bigrig_keys(e) for e in envs])
     check("its removal is registered for exit, and a SIGTERM exits through it",
-          registered[:1] == [(shutil.rmtree, (envs[0]["BIGRIG_HOME"],))] and handlers[0][0] == signal.SIGTERM,
+          registered[:1] == [(ra.ct.remove_home, (envs[0]["BIGRIG_HOME"],))] and handlers[0][0] == signal.SIGTERM,
           (registered, handlers))
     envs.clear()
     asked.clear()
@@ -324,7 +334,7 @@ with tempfile.TemporaryDirectory() as tmp:
     check("when the BigRig arm would not read the blob, it stops before starting a worker",
           refused and not envs and len(asked) == 1, (refused, len(envs)))
     for _, a in registered:
-        shutil.rmtree(a[0], ignore_errors=True)
+        ct.remove_home(a[0])
 
 print("=" * 78)
 print("4. bench/same_answers.py main(): --base, and the engine home")
@@ -374,6 +384,8 @@ print("5. NOTHING LEFT BEHIND")
 print("=" * 78)
 left = sorted(n for n in os.listdir(tempfile.tempdir) if n.startswith("bigrig_home_"))
 check("every scratch home made in this file was removed (refusals and kills included)", not left, left)
+for n in left:
+    ct.remove_home(os.path.join(tempfile.tempdir, n))
 shutil.rmtree(tempfile.tempdir, ignore_errors=True)
 
 print("\n" + "=" * 78)

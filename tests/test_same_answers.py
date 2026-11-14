@@ -174,6 +174,13 @@ with tempfile.TemporaryDirectory() as tmp:
     old = dict(every, name="pin 0,64", full=0)
     check("...where the earlier (0,64) pin would have stopped the job",
           any("plan" in w for w in sa.cell_problems(sa.run_cell(steady, "olmoe", old))))
+    noflag = fake_arm(tmp, "noflag", False, same_answers=False)
+    try:
+        sa.run_job(base, noflag, models=["qwen3.6"], speed_rounds=0, balloon_gb=0)
+        stopped = ""
+    except SystemExit as e:
+        stopped = str(e)
+    check("run_job stops at the first candidate cell that reports same_answers off", "same_answers" in stopped, stopped)
     check("a candidate whose engine did not run with SAME_ANSWERS is a stop",
           any("same_answers" in w for w in sa.cell_problems(sa.run_cell(base, "olmoe", every), candidate=True)))
 
