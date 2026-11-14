@@ -4,8 +4,9 @@ WHAT IT RUNS (the card is the authority; this file implements it)
     Two models, each through every expert plan its budgets reach, each plan in a fresh process:
         qwen3.6  pinned (whole layers, other layers' capacity) (0,8) (0,11) (0,16) (1,12) (3,11)
                  (5,12) (6,11) at budget 9.0, plus the planner's own plan at 6.1 / 7.5 / 9.0 GB
-        olmoe    pinned (0,8) (0,12) (4,10) (9,13) (14,24) and (0,64) = every expert resident, at
-                 budget 5.0, plus the planner's plan at 2.0 / 3.0 / 5.0 GB
+        olmoe    pinned (0,8) (0,12) (4,10) (9,13) (14,24) and (16,64) = every expert resident, at
+                 budget 5.0, plus the planner's plan at 4.9 / 5.2 / 5.6 GB (the budgets where it
+                 streams: below 4.9 GB it is refused, above 5.6 GB it compresses)
     Every cell answers P1-P5 greedily, 128 tokens: the three climb_decode prompts, the 1,771-token
     README summary, and a two-turn conversation. Every primary reply is read from an empty prompt
     cache; turn 2 is also read once with turn 1 still cached (P5_hit, reported, not decided on).
@@ -14,12 +15,14 @@ WHAT IT RUNS (the card is the authority; this file implements it)
     reverse order. Base (--base, by default released 6e87fcd; the card names the commit the
     candidate would replace): five cells once, to record its behaviour and prove the comparison
     catches a real difference. Then the speed guard: 6 rounds of the locked climb_turn workload at
-    6.1 GB with the 5 GB balloon, base and candidate alternating, so it prices the candidate's
-    change against exactly the code it would replace.
+    6.1 GB with the 5 GB balloon, on the planner's own 6.1 GB plan (SPEED_PLAN, pinned), base and
+    candidate alternating, so it prices the candidate's change against exactly the code it would
+    replace, on the plan a 16 GB Mac gets. Every candidate cell must report same_answers on.
 
     Every worker runs under one throwaway engine home (climb_turn.scratch_home): the checkout's
-    blobs and measured results linked in, an empty read-only sessions folder, so no run restores
-    or saves a conversation and the developer's are never touched. Before any run, each arm's own
+    blobs linked in, its measured results as a read-only copy and an empty read-only sessions
+    folder, so no run restores or saves a conversation or changes the records the planner reads:
+    an unpinned cell plans the same in both passes, and the developer's files are never touched. Before any run, each arm's own
     code is asked whether it will read each model's packed blob.
 
 ESTIMATOR (same-answers-v1)
@@ -52,16 +55,26 @@ CANDIDATE_REF = "feat/same-answers"
 MAX_TOKENS = 128
 RUN_TIMEOUT_S = 900
 SPEED_ROUNDS = 6
+# The speed guard's plan: what the planner gives Qwen3.6 at 6.1 GB (a 16 GB Mac) from this
+# checkout's measured records, 3 whole layers and 13 experts a layer elsewhere (probed with the real
+# Session, loading stubbed, 2026-11-13). Pinned so both arms run it whatever records change during
+# the job; it prices the per-expert path on whole layers as well as on streamed ones.
+SPEED_PLAN = {"capacity": 13, "full_layers": 3}
 FOLLOW_UP = "Now explain what happens when the outdoor coil ices up."
 MODELS = {
     "qwen3.6": {"dir": os.path.join(ROOT, "models", "Qwen3.6-35B-A3B-4bit"), "checked": True,
                 "pinned": [(0, 8), (0, 11), (0, 16), (1, 12), (3, 11), (5, 12), (6, 11)],
                 "pinned_budget": 9.0, "budgets": [6.1, 7.5, 9.0]},
     "olmoe": {"dir": os.path.join(ROOT, "models", "OLMoE-1B-7B-0125-4bit"), "checked": False,
-              "pinned": [(0, 8), (0, 12), (4, 10), (9, 13), (14, 24), (0, 64)],
-              "pinned_budget": 5.0, "budgets": [2.0, 3.0, 5.0]},
+              # (16,64): every expert of every layer resident. The engine reports a layer holding
+              # all its experts as whole, so the pin names it that way; (0,64) is the same plan
+              # and would read back as 16 whole layers, a wrong-plan stop.
+              "pinned": [(0, 8), (0, 12), (4, 10), (9, 13), (14, 24), (16, 64)],
+              # OLMoE streams only from 4.9 GB (below: refused, too small) to 5.6 GB (above: the
+              # planner compresses, which needs consent). These give 0, 1 and 2 whole layers.
+              "pinned_budget": 5.0, "budgets": [4.9, 5.2, 5.6]},
 }
-BASE_CELLS = {"qwen3.6": ["pin 0,8", "pin 3,11", "budget 9.0"], "olmoe": ["pin 0,8", "pin 0,64"]}
+BASE_CELLS = {"qwen3.6": ["pin 0,8", "pin 3,11", "budget 9.0"], "olmoe": ["pin 0,8", "pin 16,64"]}
 PROMPT_NAMES = ["P1", "P2", "P3", "P4", "P5"]
 KEYWORDS = {"P1": ("heat",), "P2": ("def fib",), "P3": ("9:40",), "P4": ("BigRig",), "P5": ("ice", "defrost")}
 
@@ -116,7 +129,7 @@ def worker(arm: str, model: str, cond: dict, out: str) -> None:
     except ImportError:                                    # the tests' fake engines have no stream
         blob = None
     with open(out, "w") as f:
-        json.dump({"rows": rows, "modules": modules, "blob": blob,
+        json.dump({"rows": rows, "modules": modules, "blob": blob, "same_answers": st.get("same_answers"),
                    "plan": {"capacity": st.get("capacity"), "full_layers": st.get("full_layers")}}, f)
 
 
@@ -167,9 +180,12 @@ def healthy(model: str, name: str, row: dict) -> bool:
     return any(k in row["text"] for k in KEYWORDS[name.split("_")[0]]) and len(row["ids"]) >= floor and not loops
 
 
-def cell_problems(cell: dict) -> list:
-    """Reasons a cell invalidates the job (card kill criteria): wrong plan, foreign code, unhealthy reply."""
+def cell_problems(cell: dict, candidate: bool = False) -> list:
+    """Reasons a cell invalidates the job (card kill criteria): wrong plan, foreign code, unhealthy
+    reply, and for the candidate an engine that did not run with SAME_ANSWERS on."""
     why = []
+    if candidate and cell.get("same_answers") is not True:
+        why.append(f"candidate reports same_answers={cell.get('same_answers')!r}, not True")
     if cell["pin"] and cell["plan"] != cell["want_plan"]:
         why.append(f"plan {cell['plan']} != pinned {cell['want_plan']}")
     arm = os.path.realpath(cell["arm"])
@@ -249,10 +265,13 @@ def analyse(cand: list, base: list, speed: list) -> dict:
         speed_res = {"decode": paired([math.log(dec(c) / dec(b)) for b, c in speed]),
                      "ttft_long": paired([math.log(c["rows"][0]["ttft_s"] / b["rows"][0]["ttft_s"]) for b, c in speed])}
     invariant = not differing and healthy_all and total > 0
-    fast = bool(speed_res) and speed_res["decode"]["lo"] >= 0.95 and speed_res["ttft_long"]["hi"] <= 1.05
+    speed_plan_ok = bool(speed) and all(run.get("plan") == SPEED_PLAN for pair in speed for run in pair)
+    fast = (bool(speed_res) and speed_plan_ok and speed_res["decode"]["lo"] >= 0.95
+            and speed_res["ttft_long"]["hi"] <= 1.05)
     return {"decision": "ships" if invariant and fast else ("opt-in" if invariant else "no-claim"),
             "cells_compared": total, "cells_differing": len(differing), "differing": differing,
-            "healthy": int(healthy_all), "speed": speed_res, "base_cells_differing": base_diffs,
+            "healthy": int(healthy_all), "speed": speed_res, "speed_plan": SPEED_PLAN,
+            "speed_plan_ok": int(speed_plan_ok), "base_cells_differing": base_diffs,
             "secondary": secondary, "estimator_id": ESTIMATOR_ID, "card": CARD}
 
 
@@ -262,8 +281,8 @@ def run_job(base_arm: str, cand_arm: str, models=None, speed_rounds: int = SPEED
             balloon_gb: float = ct.BALLOON_GB, python: str = sys.executable) -> dict:
     models = models or list(MODELS)
 
-    def checked(cell):
-        why = cell_problems(cell)
+    def checked(cell, candidate=False):
+        why = cell_problems(cell, candidate)
         if why:
             raise SystemExit(f"STOP ({cell['model']} {cell['cond']}): " + "; ".join(why))
         return cell
@@ -275,13 +294,14 @@ def run_job(base_arm: str, cand_arm: str, models=None, speed_rounds: int = SPEED
         for m in models:
             conds = conditions(m) if pass_no == 1 else conditions(m)[::-1]
             for c in conds:
-                cell = checked(run_cell(cand_arm, m, c, python))
+                cell = checked(run_cell(cand_arm, m, c, python), candidate=True)
                 cell["pass"] = pass_no
                 cand.append(cell)
     speed = []
     for r in range(speed_rounds + 1):                                   # round 0 is the warm-up
         order = ("base", "cand") if r % 2 == 0 else ("cand", "base")
-        got = {tag: ct.run_arm(base_arm if tag == "base" else cand_arm, balloon_gb, python) for tag in order}
+        got = {tag: ct.run_arm(base_arm if tag == "base" else cand_arm, balloon_gb, python, pin=SPEED_PLAN)
+               for tag in order}
         if r > 0:
             speed.append((got["base"], got["cand"]))
     return analyse(cand, base, speed)
@@ -333,7 +353,7 @@ def main() -> None:
         res = run_job(base, cand)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-        shutil.rmtree(home, ignore_errors=True)
+        ct.remove_home(home)
     res.update(candidate_commit=cand_commit, candidate_tree=rev(f"{cand_commit}:bigrig_engine"),
                base_commit=base_commit, base_tree=rev(f"{base_commit}:bigrig_engine"))
     with open(a.out, "w") as f:

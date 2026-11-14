@@ -48,7 +48,6 @@ import json
 import math
 import os
 import re
-import shutil
 import signal
 import statistics
 import subprocess
@@ -415,7 +414,7 @@ def main():
                      "engine_tree": sh(["git", "-C", ROOT, "rev-parse", f"{commit}:bigrig_engine"]).strip()}
     res["llama"] = {"version": LLAMA_VERSION, "gguf": os.path.basename(GGUF), "common_flags": LLAMA_COMMON}
     home = ct.scratch_home(ROOT)
-    atexit.register(shutil.rmtree, home, ignore_errors=True)
+    atexit.register(ct.remove_home, home)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))   # a kill still runs the cleanup above
     env = worker_env(home)
     if not ct.engine_reads_blob(arm_dir, env):

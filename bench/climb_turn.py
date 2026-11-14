@@ -52,8 +52,9 @@ WHY EACH EVAL GETS ITS OWN ENGINE HOME (fixed 2026-11-13, after climb 2)
     restores and saves conversations under home/data/sessions, deleting ones it did not write,
     so evals overwrote the developer's saved conversations and each run reloaded the previous
     run's. main() therefore runs both arms under scratch_home(): the checkout's blobs and
-    measured results linked in, an empty read-only sessions folder, so no run restores or
-    saves a conversation (Session's save already swallows the write error). It also drops BigRig
+    measured results in as read-only copies, an empty read-only sessions folder, so no run
+    restores or saves a conversation or changes a record the next run plans from (Session
+    swallows the write errors). It also drops BigRig
     switches inherited from the caller's shell, and asks each arm's own code whether it will
     read the packed blob (engine_reads_blob) before any run. bench/confirm_turn.py, frozen with
     its card, calls run_eval itself and still uses the checkout as home.
@@ -201,22 +202,56 @@ def export_tree(commit: str, dest: str) -> str:
 
 
 def scratch_home(root: str) -> str:
-    """A throwaway engine home for one harness invocation: `root`'s packed blobs, measured results
-    (the planner reads them), corpora and traces linked in, and an empty, read-only data/sessions,
-    so no run restores or saves a conversation (every run starts with an empty prompt cache, the
-    developer's saved conversations are never touched, and Session's save swallows the write
-    error, as at every commit these harnesses export). Records the engine writes under
-    data/results still land in `root`'s. Remove it with shutil.rmtree: it unlinks the links,
-    never what they point to."""
+    """A throwaway engine home for one harness invocation, removed with remove_home().
+
+    data/blobs is linked to `root`'s (the packed blobs and their page cache are the thing being
+    measured). data/results, data/corpora and data/traces are read-only copies (APFS clones, so
+    instant and free): the planner reads `root`'s measured records, and no run can change them, so
+    every run of a job plans from the same records and the checkout's stay as they were (a
+    Session records its peak working memory on close, which the next run's planner would read).
+    data/sessions is empty and read-only, so no run restores or saves a conversation. Session
+    swallows both write errors, identically at every commit these harnesses export."""
     home = tempfile.mkdtemp(prefix="bigrig_home_")
-    sessions = os.path.join(home, "data", "sessions")
-    os.makedirs(sessions)
-    os.chmod(sessions, 0o555)
-    for sub in ("blobs", "results", "corpora", "traces"):
-        src = os.path.join(root, "data", sub)
-        if os.path.isdir(src):
-            os.symlink(src, os.path.join(home, "data", sub))
+    data = os.path.join(home, "data")
+    os.makedirs(os.path.join(data, "sessions"))
+    os.chmod(os.path.join(data, "sessions"), 0o555)
+    if os.path.isdir(os.path.join(root, "data", "blobs")):
+        os.symlink(os.path.join(root, "data", "blobs"), os.path.join(data, "blobs"))
+    for sub in ("results", "corpora", "traces"):
+        # The folder itself, even if the checkout links it elsewhere: cp -R would copy the link,
+        # and making "the copy" read-only would then make the checkout's own files read-only.
+        src, dst = os.path.realpath(os.path.join(root, "data", sub)), os.path.join(data, sub)
+        if not os.path.isdir(src):
+            continue
+        if subprocess.run(["cp", "-cR", src, dst], capture_output=True).returncode != 0:
+            shutil.rmtree(dst, ignore_errors=True)
+            shutil.copytree(src, dst, symlinks=True)         # not APFS: a plain copy
+        _set_writable(dst, False)
     return home
+
+
+def _set_writable(top: str, writable: bool) -> None:
+    """chmod a copied tree read-only (or back), never following a link out of it."""
+    if os.path.islink(top):
+        return
+    for d, dirs, files in os.walk(top, topdown=not writable):
+        for name in files:
+            p = os.path.join(d, name)
+            if not os.path.islink(p):
+                os.chmod(p, 0o644 if writable else 0o444)
+        if not os.path.islink(d):
+            os.chmod(d, 0o755 if writable else 0o555)
+
+
+def remove_home(home: str) -> None:
+    """Remove a scratch_home(): its read-only copies made writable first; links are unlinked,
+    never followed."""
+    data = os.path.join(home, "data")
+    for sub in ("results", "corpora", "traces", "sessions"):
+        p = os.path.join(data, sub)
+        if os.path.isdir(p) and not os.path.islink(p):
+            _set_writable(p, True)
+    shutil.rmtree(home, ignore_errors=True)
 
 
 def engine_reads_blob(arm: str, env: dict, model: str = MODEL) -> bool:
@@ -268,14 +303,19 @@ def one_reply(session, prompt: str) -> dict:
             "decode_tokens": g_last - g_first, "decode_s": t_last - t_first}
 
 
-def worker(arm: str, out: str) -> None:
-    """Load bigrig_engine from `arm` (first on sys.path), answer the workload, write JSON to `out`."""
+def worker(arm: str, out: str, pin: str = "") -> None:
+    """Load bigrig_engine from `arm` (first on sys.path), answer the workload, write JSON to `out`.
+
+    `pin`, JSON {"capacity": C, "full_layers": n}, replaces PIN for this run (same_answers' speed
+    guard prices the planner's own plan); without it the run is exactly the climb's."""
     sys.path.insert(0, arm)
     import bigrig_engine  # noqa: F401 -- imported first so every submodule resolves inside `arm`
     from bigrig_engine.session import Session
 
     t0 = time.perf_counter()
-    s = Session(MODEL, budget_gb=BUDGET_GB, capacity=PIN["capacity"], full_layers=(), verbose=False)
+    plan = json.loads(pin) if pin else PIN
+    s = Session(MODEL, budget_gb=BUDGET_GB, capacity=plan["capacity"],
+                full_layers=tuple(range(plan["full_layers"])), verbose=False)
     load_s = time.perf_counter() - t0
     st = s.stats()
     one_reply(s, WARMUP)
@@ -291,14 +331,16 @@ def worker(arm: str, out: str) -> None:
 
 # ---------------------------------------------------------------- one run, watched from the parent
 
-def run_arm(arm: str, balloon_gb: float, python: str = sys.executable) -> dict:
-    """One worker run under a fresh balloon; the parent samples footprint and swap every 0.1 s."""
+def run_arm(arm: str, balloon_gb: float, python: str = sys.executable, pin: dict | None = None) -> dict:
+    """One worker run under a fresh balloon; the parent samples footprint and swap every 0.1 s.
+    `pin` replaces PIN for this run (see worker); run_eval never passes one."""
     balloon, b0 = start_balloon(balloon_gb) if balloon_gb > 0 else (None, 0.0)
     fd, out = tempfile.mkstemp(suffix=".json")
     os.close(fd)
     swap0 = mac_state()["swap_used_gb"]
     t0 = time.perf_counter()
-    p = subprocess.Popen([python, os.path.abspath(__file__), "--worker", arm, out], stdin=subprocess.DEVNULL)
+    p = subprocess.Popen([python, os.path.abspath(__file__), "--worker", arm, out]
+                         + ([json.dumps(pin)] if pin else []), stdin=subprocess.DEVNULL)
     peak, killed, stop = [0.0], [None], threading.Event()
 
     def watch():
@@ -407,7 +449,7 @@ def run_eval(base_arm: str, cand_arm: str, balloon_gb: float = BALLOON_GB, pytho
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--out", default=os.environ.get("LAB_RESULTS"))
-    ap.add_argument("--worker", nargs=2, metavar=("ARM", "OUT"), help=argparse.SUPPRESS)
+    ap.add_argument("--worker", nargs="+", metavar="ARM OUT [PIN]", help=argparse.SUPPRESS)
     a = ap.parse_args()
     if a.worker:
         worker(*a.worker)
@@ -430,7 +472,7 @@ def main() -> None:
         res = run_eval(base, ROOT)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-        shutil.rmtree(home, ignore_errors=True)
+        remove_home(home)
     res["cand_commit"] = sh(["git", "-C", ROOT, "rev-parse", "HEAD"]).strip()
     with open(a.out, "w") as f:
         json.dump(res, f, indent=1)
