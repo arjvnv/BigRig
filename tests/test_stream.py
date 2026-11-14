@@ -251,8 +251,10 @@ check("only a real prefill chunk that wants most of the layer takes it",
       "flat.shape[0] >= VIEWS_MIN_TOKENS" in _src3 and "VIEWS_MIN_SHARE * self._pool.n_experts" in _src3
       and stream.VIEWS_MIN_TOKENS >= 4)
 _fv = _ins2.getsource(stream.StreamingSwitchGLU._forward_views)
+_pa = _ins2.getsource(stream.StreamingSwitchGLU._prefill_arrays)   # its fetch, since layer-major prefill
 check("it fetches every expert of the chunk once and never admits to the pool",
-      "self._fetcher.fetch(" in _fv and "admit" not in _fv and "ensure(" not in _fv)
+      "self._prefill_arrays(" in _fv and "self._fetcher.fetch(" in _pa
+      and not any(w in src for src in (_fv, _pa) for w in ("admit", "ensure(")))
 check("rows come back in the caller's (token, k) order", "np.argsort(order, kind=\"stable\")" in _fv
       and "return y[mx.array(inv)]" in _fv)
 _cli_help = _sp3.run([_sys3.executable, "-m", "bigrig_engine.cli", "serve", "--help"], capture_output=True, text=True, cwd=ROOT).stdout
@@ -289,6 +291,8 @@ def _provider(e):
     return _pv.views_of(e)
 _fake2 = type("M", (), {})(); _fake2._pool = _pv; _fake2._fetcher = None
 _fake2._quantized = False; _fake2._activation = lambda u, g: u
+_fake2._held = None                                   # outside a held prefill block: counts nothing
+_fake2._count_routing = stream.StreamingSwitchGLU._count_routing.__get__(_fake2)
 try:
     stream.StreamingSwitchGLU._forward_views(_fake2, _rows, np.array([[C, C], [C, C]]), _provider)
     check("decode through views asks the provider once per distinct expert", _seen == [C], str(_seen))
