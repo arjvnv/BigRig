@@ -242,7 +242,7 @@ else:
         for budget, pref in ((4.9, None), (6.0, "compress")):
             try:
                 _session.Session(OLMOE, budget_gb=budget, preference=pref, verbose=False, persist=False,
-                                 monitor=False)
+                                 monitor=False, remember=False)   # never record a compress consent
             except _Stop:
                 pass
     finally:
@@ -263,6 +263,53 @@ try:
 finally:
     stream.load_lenient, stream.attach = saved
 check("load_streaming hands same_answers to attach", handed == [True, False], handed)
+
+print("=" * 78)
+print("6. END TO END: THE SETTING REACHES EVERY LAYER AND THE SESSION'S STATS (real OLMoE session)")
+print("=" * 78)
+# A real stream-mode Session (OLMoE at 4.9 GB, no expert read: warm leaves a streamed pool empty),
+# under a throwaway engine home so it writes no record into any checkout. With SAME_ANSWERS off
+# (as BIGRIG_SAME_ANSWERS=0 sets it) every layer and the stats must say so.
+if not (os.path.isdir(OLMOE) and os.path.exists(os.path.join(ROOT, "data", "blobs", "OLMoE-1B-7B-0125-4bit.experts"))):
+    print("  SKIPPED - needs models/OLMoE-1B-7B-0125-4bit and its packed blob.")
+else:
+    import shutil
+    import tempfile
+    from bigrig_engine import session as _session
+    tmp_home = tempfile.mkdtemp(prefix="plan_invariance_home_")
+    os.makedirs(os.path.join(tmp_home, "data"))
+    os.symlink(os.path.join(ROOT, "data", "blobs"), os.path.join(tmp_home, "data", "blobs"))
+    saved_home = os.environ.get("BIGRIG_HOME")
+    os.environ["BIGRIG_HOME"] = tmp_home
+    try:
+        for flag in (True, False):
+            stream.SAME_ANSWERS = flag
+            s = _session.Session(OLMOE, budget_gb=4.9, verbose=False, persist=False, monitor=False,
+                                 remember=False)
+            st = s.stats()
+            layers = {m.same_answers for m in s.handle.mods}
+            check(f"SAME_ANSWERS={flag}: stream mode, every layer and Session.stats() report {flag}",
+                  st["mode"] == "stream" and layers == {flag} and st["same_answers"] is flag,
+                  (st["mode"], layers, st.get("same_answers")))
+            if flag:
+                s.handle.mods[-1].same_answers = False
+                check("...and one layer without it makes the handle report False (all layers, not any)",
+                      s.handle.stats()["same_answers"] is False)
+            s.close()
+            del s
+        stream.SAME_ANSWERS = True
+        _m, _t, h = stream.load_streaming(OLMOE, capacity=8, warm="lazy", verbose=False, same_answers=False)
+        check("load_streaming(same_answers=False), as compress mode loads: every layer and the handle report False",
+              {m.same_answers for m in h.mods} == {False} and h.stats()["same_answers"] is False)
+        h.close()
+        del _m, _t, h
+    finally:
+        stream.SAME_ANSWERS = True
+        if saved_home is None:
+            os.environ.pop("BIGRIG_HOME", None)
+        else:
+            os.environ["BIGRIG_HOME"] = saved_home
+        shutil.rmtree(tmp_home, ignore_errors=True)
 
 print("\n" + "=" * 78)
 print(f"{'ALL TESTS PASSED' if not FAIL else str(len(FAIL)) + ' FAILURES: ' + ', '.join(FAIL)}")
