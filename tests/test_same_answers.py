@@ -32,15 +32,20 @@ FAKE_SESSION = textwrap.dedent('''
     WORDS = {"heat": "heat", "Fibonacci": "def fib", "9:40": "9:40", "Summarize": "BigRig", "ices up": "ice",
              "rivers": "rivers"}
     PLAN_DEPENDENT = %r
+    SAME_ANSWERS = %r
 
     class Session:
+        # Reports its plan as the real engine does: a layer holding every expert counts as whole,
+        # so capacity == experts reads back as every layer whole.
         def __init__(self, model_dir, budget_gb=None, capacity=None, full_layers=None, verbose=True):
+            self.n_experts, self.n_layers = (64, 16) if "OLMoE" in model_dir else (256, 40)
             self.capacity = capacity if capacity is not None else int(budget_gb * 2)
             self.full = len(tuple(full_layers or ()))
             self.prompt_cache_hits, self._generated_ids, self._cached = 0, [], False
 
         def stats(self):
-            return {"capacity": self.capacity, "full_layers": self.full}
+            whole = self.n_layers if self.capacity >= self.n_experts else self.full
+            return {"capacity": self.capacity, "full_layers": whole, "same_answers": SAME_ANSWERS}
 
         def trim_prompt_cache(self, to_bytes=0):
             self._cached = False
@@ -66,12 +71,12 @@ FAKE_SESSION = textwrap.dedent('''
 ''')
 
 
-def fake_arm(parent, name, plan_dependent):
+def fake_arm(parent, name, plan_dependent, same_answers=True):
     pkg = os.path.join(parent, name, "bigrig_engine")
     os.makedirs(pkg)
     open(os.path.join(pkg, "__init__.py"), "w").close()
     with open(os.path.join(pkg, "session.py"), "w") as f:
-        f.write(FAKE_SESSION % plan_dependent)
+        f.write(FAKE_SESSION % (plan_dependent, same_answers))
     return os.path.join(parent, name)
 
 
@@ -90,7 +95,8 @@ def cell(model, cond, ids_tail=(), arm="/a/cand", pass_no=1):
 
 def speed_pair(base_dec, cand_dec, base_ttft, cand_ttft):
     run = lambda dec, ttft: {"rows": [{"ttft_s": ttft, "decode_tokens": 0, "decode_s": 1.0}] +
-                             [{"ttft_s": 1.0, "decode_tokens": dec, "decode_s": 1.0}] * 3}
+                             [{"ttft_s": 1.0, "decode_tokens": dec, "decode_s": 1.0}] * 3,
+                             "plan": dict(sa.SPEED_PLAN)}
     return run(base_dec, base_ttft), run(cand_dec, cand_ttft)
 
 
@@ -98,6 +104,10 @@ same = [cell("qwen3.6", f"c{i}") for i in range(4)]
 fast = [speed_pair(10, 10 * (1 + 0.002 * (-1) ** r), 80, 80) for r in range(6)]
 slow = [speed_pair(10, 8.5 + 0.01 * r, 80, 80) for r in range(6)]
 check("invariant + speed guard passes -> ships", sa.analyse(same, [], fast)["decision"] == "ships")
+off_plan = [(dict(b, plan={"capacity": 8, "full_layers": 0}), c) for b, c in fast]
+r_off = sa.analyse(same, [], off_plan)
+check("...but not when the guard's runs did not hold SPEED_PLAN (they priced another plan)",
+      r_off["decision"] == "opt-in" and r_off["speed_plan_ok"] == 0, r_off["decision"])
 check("invariant + 15% slower decode -> opt-in", sa.analyse(same, [], slow)["decision"] == "opt-in")
 moved = same[:3] + [cell("qwen3.6", "c3", ids_tail=[7])]
 res = sa.analyse(moved, [], fast)
@@ -139,7 +149,7 @@ print("=" * 78)
 print("3. END TO END ON FAKE ENGINES (real processes, no model)")
 print("=" * 78)
 with tempfile.TemporaryDirectory() as tmp:
-    base, steady, moving = (fake_arm(tmp, "base", True), fake_arm(tmp, "steady", False),
+    base, steady, moving = (fake_arm(tmp, "base", True, same_answers=None), fake_arm(tmp, "steady", False),
                             fake_arm(tmp, "moving", True))
     res = sa.run_job(base, steady, models=["qwen3.6"], speed_rounds=2, balloon_gb=0)
     check("an engine whose replies never change: no differing cell", res["cells_differing"] == 0, res["differing"][:2])
@@ -155,6 +165,50 @@ with tempfile.TemporaryDirectory() as tmp:
           res["decision"] == ("ships" if guard else "opt-in"), (res["decision"], sp))
     res = sa.run_job(base, moving, models=["qwen3.6"], speed_rounds=2, balloon_gb=0)
     check("an engine whose reply moves with capacity: no-claim", res["decision"] == "no-claim", res["decision"])
+    check("the speed guard's runs held SPEED_PLAN end to end", res["speed_plan_ok"] == 1, res.get("speed_plan_ok"))
+    # OLMoE with every expert resident: the engine reads that back as 16 whole layers.
+    every = next(c for c in sa.conditions("olmoe") if c.get("capacity") == 64)
+    got = sa.run_cell(steady, "olmoe", every)
+    check(f"the OLMoE every-expert pin {every['name']!r} reads back as itself (no wrong-plan stop)",
+          not [w for w in sa.cell_problems(got, candidate=True) if "plan" in w], got["plan"])
+    old = dict(every, name="pin 0,64", full=0)
+    check("...where the earlier (0,64) pin would have stopped the job",
+          any("plan" in w for w in sa.cell_problems(sa.run_cell(steady, "olmoe", old))))
+    check("a candidate whose engine did not run with SAME_ANSWERS is a stop",
+          any("same_answers" in w for w in sa.cell_problems(sa.run_cell(base, "olmoe", every), candidate=True)))
+
+print("=" * 78)
+print("4. EVERY BUDGET THE JOB USES STREAMS (real Session, loading stubbed)")
+print("=" * 78)
+# The planner refuses a budget too small for the model and compresses (with consent) above the
+# streaming range; either would end the job. Checked against the engine in this checkout.
+if not all(os.path.isdir(m["dir"]) for m in sa.MODELS.values()):
+    print("  SKIPPED - needs both models under models/ (no weights are loaded).")
+else:
+    from bigrig_engine import stream as _stream
+    from bigrig_engine.session import Session as _Session
+
+    class _Loaded(Exception):
+        pass
+
+    def _no_load(*a, **k):
+        raise _Loaded()
+
+    saved = _stream.load_streaming
+    _stream.load_streaming = _no_load
+    try:
+        for name, m in sa.MODELS.items():
+            for b in m["budgets"] + [m["pinned_budget"]]:
+                try:
+                    _Session(m["dir"], budget_gb=b, verbose=False, persist=False, monitor=False)
+                    outcome = "constructed"
+                except _Loaded:
+                    outcome = "streams"
+                except Exception as e:                          # noqa: BLE001 -- the outcome is the check
+                    outcome = type(e).__name__
+                check(f"{name} at {b} GB streams", outcome == "streams", outcome)
+    finally:
+        _stream.load_streaming = saved
 
 print("\n" + "=" * 78)
 print(f"{'ALL TESTS PASSED' if not FAIL else str(len(FAIL)) + ' FAILURES: ' + ', '.join(FAIL)}")

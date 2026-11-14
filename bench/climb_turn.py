@@ -268,14 +268,19 @@ def one_reply(session, prompt: str) -> dict:
             "decode_tokens": g_last - g_first, "decode_s": t_last - t_first}
 
 
-def worker(arm: str, out: str) -> None:
-    """Load bigrig_engine from `arm` (first on sys.path), answer the workload, write JSON to `out`."""
+def worker(arm: str, out: str, pin: str = "") -> None:
+    """Load bigrig_engine from `arm` (first on sys.path), answer the workload, write JSON to `out`.
+
+    `pin`, JSON {"capacity": C, "full_layers": n}, replaces PIN for this run (same_answers' speed
+    guard prices the planner's own plan); without it the run is exactly the climb's."""
     sys.path.insert(0, arm)
     import bigrig_engine  # noqa: F401 -- imported first so every submodule resolves inside `arm`
     from bigrig_engine.session import Session
 
     t0 = time.perf_counter()
-    s = Session(MODEL, budget_gb=BUDGET_GB, capacity=PIN["capacity"], full_layers=(), verbose=False)
+    plan = json.loads(pin) if pin else PIN
+    s = Session(MODEL, budget_gb=BUDGET_GB, capacity=plan["capacity"],
+                full_layers=tuple(range(plan["full_layers"])), verbose=False)
     load_s = time.perf_counter() - t0
     st = s.stats()
     one_reply(s, WARMUP)
@@ -291,14 +296,16 @@ def worker(arm: str, out: str) -> None:
 
 # ---------------------------------------------------------------- one run, watched from the parent
 
-def run_arm(arm: str, balloon_gb: float, python: str = sys.executable) -> dict:
-    """One worker run under a fresh balloon; the parent samples footprint and swap every 0.1 s."""
+def run_arm(arm: str, balloon_gb: float, python: str = sys.executable, pin: dict | None = None) -> dict:
+    """One worker run under a fresh balloon; the parent samples footprint and swap every 0.1 s.
+    `pin` replaces PIN for this run (see worker); run_eval never passes one."""
     balloon, b0 = start_balloon(balloon_gb) if balloon_gb > 0 else (None, 0.0)
     fd, out = tempfile.mkstemp(suffix=".json")
     os.close(fd)
     swap0 = mac_state()["swap_used_gb"]
     t0 = time.perf_counter()
-    p = subprocess.Popen([python, os.path.abspath(__file__), "--worker", arm, out], stdin=subprocess.DEVNULL)
+    p = subprocess.Popen([python, os.path.abspath(__file__), "--worker", arm, out]
+                         + ([json.dumps(pin)] if pin else []), stdin=subprocess.DEVNULL)
     peak, killed, stop = [0.0], [None], threading.Event()
 
     def watch():
@@ -407,7 +414,7 @@ def run_eval(base_arm: str, cand_arm: str, balloon_gb: float = BALLOON_GB, pytho
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--out", default=os.environ.get("LAB_RESULTS"))
-    ap.add_argument("--worker", nargs=2, metavar=("ARM", "OUT"), help=argparse.SUPPRESS)
+    ap.add_argument("--worker", nargs="+", metavar="ARM OUT [PIN]", help=argparse.SUPPRESS)
     a = ap.parse_args()
     if a.worker:
         worker(*a.worker)
