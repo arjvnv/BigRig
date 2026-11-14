@@ -55,8 +55,9 @@ any setting, it says that too, before you download 40 GB to find out.
   layer keeps resident and which layers it holds whole, not the reply: every prompt chunk runs
   the same per-expert arithmetic whatever the plan, so a greedy reply is token-for-token the same
   at 6 GB as at 9. Across every plan Qwen3.6-35B-A3B (6.1–9.0 GB) and OLMoE-1B-7B (4.9–5.6 GB)
-  reach in streaming mode on an M4 Air, 0 of 190 comparisons differed, at no measurable cost in
-  speed. Compress mode, sampling, batching and speculative decoding are outside that guarantee.
+  reach in streaming mode on an M4 Air, each run twice, every reply matched the first plan's
+  exactly, length included: 0 of 180 comparisons differed. Compress mode, sampling, batching and
+  speculative decoding are outside that guarantee.
 - **It answers for your machine, not ours.** Speed depends on your chip and your SSD, so BigRig
   measures rather than guesses. `bigrig doctor <model>` reads the model's shape from the hub,
   profiles your Mac, and tells you whether it runs, what memory it needs and roughly how many
