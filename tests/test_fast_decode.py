@@ -46,15 +46,26 @@ def _bytes(a: mx.array) -> bytes:
     return np.array(a).tobytes()
 
 
-def make_experts(projections):
-    """E experts' packed bytes (page-padded, as the packed blob lays them out), spec, and parts."""
+def make_experts(projections, quantized=True, bias=False, order=None):
+    """E experts' packed bytes, their spec, and each component's bytes.
+
+    `quantized` False stores plain bfloat16 weights (the layer then computes `x @ w.T`); `bias`
+    adds a per-projection bias vector (gpt-oss ships one); `order` lists the components in another
+    order than weight/scales/biases/bias, as a spec is free to."""
     blobs, spec, parts = {}, {}, {}
     for e in range(E):
         chunks = []
         for p in projections:
             w = mx.array(rng.standard_normal((D, D)).astype(np.float32) * 0.05).astype(mx.bfloat16)
-            wq, s, b = mx.quantize(w, group_size=GS, bits=BITS)
-            comps = {"weight": wq, "scales": s, "biases": b}
+            if quantized:
+                wq, s, b = mx.quantize(w, group_size=GS, bits=BITS)
+                comps = {"weight": wq, "scales": s, "biases": b}
+            else:
+                comps = {"weight": w}
+            if bias:
+                comps["bias"] = mx.array(rng.standard_normal((D,)).astype(np.float32)).astype(mx.bfloat16)
+            if order:
+                comps = {c: comps[c] for c in order if c in comps}
             spec[p] = {c: {"shape": list(a.shape), "dtype": str(a.dtype).split(".")[-1], "nbytes": a.nbytes}
                        for c, a in comps.items()}
             for c, a in comps.items():
@@ -71,14 +82,14 @@ class _SG:
                               for c, m in spec[p].items()})
 
 
-def write_blob(blobs, path):
+def write_blob(blobs, path, layer=0):
     """The experts in one file, each region page-aligned and a whole number of pages (zero-copy)."""
     per = len(blobs[0])
     padded = -(-per // PAGE) * PAGE
     with open(path, "wb") as f:
         for e in range(E):
             f.write(blobs[e] + b"\0" * (padded - per))
-    return {(0, e): fetch.Region(e * padded, per) for e in range(E)}, padded
+    return {(layer, e): fetch.Region(e * padded, per) for e in range(E)}, padded
 
 
 def act_gated(up, gate):
@@ -90,19 +101,35 @@ def act_plain(h):
 
 
 TMP = tempfile.mkdtemp(prefix="fast_decode_")
-GATED = make_experts(stream.PROJECTIONS)
-PLAIN = make_experts(stream.MLP_PROJECTIONS)
-LAYOUT_G, _ = write_blob(GATED[0], os.path.join(TMP, "gated.experts"))
-LAYOUT_P, _ = write_blob(PLAIN[0], os.path.join(TMP, "plain.experts"))
+# Every shape of layer the engine serves: the two projection layouts, 4-bit and plain weights,
+# with and without a bias, and a spec that lists its components in another order.
+CASES = {}
+for _name, _proj, _quant, _bias, _order in (
+        ("gated", stream.PROJECTIONS, True, False, None),
+        ("plain", stream.MLP_PROJECTIONS, True, False, None),
+        ("gated + bias", stream.PROJECTIONS, True, True, None),
+        ("plain + bias", stream.MLP_PROJECTIONS, True, True, None),
+        ("gated, unquantized", stream.PROJECTIONS, False, False, None),
+        ("gated, unquantized + bias", stream.PROJECTIONS, False, True, None),
+        ("gated, components listed biases/bias/scales/weight", stream.PROJECTIONS, True, True,
+         ("biases", "bias", "scales", "weight"))):
+    _blobs, _spec, _parts = make_experts(_proj, _quant, _bias, _order)
+    _path = os.path.join(TMP, _name.replace(" ", "_").replace("/", "_").replace(",", "").replace("+", "and") + ".experts")
+    _layout, _ = write_blob(_blobs, _path)
+    CASES[_name] = {"blobs": _blobs, "spec": _spec, "parts": _parts, "path": _path, "layout": _layout,
+                    "gated": _proj == stream.PROJECTIONS, "quantized": _quant, "bias": _bias}
+GATED = (CASES["gated"]["blobs"], CASES["gated"]["spec"], CASES["gated"]["parts"])
+PLAIN = (CASES["plain"]["blobs"], CASES["plain"]["spec"], CASES["plain"]["parts"])
+LAYOUT_G, LAYOUT_P = CASES["gated"]["layout"], CASES["plain"]["layout"]
+assert CASES["gated"]["path"].endswith("gated.experts") and CASES["plain"]["path"].endswith("plain.experts")
 
 
-def module(kind, capacity, fetcher=None):
-    blobs, spec, _ = GATED if kind == "gated" else PLAIN
-    store = fetch.WeightStore(os.path.join(TMP, f"{kind}.experts"), LAYOUT_G if kind == "gated" else LAYOUT_P)
-    f = fetcher or fetch.ParallelFetcher(store, threads=4)
-    pool = stream.ExpertPool(0, _SG(spec), E, capacity, spec, policy="lfuda", views=True).build()
-    return stream.StreamingSwitchGLU(pool, f, act_gated if kind == "gated" else act_plain,
-                                     quantized=True, qparams=Q), f
+def module(kind, capacity, fetcher=None, views=True):
+    c = CASES[kind]
+    f = fetcher or fetch.ParallelFetcher(fetch.WeightStore(c["path"], c["layout"]), threads=4)
+    pool = stream.ExpertPool(0, _SG(c["spec"]), E, capacity, c["spec"], policy="lfuda", views=views).build()
+    return stream.StreamingSwitchGLU(pool, f, act_gated if c["gated"] else act_plain,
+                                     quantized=c["quantized"], qparams=Q if c["quantized"] else {}), f
 
 
 # A decode run: 48 tokens, each routed to 8 distinct experts, with the overlap between
@@ -118,10 +145,10 @@ for _ in range(48):
     prev = row
 
 
-def run(kind, capacity, fast, steps=STEPS):
+def run(kind, capacity, fast, steps=STEPS, views=True):
     stream.FAST_DECODE = fast
     try:
-        m, f = module(kind, capacity)
+        m, f = module(kind, capacity, views=views)
         ys = []
         for x, idx in steps:
             y = m(x, mx.array(idx))
@@ -130,7 +157,8 @@ def run(kind, capacity, fast, steps=STEPS):
         pool = m._pool
         state = {"g2s": pool.g2s.copy(), "s2g": pool.s2g.copy(), "hits": pool.hits, "misses": pool.misses,
                  "admits": pool.admits, "evicts": pool.evicts, "uses": pool.uses.copy(),
-                 "resident": sorted(pool._views), "local": f.n_fetches, "chunked": m.chunked_calls}
+                 "resident": sorted(pool._views), "local": f.n_fetches, "chunked": m.chunked_calls,
+                 "seen": set(f._seen)}
         f.close()
         return ys, state
     finally:
@@ -146,16 +174,19 @@ print("=" * 78)
 print("1. FAST_DECODE ON == OFF: EVERY DECODE STEP BIT-IDENTICAL, SAME ADMISSIONS AND EVICTIONS")
 print("=" * 78)
 assert stream.FAST_DECODE, "default changed; this file tests the default"
-for kind in ("gated", "plain"):
-    for cap in (8, 13, 32):
-        on, s_on = run(kind, cap, True)
-        off, s_off = run(kind, cap, False)
+for kind in CASES:
+    # Views mode (the default pool) at three capacities; the slot pool (--slot-pool) at one, where
+    # only the fetch changes and the stock gather computes the step.
+    for cap, views in ((8, True), (13, True), (32, True), (13, False)):
+        tag = f"{kind}, capacity {cap}" + ("" if views else ", slot pool")
+        on, s_on = run(kind, cap, True, views=views)
+        off, s_off = run(kind, cap, False, views=views)
         same = [mx.array_equal(a, b).item() for a, b in zip(on, off)]
-        check(f"{kind}, capacity {cap}: {len(STEPS)} steps bit-identical on vs off", all(same),
+        check(f"{tag}: {len(STEPS)} steps bit-identical on vs off", all(same),
               [i for i, s in enumerate(same) if not s][:5])
-        check(f"{kind}, capacity {cap}: same pool tables, hits, misses, admits, evicts, use counts",
+        check(f"{tag}: same pool tables, hits, misses, admits, evicts, use counts",
               same_state(s_on, s_off), {k: (s_on[k], s_off[k]) for k in ("hits", "misses", "admits", "evicts")})
-        check(f"{kind}, capacity {cap}: the pool really cycled (misses and evictions happened)",
+        check(f"{tag}: the pool really cycled (misses and evictions happened)",
               s_on["misses"] > len(STEPS) and (cap >= 32 or s_on["evicts"] > 0), (s_on["misses"], s_on["evicts"]))
 
 print("=" * 78)
@@ -163,38 +194,54 @@ print("2. AGAINST ARRAYS BUILT HERE FROM THE RAW BYTES (COPIES, NOT THE ENGINE'S
 print("=" * 78)
 
 
-def arr(parts, spec, e, p, c):
-    m = spec[p][c]
+def arr(case, e, p, c):
+    m = case["spec"][p][c]
     npdt = {"uint32": np.uint32, "bfloat16": np.uint16, "float16": np.float16, "float32": np.float32}[m["dtype"]]
-    a = mx.array(np.frombuffer(parts[(e, p, c)], dtype=npdt).copy().reshape(m["shape"]))
+    a = mx.array(np.frombuffer(case["parts"][(e, p, c)], dtype=npdt).copy().reshape(m["shape"]))
     return a.view(mx.bfloat16) if m["dtype"] == "bfloat16" else a
 
 
 def by_hand(kind, x, row):
-    _, spec, parts = GATED if kind == "gated" else PLAIN
+    """The layer's definition, written out: per expert, y = x @ W.T (+ bias) for each projection."""
+    case = CASES[kind]
 
     def proj(e, p, inp):
-        return mx.quantized_matmul(inp, arr(parts, spec, e, p, "weight"), arr(parts, spec, e, p, "scales"),
-                                   arr(parts, spec, e, p, "biases"), transpose=True, group_size=GS, bits=BITS)
+        if case["quantized"]:
+            y = mx.quantized_matmul(inp, arr(case, e, p, "weight"), arr(case, e, p, "scales"),
+                                    arr(case, e, p, "biases"), transpose=True, group_size=GS, bits=BITS)
+        else:
+            y = inp @ arr(case, e, p, "weight").T
+        return y + arr(case, e, p, "bias") if case["bias"] else y
     xf = x.reshape(1, D)
     outs = []
     for e in row:
         e = int(e)
-        if kind == "gated":
+        if case["gated"]:
             outs.append(proj(e, "down_proj", act_gated(proj(e, "up_proj", xf), proj(e, "gate_proj", xf))))
         else:
             outs.append(proj(e, "fc2", act_plain(proj(e, "fc1", xf))))
     return mx.concatenate(outs, axis=0).reshape(1, 1, K, D)
 
 
-for kind in ("gated", "plain"):
+for kind in CASES:
     on, _ = run(kind, 8, True)
-    ok = [mx.array_equal(on[i], by_hand(kind, *STEPS[i][:1], STEPS[i][1].reshape(-1))).item()
+    ok = [mx.array_equal(on[i], by_hand(kind, STEPS[i][0], STEPS[i][1].reshape(-1))).item()
           for i in (0, 1, 17, 47)]
     check(f"{kind}: fast-path outputs equal per-expert products on independently built arrays", all(ok), ok)
     fin = all(bool(mx.isfinite(y.astype(mx.float32)).all().item()) for y in on)
     nz = float(mx.abs(on[0].astype(mx.float32)).max().item())
     check(f"{kind}: outputs are finite and not all zero", fin and nz > 0, (fin, nz))
+# The oracle must be able to tell a bias from no bias, and W from W.T, or the checks above prove less
+# than they say: the same step computed without the bias, and with the weight untransposed, differs.
+x0, row0 = STEPS[0][0], STEPS[0][1].reshape(-1)
+ref_b = by_hand("gated, unquantized + bias", x0, row0)
+CASES["_nobias"] = dict(CASES["gated, unquantized + bias"], bias=False)
+check("the by-hand answer changes when the bias is left out (the oracle sees the bias)",
+      not mx.array_equal(ref_b, by_hand("_nobias", x0, row0)).item())
+del CASES["_nobias"]
+w0 = arr(CASES["gated, unquantized"], int(row0[0]), "up_proj", "weight")
+check("x @ W.T differs from x @ W on these weights (the oracle sees the transpose)",
+      not mx.array_equal(x0.reshape(1, D) @ w0.T, x0.reshape(1, D) @ w0).item())
 
 print("=" * 78)
 print("3. THE FAST PATH IS THE ONE RUNNING, AND ONLY WHERE IT APPLIES")
@@ -259,6 +306,21 @@ try:
     y40_off, _ = run("gated", 8, False, steps=[(x40, i40)])
     check(f"a 40-row chunk needing {need} experts (> LOCAL_FETCH_MAX) never calls fetch_local, same output",
           need > stream.LOCAL_FETCH_MAX and l40["n"] == 0 and mx.array_equal(y40_on[0], y40_off[0]).item(), l40)
+    # Layer-major prefill's last chunk can be one token; its routing must still be counted for
+    # the re-warm that follows (holding() collects prefill_routed), on the one-row path too.
+    counted = {}
+    for fast in (True, False):
+        stream.FAST_DECODE = fast
+        m, f = module("gated", 8)
+        with m.holding():
+            mx.eval(m(STEPS[0][0], mx.array(STEPS[0][1])))
+            counted[fast] = m.prefill_routed.copy()
+        f.close()
+    stream.FAST_DECODE = True
+    want_counts = np.bincount(STEPS[0][1].reshape(-1), minlength=E)
+    check("a one-token prefill chunk is counted in prefill_routed on the one-row path, as on the chunk path",
+          np.array_equal(counted[True], want_counts) and np.array_equal(counted[False], want_counts),
+          (int(counted[True].sum()), int(counted[False].sum())))
     # Two rows (a prompt chunk that fits the pool) is not decode: chunk path, unchanged.
     x2 = mx.array(rng.standard_normal((1, 2, D)).astype(np.float32)).astype(mx.bfloat16)
     i2 = np.stack([np.arange(K), np.arange(K)]).reshape(1, 2, K)
@@ -271,6 +333,24 @@ try:
 finally:
     stream.StreamingSwitchGLU._forward_views_one, stream.StreamingSwitchGLU._forward_views = orig_one, orig_views
     fetch.ParallelFetcher.fetch_local = orig_local
+
+# ensure() records the experts it has under live views as resident, under THEIR layer's keys.
+_, st_on = run("gated", 8, True)
+used = {(0, int(e)) for _x, idx in STEPS for e in idx.reshape(-1)}
+check("a decode run records exactly the (layer, expert) keys it used as resident", st_on["seen"] == used,
+      (len(st_on["seen"]), len(used), sorted(st_on["seen"] - used)[:3]))
+layout3, _ = write_blob(GATED[0], os.path.join(TMP, "layer3.experts"), layer=3)
+f3s = fetch.ParallelFetcher(fetch.WeightStore(os.path.join(TMP, "layer3.experts"), layout3), threads=2)
+pool3 = stream.ExpertPool(3, _SG(GATED[1]), E, 8, GATED[1], policy="lfuda", views=True).build()
+m3 = stream.StreamingSwitchGLU(pool3, f3s, act_gated, quantized=True, qparams=Q)
+y3 = [m3(x, mx.array(idx)) for x, idx in STEPS[:6]]
+mx.eval(y3)
+used3 = {(3, int(e)) for _x, idx in STEPS[:6] for e in idx.reshape(-1)}
+ref3, _ = run("gated", 8, True, steps=STEPS[:6])
+check("...for a layer that is not layer 0 too (keys carry the pool's own layer), with the same outputs",
+      set(f3s._seen) == used3 and all(mx.array_equal(a, b).item() for a, b in zip(y3, ref3)),
+      sorted(set(f3s._seen) - used3)[:3])
+f3s.close()
 
 print("=" * 78)
 print("4. fetch_local: fetch()'S BYTES, NO POOL FOR WARM KEYS, EXACTLY THE COLD REGIONS READ")
@@ -366,6 +446,48 @@ try:
     probed.clear()
     f.fetch_local([(0, 40), (0, 41)])
     check("RECENT_S = 0 asks about every key every time", sorted(probed) == [OFF[40], OFF[41]], probed)
+
+    # What is recorded as resident: only what was probed resident or read. Not a key whose probe
+    # was skipped (its time must not be renewed, or a busy key would never be asked about again),
+    # and not a key whose read failed.
+    fetch.RECENT_S = 3600.0
+    f._seen.clear(); probed.clear(); filled.clear(); cold_set = set()
+    f.fetch_local([(0, 55)])
+    f._seen[(0, 55)] -= 1000.0                                # still recent, but an older time
+    t_old = f._seen[(0, 55)]
+    f.fetch_local([(0, 55)])
+    check("a skipped key keeps its old time (a probe skipped is not a probe made)",
+          probed == [OFF[55]] and f._seen[(0, 55)] == t_old, (probed, f._seen[(0, 55)] - t_old))
+    store.fill = lambda fd, off, n: (_ for _ in ()).throw(OSError("read failed"))
+    cold_set = {OFF[56], OFF[57], OFF[58]}
+    f.fetch_local([(0, 56)])
+    f.fetch_local([(0, 57), (0, 58), (0, 59)])
+    check("keys whose read failed are not recorded as resident (one read here, two on the pool); "
+          "the warm key beside them is",
+          (0, 56) not in f._seen and (0, 57) not in f._seen and (0, 58) not in f._seen and (0, 59) in f._seen,
+          sorted(k for k in f._seen if k[1] >= 56))
+    store.fill = lambda fd, off, n: (filled.append((off, n)), orig_fill(fd, off, n))[1]
+    orig_make = store.make_resident
+    store.make_resident = lambda path, off, n: None           # the warm job could not check or read
+    f.warm([(0, 60)])
+    f._warm_pool.shutdown(wait=True); f._warm_pool = None
+    store.make_resident = orig_make
+    check("a warm job that could not make its region resident records nothing", (0, 60) not in f._seen)
+    saved_warm_mode = fetch.WARM_MODE
+    fetch.WARM_MODE = "on"                                    # BIGRIG_WARM_READ=1
+    cold_set = set(); probed.clear()
+    f.fetch_local([(0, 55), (0, 59)])
+    fetch.WARM_MODE = saved_warm_mode
+    check("BIGRIG_WARM_READ=1 asks about every key even when it was resident a moment ago",
+          sorted(probed) == [OFF[55], OFF[59]], probed)
+    real_submit = f._pool.submit
+    f._pool.submit = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("cannot schedule new futures"))
+    cold_set = {OFF[61], OFF[62]}; filled.clear(); f._seen.clear()
+    got = f.fetch_local([(0, 61), (0, 62)])
+    f._pool.submit = real_submit
+    check("a fetch pool that is shutting down does not fail the request: cold keys are read here instead",
+          got is not None and sorted(filled) == sorted((OFF[e], LAYOUT_G[(0, e)].length) for e in (61, 62))
+          and bytes(got[(0, 61)]) == blobs[61], filled)
 finally:
     f._pool.submit, store.fill, fetch.pages_resident, fetch.RECENT_S = orig_submit, orig_fill, orig_res, orig_recent
 
@@ -452,9 +574,10 @@ print("6. END TO END: A REAL MODEL'S GREEDY REPLY IS TOKEN-FOR-TOKEN THE SAME ON
 print("=" * 78)
 OLMOE = os.path.join(ROOT, "models", "OLMoE-1B-7B-0125-4bit")
 BLOB = os.path.join(ROOT, "data", "blobs", "OLMoE-1B-7B-0125-4bit.experts")
+SKIPPED = []
 if not (os.path.isdir(OLMOE) and os.path.exists(BLOB)):
     print("  SKIPPED - needs models/OLMoE-1B-7B-0125-4bit and its packed blob.")
-    FAIL.append("section 6 skipped: OLMoE model or blob missing") if os.environ.get("BIGRIG_REQUIRE_MODELS") else None
+    SKIPPED.append("section 6 (a real model's reply, on and off)")
 else:
     import shutil
     from bigrig_engine import session as _session
@@ -515,6 +638,9 @@ else:
 import shutil as _sh  # noqa: E402
 _sh.rmtree(TMP, ignore_errors=True)
 print("\n" + "=" * 78)
-print(f"{'ALL TESTS PASSED' if not FAIL else str(len(FAIL)) + ' FAILURES: ' + ', '.join(FAIL)}")
+if SKIPPED:
+    print(f"SKIPPED: {', '.join(SKIPPED)} (model not on disk)")
+print(f"{'ALL TESTS PASSED' if not FAIL else str(len(FAIL)) + ' FAILURES: ' + ', '.join(FAIL)}"
+      + (" (with skips above)" if SKIPPED and not FAIL else ""))
 print("=" * 78)
 sys.exit(1 if FAIL else 0)

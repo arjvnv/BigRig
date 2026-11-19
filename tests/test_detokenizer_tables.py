@@ -118,7 +118,10 @@ for name, (pieces, factory) in CASES.items():
     shared = stream.reuse_detokenizer_tables(StubTokenizer(pieces, factory))
     a_ids, b_ids = rng.integers(0, len(pieces), size=60), rng.integers(0, len(pieces), size=60)
     want_a, want_b = streams(plain.detokenizer, a_ids), streams(plain.detokenizer, b_ids)
-    da, db = shared.detokenizer, shared.detokenizer
+    shared.detokenizer                                        # the one that builds the tables: discarded,
+    da, db = shared.detokenizer, shared.detokenizer           # so both of these start from the shared ones
+    check(f"{name}: the two later detokenizers have separate attribute dicts",
+          vars(da) is not vars(db) and da.tokenmap is db.tokenmap)
     sa, sb = [], []
     for ta, tb in zip(a_ids, b_ids):                          # interleaved token by token
         da.add_token(int(ta)); sa.append(da.last_segment)

@@ -134,9 +134,10 @@ def pages_resident(addr: int, length: int) -> bool:
 #
 #     A SAMPLE OF THE PAGES IS NOT ENOUGH, AND THAT WAS MEASURED. Asking about 5 of an expert's 108
 #     pages (2.7 us) reported 5 cold experts a token where the full probe found 28 (medians of one
-#     interleaved run): under memory pressure macOS evicts page by page, so experts with SOME
-#     pages gone are common. Each one the sample passed was paged in inside the Metal buffer
-#     import instead, on the calling thread: admitting an expert rose from 73 to 117 us.
+#     interleaved run in which the warm pool sampled too, so nothing re-read them ahead): under
+#     memory pressure macOS evicts page by page, so experts with SOME pages gone are common. Each
+#     one the sample passed was paged in inside the Metal buffer import instead, on the calling
+#     thread: admitting an expert rose from 73 to 117 us.
 RECENT_S = 1.0
 
 
@@ -581,16 +582,20 @@ class ParallelFetcher:
 
         WHY. fetch() hands every key to the pool and waits on a future, whether or not there is
         anything to read. In decode nearly nothing is read: of about 142 experts a token admits
-        on Qwen3.6 on its 6.1 GB plan (13 slots a layer, 3 layers whole; measured 2026-11-19),
-        about 7 are cold and the rest are already in the page cache, where "fetching" one is
-        slicing the map. A future, a queue hop and a wake-up per key cost more than that slice.
+        on Qwen3.6 on its 6.1 GB plan (13 slots a layer, 3 layers whole; measured 2026-11-19 on a
+        24 GB Mac with 12-13 GB in use, full probes everywhere), about 7 are cold and the rest are
+        already in the page cache, where "fetching" one is slicing the map. A future, a queue hop
+        and a wake-up per key cost more than that slice.
 
         WHAT IT DOES. For a packed blob read through the map, on the calling thread: a residency
         probe of each key's pages, then its view. Only keys found cold are read -- one
         directly, several at once on the fetch pool, each in SPLIT_PARTS parts exactly as
         region_view reads them -- and the call returns when those reads have landed. A key known
-        resident within the last RECENT_S seconds (it was fetched, warmed or in use) is not probed
-        at all; every other key is probed in full, never one in eight as region_view samples them.
+        resident within the last RECENT_S seconds (probed or read here, warmed, or in use under a
+        live view) is not probed at all; every other key is probed in full, never one in eight as
+        region_view samples them. A skipped key's time is not renewed, and a key whose read failed
+        is not recorded, so neither can go unasked for longer than RECENT_S. BIGRIG_WARM_READ=1
+        asks about every key every time; =0 never asks, as for region_view.
 
         WHY IT CANNOT RETURN DIFFERENT BYTES. Same map, same offset, same length as
         `_read_region`'s mapped path; which thread asks is the only change.
@@ -611,38 +616,49 @@ class ParallelFetcher:
         mm, size, fd, base = ent
         layout = store.layout
         probe = WARM_MODE != "off"
+        every = WARM_MODE == "on"                      # BIGRIG_WARM_READ=1: ask about every key, always
         t0 = time.perf_counter()
         seen, stale = self._seen, t0 - RECENT_S
-        out, cold, nbytes, probes = {}, [], 0, 0
+        out, cold, known, nbytes, probes = {}, [], [], 0, 0
         for k in keys:
             if k in out:
                 continue
             r = layout.get(k)
             if type(r) is not Region or r.offset + r.length > size:
                 return None
-            if probe and seen.get(k, stale) <= stale:
+            if probe and (every or seen.get(k, stale) <= stale):
                 probes += 1
-                if not pages_resident(base + r.offset, r.length):
-                    cold.append(r)
+                if pages_resident(base + r.offset, r.length):
+                    known.append(k)
+                else:
+                    cold.append((k, r))
             out[k] = memoryview(mm)[r.offset:r.offset + r.length]
             nbytes += r.length
         if cold:
             # A failed read is not an error here: the views are still right, they will just fault.
-            if len(cold) == 1:
+            futures = None
+            if len(cold) > 1:
                 try:
-                    store.fill(fd, cold[0].offset, cold[0].length)
-                except OSError:
-                    pass
+                    futures = [(k, self._pool.submit(store.fill, fd, r.offset, r.length)) for k, r in cold]
+                except RuntimeError:                   # the pool is shutting down: read them here
+                    futures = None
+            if futures is None:
+                for k, r in cold:
+                    try:
+                        store.fill(fd, r.offset, r.length)
+                        known.append(k)
+                    except OSError:
+                        pass
             else:
-                for f in [self._pool.submit(store.fill, fd, r.offset, r.length) for r in cold]:
+                for k, f in futures:
                     try:
                         f.result()
+                        known.append(k)
                     except OSError:
                         pass
         now = time.perf_counter()
-        if probe:
-            for k in out:
-                seen[k] = now                          # probed resident, or just read
+        for k in known:
+            seen[k] = now                              # probed resident just now, or just read
         with self._lock:
             store.warm_probes += probes
             store.warm_reads += len(cold)

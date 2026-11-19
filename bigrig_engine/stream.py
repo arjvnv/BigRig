@@ -252,10 +252,12 @@ def reuse_detokenizer_tables(tokenizer):
     WHY. mlx_lm's stream_generate asks the tokenizer for a fresh streaming detokenizer on every
     call, and the BPE and SentencePiece ones build their id -> text table in `__init__`: two
     `get_vocab()` calls and a Python loop over the vocabulary, all of it before the first token.
-    Measured on Qwen3.6-35B-A3B (248,077 tokens, M4 Air): building one detokenizer takes
-    228-236 ms on battery; on AC, with the table shared, a short prompt's first token arrives
-    0.10 s sooner (1.23 -> 1.10 s median, 24 interleaved pairs in one process, 2026-11-19).
-    The table depends on the tokenizer alone and is only ever read.
+    Measured on Qwen3.6-35B-A3B (248,077 tokens, M4 Air, 2026-11-19): building one detokenizer
+    takes 228-236 ms on battery in Low Power Mode and about 92 ms on AC. With the table shared, a
+    short prompt's first token arrived 0.10 s sooner on AC (mean of 24 interleaved pairs in one
+    process, standard error 0.025 s; medians 1.23 and 1.10 s). An explore measurement.
+    The table depends on the tokenizer alone and is only ever read (about 19 MB, kept while the
+    tokenizer lives).
 
     WHAT IT DOES. The tokenizer's detokenizer class is replaced by a subclass that runs the
     upstream `__init__` once and keeps what it built. Every later detokenizer starts from those
@@ -278,22 +280,26 @@ def reuse_detokenizer_tables(tokenizer):
             and not factory.args else (factory, {})
         if base not in (BPEStreamingDetokenizer, SPMStreamingDetokenizer):
             return tokenizer
+        import weakref
+        try:
+            owner = weakref.ref(tokenizer)          # the class must not keep its tokenizer alive
+        except TypeError:
+            owner = lambda: tokenizer               # noqa: E731
 
         class _SharedTables(base):
             _tables = None                          # {attribute: object} built by the first __init__
 
             def __init__(self, tok, **kwargs):
                 shared = type(self)._tables
-                if shared is None or tok is not tokenizer or kwargs != kw:
+                mine = tok is owner() and kwargs == kw
+                if shared is None or not mine:
                     super().__init__(tok, **kwargs)
-                    if tok is tokenizer and kwargs == kw:
+                    if mine:
                         type(self)._tables = dict(vars(self))
                     return
                 self.__dict__.update(shared)
                 self.reset()                        # this reply's own offset, pending text, tokens
 
-        _SharedTables.__name__ = base.__name__
-        _SharedTables.__qualname__ = base.__qualname__
         tokenizer._detokenizer_class = functools.partial(_SharedTables, **kw) if kw else _SharedTables
     except Exception:                               # noqa: BLE001 -- an optimisation, never a failure
         pass
@@ -1281,6 +1287,7 @@ class StreamingSwitchGLU(nn.Module):
         arrays built on the host. See FAST_DECODE.
         """
         pool = self._pool
+        self._count_routing(np.asarray(row))        # a one-token prefill chunk counts, as in _forward_views
         lay = self._one_layout
         if lay is None:
             comps = [(proj, comp) for proj in pool.projections for comp in pool.spec[proj]]
@@ -1701,8 +1708,9 @@ VIEWS_DECODE = os.environ.get("BIGRIG_VIEWS_DECODE", "1") == "1"
 #        (_forward_views_one): no sort, no gather per expert, no gather to put the results back.
 #     Measured 2026-11-19 on AC, Qwen3.6-35B-A3B-4bit on its 6.1 GB plan (13 slots a layer, 3 layers
 #     whole), one process, the two paths interleaved over 18 pairs of 96-token greedy replies:
-#     65.8 -> 60.7 ms a token (1.071x, 95% CI about 1.05-1.09), process CPU 60.7 -> 51.4 ms a
-#     token, every token id identical. An explore measurement, not a confirmed claim.
+#     decode 1.071x faster (geometric mean of the 18 paired ratios, 95% CI about 1.05-1.09; the
+#     arms' medians are 65.8 and 60.7 ms a token), process CPU per token 1.19x lower (medians
+#     60.7 and 51.4 ms), every token id identical. An explore measurement, not a confirmed claim.
 #     Read each call, so one process can run both ways. BIGRIG_FAST_DECODE=0 restores the old paths.
 FAST_DECODE = os.environ.get("BIGRIG_FAST_DECODE", "1") == "1"
 # The most experts one request may ask for and still be served on the calling thread. A decode
