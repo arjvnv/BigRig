@@ -251,8 +251,10 @@ def reuse_detokenizer_tables(tokenizer):
 
     WHY. mlx_lm's stream_generate asks the tokenizer for a fresh streaming detokenizer on every
     call, and the BPE and SentencePiece ones build their id -> text table in `__init__`: two
-    `get_vocab()` calls and a Python loop over the vocabulary. Measured on Qwen3.6-35B-A3B
-    (248,077 tokens, M4 Air on battery): 228-236 ms per reply, all of it before the first token.
+    `get_vocab()` calls and a Python loop over the vocabulary, all of it before the first token.
+    Measured on Qwen3.6-35B-A3B (248,077 tokens, M4 Air): building one detokenizer takes
+    228-236 ms on battery; on AC, with the table shared, a short prompt's first token arrives
+    0.10 s sooner (1.23 -> 1.10 s median, 24 interleaved pairs in one process, 2026-11-19).
     The table depends on the tokenizer alone and is only ever read.
 
     WHAT IT DOES. The tokenizer's detokenizer class is replaced by a subclass that runs the
@@ -970,9 +972,11 @@ class StreamingSwitchGLU(nn.Module):
         return self._pool.g2s[gi]
 
     def _fetch(self, keys) -> dict:
-        """{key: bytes} for experts that must be resident now: on this thread where the fetcher
-        can (see ParallelFetcher.fetch_local and FAST_DECODE), through its pool otherwise."""
-        local = getattr(self._fetcher, "fetch_local", None) if FAST_DECODE else None
+        """{key: bytes} for experts that must be resident now: a decode-sized request on this
+        thread where the fetcher can (ParallelFetcher.fetch_local, FAST_DECODE), anything larger
+        or anything it declines through its pool. See LOCAL_FETCH_MAX."""
+        local = getattr(self._fetcher, "fetch_local", None) \
+            if FAST_DECODE and len(keys) <= LOCAL_FETCH_MAX else None
         blobs = local(keys) if local is not None else None
         return self._fetcher.fetch(keys) if blobs is None else blobs
 
@@ -1695,8 +1699,17 @@ VIEWS_DECODE = os.environ.get("BIGRIG_VIEWS_DECODE", "1") == "1"
 #        experts go to the fetch pool, as before.
 #     2. One token's experts are computed straight off the token's row in the router's order
 #        (_forward_views_one): no sort, no gather per expert, no gather to put the results back.
+#     Measured 2026-11-19 on AC, Qwen3.6-35B-A3B-4bit on its 6.1 GB plan (13 slots a layer, 3 layers
+#     whole), one process, the two paths interleaved over 18 pairs of 96-token greedy replies:
+#     65.8 -> 60.7 ms a token (1.071x, 95% CI about 1.05-1.09), process CPU 60.7 -> 51.4 ms a
+#     token, every token id identical. An explore measurement, not a confirmed claim.
 #     Read each call, so one process can run both ways. BIGRIG_FAST_DECODE=0 restores the old paths.
 FAST_DECODE = os.environ.get("BIGRIG_FAST_DECODE", "1") == "1"
+# The most experts one request may ask for and still be served on the calling thread. A decode
+# step misses at most top-k (8); a prompt chunk asks for 110-230 experts of a layer at once, and
+# probing those one after another here is slower than the pool's eight threads (profiled on short
+# prompts: about 2,600 probes a reply on the calling thread, first token 0.02 s later).
+LOCAL_FETCH_MAX = 16
 VIEWS_MIN_TOKENS = 32
 VIEWS_MIN_SHARE = 0.5
 # Most experts a layer will copy to the GPU on the previous layer's say-so. Eight is the

@@ -249,6 +249,16 @@ try:
     y_off, _ = run("gated", 8, False, steps=[(xd, dup)])
     check("a row with a repeated expert stays on the chunk path and gives the same output",
           c_on == {"one": 0, "views": 1} and mx.array_equal(y_on[0], y_off[0]).item(), c_on)
+    # A prompt chunk asks for most of the layer at once: served by the fetch pool as before.
+    x40 = mx.array(rng.standard_normal((1, 40, D)).astype(np.float32)).astype(mx.bfloat16)
+    i40 = np.stack([rng.choice(E, K, replace=False) for _ in range(40)]).reshape(1, 40, K)
+    need = len(np.unique(i40))
+    local_calls.update(n=0, none=0)
+    y40_on, _ = run("gated", 8, True, steps=[(x40, i40)])
+    l40 = dict(local_calls)
+    y40_off, _ = run("gated", 8, False, steps=[(x40, i40)])
+    check(f"a 40-row chunk needing {need} experts (> LOCAL_FETCH_MAX) never calls fetch_local, same output",
+          need > stream.LOCAL_FETCH_MAX and l40["n"] == 0 and mx.array_equal(y40_on[0], y40_off[0]).item(), l40)
     # Two rows (a prompt chunk that fits the pool) is not decode: chunk path, unchanged.
     x2 = mx.array(rng.standard_normal((1, 2, D)).astype(np.float32)).astype(mx.bfloat16)
     i2 = np.stack([np.arange(K), np.arange(K)]).reshape(1, 2, K)
