@@ -246,6 +246,66 @@ def _num_experts(sg) -> int:
     return int(first_projection(sg)["weight"].shape[0])
 
 
+def reuse_detokenizer_tables(tokenizer):
+    """Build the streaming detokenizer's id -> text table once per tokenizer, not once per reply.
+
+    WHY. mlx_lm's stream_generate asks the tokenizer for a fresh streaming detokenizer on every
+    call, and the BPE and SentencePiece ones build their id -> text table in `__init__`: two
+    `get_vocab()` calls and a Python loop over the vocabulary, all of it before the first token.
+    Measured on Qwen3.6-35B-A3B (248,077 tokens, M4 Air, 2026-11-19): building one detokenizer
+    takes 228-236 ms on battery in Low Power Mode and about 92 ms on AC. With the table shared, a
+    short prompt's first token arrived 0.10 s sooner on AC (mean of 24 interleaved pairs in one
+    process, standard error 0.025 s; medians 1.23 and 1.10 s). An explore measurement.
+    The table depends on the tokenizer alone and is only ever read (about 19 MB, kept while the
+    tokenizer lives).
+
+    WHAT IT DOES. The tokenizer's detokenizer class is replaced by a subclass that runs the
+    upstream `__init__` once and keeps what it built. Every later detokenizer starts from those
+    same objects and then calls upstream's own `reset()`, which exists to rebuild the per-reply
+    state (offset, pending text, tokens) for exactly this kind of reuse. Decoding code is
+    untouched, so the text is the same by construction; tests/test_detokenizer_tables.py compares
+    it anyway, including two replies decoded at once.
+
+    Applies to mlx_lm's BPEStreamingDetokenizer and SPMStreamingDetokenizer exactly (the Naive
+    one builds no table). Anything else, or any surprise, leaves the tokenizer as it was.
+    BIGRIG_SHARE_DETOK=0 turns it off. Returns the tokenizer.
+    """
+    if os.environ.get("BIGRIG_SHARE_DETOK", "1") == "0":
+        return tokenizer
+    try:
+        import functools
+        from mlx_lm.tokenizer_utils import BPEStreamingDetokenizer, SPMStreamingDetokenizer
+        factory = tokenizer._detokenizer_class
+        base, kw = (factory.func, dict(factory.keywords)) if isinstance(factory, functools.partial) \
+            and not factory.args else (factory, {})
+        if base not in (BPEStreamingDetokenizer, SPMStreamingDetokenizer):
+            return tokenizer
+        import weakref
+        try:
+            owner = weakref.ref(tokenizer)          # the class must not keep its tokenizer alive
+        except TypeError:
+            owner = lambda: tokenizer               # noqa: E731
+
+        class _SharedTables(base):
+            _tables = None                          # {attribute: object} built by the first __init__
+
+            def __init__(self, tok, **kwargs):
+                shared = type(self)._tables
+                mine = tok is owner() and kwargs == kw
+                if shared is None or not mine:
+                    super().__init__(tok, **kwargs)
+                    if mine:
+                        type(self)._tables = dict(vars(self))
+                    return
+                self.__dict__.update(shared)
+                self.reset()                        # this reply's own offset, pending text, tokens
+
+        tokenizer._detokenizer_class = functools.partial(_SharedTables, **kw) if kw else _SharedTables
+    except Exception:                               # noqa: BLE001 -- an optimisation, never a failure
+        pass
+    return tokenizer
+
+
 def load_lenient(model_dir: str, lazy: bool = True):
     """Load a model, tolerating LEFTOVER weights in the checkpoint but never MISSING ones.
 
@@ -266,10 +326,12 @@ def load_lenient(model_dir: str, lazy: bool = True):
     from mlx_lm import load as _load
     model_dir = os.path.expanduser(model_dir)
     try:
-        return _load(model_dir, lazy=lazy)
+        model, tokenizer = _load(model_dir, lazy=lazy)
     except ValueError as e:
         if "not in model" not in str(e):
             raise                      # missing or mis-shaped: a real problem, do not paper over
+    else:
+        return model, reuse_detokenizer_tables(tokenizer)
 
     import glob as _glob
     from mlx.utils import tree_flatten
@@ -293,7 +355,7 @@ def load_lenient(model_dir: str, lazy: bool = True):
     extra = sorted(set(weights) - expected)
     print(f"  note: ignoring {len(extra)} leftover weight(s) not used by this architecture "
           f"({', '.join(extra[:3])}{'...' if len(extra) > 3 else ''})")
-    return model, load_tokenizer(path, eos_token_ids=cfg.get("eos_token_id"))
+    return model, reuse_detokenizer_tables(load_tokenizer(path, eos_token_ids=cfg.get("eos_token_id")))
 
 
 def model_top_k(model_dir: str, manifest: dict | None = None, default: int = 8) -> int:
@@ -773,6 +835,7 @@ class StreamingSwitchGLU(nn.Module):
         self._ahead = []                # keys read_ahead() issued for this layer, released by holding()
         self._then = None               # holding()'s once-only hook after the first prefill fetch
         self.prefill_routed = None      # per-expert routing counts of the last held prefill; see rewarm
+        self._one_layout = None         # projection -> component positions; see _forward_views_one
         self.sync_seconds = 0.0
         self.bypass = False        # timing control; see __call__
         self._sync_free = False    # set by refresh() once the pool is known to be full
@@ -898,14 +961,30 @@ class StreamingSwitchGLU(nn.Module):
                 self._pool.stage_hits += 1
             if cold:
                 t0 = time.perf_counter()
-                blobs = self._fetcher.fetch([(self._pool.layer, e) for e in cold])
+                blobs = self._fetch([(self._pool.layer, e) for e in cold])
                 self.fetch_seconds += time.perf_counter() - t0
                 for e in cold:
                     b = blobs[(self._pool.layer, e)]
                     self.fetch_bytes += len(b)
                     self._pool.admit(e, b, protect=uniq)
         self._pool.stage = {}                       # whatever was not used was a wrong guess
+        if FAST_DECODE and self._pool.views:
+            # Every expert of this step is under a live view now: in memory, whatever happens to
+            # its slot later. See ParallelFetcher.mark_resident.
+            mark = getattr(self._fetcher, "mark_resident", None)
+            if mark is not None:
+                layer = self._pool.layer
+                mark([(layer, e) for e in uniq])
         return self._pool.g2s[gi]
+
+    def _fetch(self, keys) -> dict:
+        """{key: bytes} for experts that must be resident now: a decode-sized request on this
+        thread where the fetcher can (ParallelFetcher.fetch_local, FAST_DECODE), anything larger
+        or anything it declines through its pool. See LOCAL_FETCH_MAX."""
+        local = getattr(self._fetcher, "fetch_local", None) \
+            if FAST_DECODE and len(keys) <= LOCAL_FETCH_MAX else None
+        blobs = local(keys) if local is not None else None
+        return self._fetcher.fetch(keys) if blobs is None else blobs
 
     def _prefetch_span(self, rows) -> list:
         """Start the disk read for a later chunk while the current one is still on the GPU.
@@ -1147,7 +1226,7 @@ class StreamingSwitchGLU(nn.Module):
         held = self._held if self._held is not None else {}
         new = [int(e) for e in experts if int(e) not in held]
         if new:
-            blobs = self._fetcher.fetch([(pool.layer, e) for e in new])
+            blobs = self._fetch([(pool.layer, e) for e in new])
             for e in new:
                 held[e] = pool.build_arrays(e, blobs[(pool.layer, e)])
         if self._then is not None:
@@ -1195,6 +1274,48 @@ class StreamingSwitchGLU(nn.Module):
         y = mx.concatenate(outs, axis=0)
         inv = np.argsort(order, kind="stable")
         return y[mx.array(inv)]
+
+    def _forward_views_one(self, xf, row, arrays_for):
+        """One token's k distinct experts, each on its own view, in the router's order (decode).
+
+        `_forward_views` is written for a chunk: it sorts the (token, expert) pairs by expert,
+        gathers each expert's rows out of `xf`, and gathers the results back into the caller's
+        order. With one token every expert's rows ARE `xf` and its results are wanted in the
+        order they were asked for, so the sort, the gather per expert and the gather at the end
+        move nothing. This is the same `quantized_matmul` per projection on the same values and
+        the same activation, without them: 4 GPU kernels an expert instead of 5, and no index
+        arrays built on the host. See FAST_DECODE.
+        """
+        pool = self._pool
+        self._count_routing(np.asarray(row))        # a one-token prefill chunk counts, as in _forward_views
+        lay = self._one_layout
+        if lay is None:
+            comps = [(proj, comp) for proj in pool.projections for comp in pool.spec[proj]]
+            lay = self._one_layout = {
+                proj: tuple(comps.index((proj, c)) if (proj, c) in comps else None
+                            for c in ("weight", "scales", "biases", "bias"))
+                for proj in pool.projections}
+        quantized, q, act = self._quantized, self._q, self._activation
+
+        def proj(a, name, inp):
+            iw, isc, ibi, ib = lay[name]
+            if quantized:
+                y = mx.quantized_matmul(inp, a[iw], None if isc is None else a[isc],
+                                        None if ibi is None else a[ibi], transpose=True,
+                                        group_size=q["group_size"], bits=q["bits"], mode=q["mode"])
+            else:
+                y = inp @ a[iw].T
+            return y if ib is None else y + a[ib]
+
+        outs = []
+        for e in row:
+            a = arrays_for(int(e))
+            if pool.gated:
+                up, gate = proj(a, "up_proj", xf), proj(a, "gate_proj", xf)
+                outs.append(proj(a, "down_proj", act(up, gate)))
+            else:
+                outs.append(proj(a, "fc2", act(proj(a, "fc1", xf))))
+        return mx.concatenate(outs, axis=0)
 
     def _forward_pairs(self, x, slots, arrays=None):
         """The three projections over (token, expert) pairs already grouped by expert.
@@ -1376,7 +1497,11 @@ class StreamingSwitchGLU(nn.Module):
                 self.ensure(gi)
                 if warm_after:
                     self._fetcher.warm(warm_after)
-                y = self._forward_views(x.reshape(-1, x.shape[-1]), flat, self._pool.views_of)
+                xf = x.reshape(-1, x.shape[-1])
+                if FAST_DECODE and flat.shape[0] == 1 and len(set(flat[0].tolist())) == k:
+                    y = self._forward_views_one(xf, flat[0], self._pool.views_of)
+                else:
+                    y = self._forward_views(xf, flat, self._pool.views_of)
                 return y.reshape(*gi.shape[:-1], k, y.shape[-1])
             # Unchunked path: byte-for-byte the shape handling of the stock SwitchGLU, so the
             # C == E identity test exercises exactly the code the fast path runs.
@@ -1573,6 +1698,26 @@ SAME_ANSWERS = os.environ.get("BIGRIG_SAME_ANSWERS", "1") == "1"
 #     can, and the session's footprint adds the resident bytes in this mode. On by default with
 #     VIEWS_PREFILL (see above); BIGRIG_VIEWS_DECODE=0 or --slot-pool turns it off.
 VIEWS_DECODE = os.environ.get("BIGRIG_VIEWS_DECODE", "1") == "1"
+# DECODE'S HOST WORK, CUT TO WHAT ONE TOKEN NEEDS (2026-11-19). Same bytes, same kernels on the same
+# values, same order of admissions and evictions; only work that moved nothing is gone.
+#     1. Experts already in the page cache are wrapped on the calling thread
+#        (ParallelFetcher.fetch_local): no future, queue hop and wake-up per expert, and no
+#        residency probe for one in use within the last second (fetch.RECENT_S). Only cold
+#        experts go to the fetch pool, as before.
+#     2. One token's experts are computed straight off the token's row in the router's order
+#        (_forward_views_one): no sort, no gather per expert, no gather to put the results back.
+#     Measured 2026-11-19 on AC, Qwen3.6-35B-A3B-4bit on its 6.1 GB plan (13 slots a layer, 3 layers
+#     whole), one process, the two paths interleaved over 18 pairs of 96-token greedy replies:
+#     decode 1.071x faster (geometric mean of the 18 paired ratios, 95% CI about 1.05-1.09; the
+#     arms' medians are 65.8 and 60.7 ms a token), process CPU per token 1.19x lower (medians
+#     60.7 and 51.4 ms), every token id identical. An explore measurement, not a confirmed claim.
+#     Read each call, so one process can run both ways. BIGRIG_FAST_DECODE=0 restores the old paths.
+FAST_DECODE = os.environ.get("BIGRIG_FAST_DECODE", "1") == "1"
+# The most experts one request may ask for and still be served on the calling thread. A decode
+# step misses at most top-k (8); a prompt chunk asks for 110-230 experts of a layer at once, and
+# probing those one after another here is slower than the pool's eight threads (profiled on short
+# prompts: about 2,600 probes a reply on the calling thread, first token 0.02 s later).
+LOCAL_FETCH_MAX = 16
 VIEWS_MIN_TOKENS = 32
 VIEWS_MIN_SHARE = 0.5
 # Most experts a layer will copy to the GPU on the previous layer's say-so. Eight is the

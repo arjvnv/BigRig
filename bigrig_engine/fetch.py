@@ -96,6 +96,9 @@ except ValueError:
 SPLIT_MIN_BYTES = 1 << 20      # below this one request is already short; splitting only adds overhead
 _PAGE = os.sysconf("SC_PAGESIZE")
 _libc = None
+# Every byte value with the in-core bit set. A mincore vector with these deleted is empty exactly
+# when every page is resident: one C call instead of a Python loop over the pages (108 an expert).
+_IN_CORE = bytes(range(1, 256, 2))
 
 
 def pages_resident(addr: int, length: int) -> bool:
@@ -113,9 +116,29 @@ def pages_resident(addr: int, length: int) -> bool:
         vec = ctypes.create_string_buffer(n)
         if _libc.mincore(start, n * _PAGE, vec) != 0:
             return True
-        return all(b & 1 for b in vec.raw)
+        return not vec.raw.translate(None, _IN_CORE)
     except Exception:                            # noqa: BLE001 -- never let a hint become a fault
         return True
+
+
+# HOW LONG A REGION THAT WAS JUST IN USE IS TAKEN TO STILL BE IN MEMORY, WITHOUT ASKING.
+#     A residency probe is one `mincore` over the region, and `mincore` costs about 0.22 us a page
+#     here (measured on AC over resident pages of the packed blob: 1 page 0.67 us, 27 pages 6.4 us,
+#     108 pages -- one Qwen3.6 expert -- 23.7 us). Decode admits about 142 experts a token, so
+#     probing each is 3.4 ms of every token, mostly to hear "yes". But 46% of those admits are of
+#     an expert the same layer used within the last 8 tokens and 61% within 16 (routing trace, 388
+#     tokens): it was wired under a live view a moment ago and has not had time to leave the page
+#     cache. ParallelFetcher.fetch_local skips the probe for a key known resident within this many
+#     seconds and probes every other key in full. If the guess is ever wrong the view is still the
+#     right bytes; the GPU faults the missing pages in, only slower.
+#
+#     A SAMPLE OF THE PAGES IS NOT ENOUGH, AND THAT WAS MEASURED. Asking about 5 of an expert's 108
+#     pages (2.7 us) reported 5 cold experts a token where the full probe found 28 (medians of one
+#     interleaved run in which the warm pool sampled too, so nothing re-read them ahead): under
+#     memory pressure macOS evicts page by page, so experts with SOME pages gone are common. Each
+#     one the sample passed was paged in inside the Metal buffer import instead, on the calling
+#     thread: admitting an expert rose from 73 to 117 us.
+RECENT_S = 1.0
 
 
 def split_ranges(offset: int, length: int, parts: int, page: int = _PAGE) -> list:
@@ -277,14 +300,22 @@ class WeightStore:
         offset and length as the view ensure() will later wrap, so the only effect is WHEN the
         pages arrive.
         """
+        return bool(self.make_resident(path, offset, length))
+
+    def make_resident(self, path: str, offset: int, length: int):
+        """warm_region, saying which of three things happened: True, it read the region; False,
+        every page was already in memory; None, the pages are not known to be in memory (no map,
+        a region past the end of the file, or the read failed)."""
         ent = self._map(path)
-        if ent is None or offset + length > ent[1] or pages_resident(ent[3] + offset, length):
+        if ent is None or offset + length > ent[1]:
+            return None
+        if pages_resident(ent[3] + offset, length):
             return False
         try:
             self.fill(ent[2], offset, length)
             return True
         except OSError:
-            return False
+            return None
 
     def fill(self, fd: int, offset: int, length: int) -> None:
         """Read [offset, offset + length) of `fd` into the page cache, dropping the bytes.
@@ -398,6 +429,8 @@ class ParallelFetcher:
         self._closed = False
         self._warm_pool = None                  # see warm(); created on first use
         self._warm_queued = self.warm_issued = self.warm_read = 0
+        self._seen: dict = {}                   # key -> when its pages were last known resident; see RECENT_S
+        self.recent_skips = 0                   # probes fetch_local did not need to make
         self.bytes_read = 0
         self.seconds = 0.0
         self.n_fetches = 0
@@ -544,6 +577,106 @@ class ParallelFetcher:
             self.n_fetches += 1
         return out
 
+    def fetch_local(self, keys):
+        """fetch(), without a thread hop for bytes that are already in memory. None if it does not apply.
+
+        WHY. fetch() hands every key to the pool and waits on a future, whether or not there is
+        anything to read. In decode nearly nothing is read: of about 142 experts a token admits
+        on Qwen3.6 on its 6.1 GB plan (13 slots a layer, 3 layers whole; measured 2026-11-19 on a
+        24 GB Mac with 12-13 GB in use, full probes everywhere), about 7 are cold and the rest are
+        already in the page cache, where "fetching" one is slicing the map. A future, a queue hop
+        and a wake-up per key cost more than that slice.
+
+        WHAT IT DOES. For a packed blob read through the map, on the calling thread: a residency
+        probe of each key's pages, then its view. Only keys found cold are read -- one
+        directly, several at once on the fetch pool, each in SPLIT_PARTS parts exactly as
+        region_view reads them -- and the call returns when those reads have landed. A key known
+        resident within the last RECENT_S seconds (probed or read here, warmed, or in use under a
+        live view) is not probed at all; every other key is probed in full, never one in eight as
+        region_view samples them. A skipped key's time is not renewed, and a key whose read failed
+        is not recorded, so neither can go unasked for longer than RECENT_S. BIGRIG_WARM_READ=1
+        asks about every key every time; =0 never asks, as for region_view.
+
+        WHY IT CANNOT RETURN DIFFERENT BYTES. Same map, same offset, same length as
+        `_read_region`'s mapped path; which thread asks is the only change.
+
+        Returns None, and the caller uses fetch(), when a key is not one mapped region of this
+        store's own file (a model read from its shards has nine segments a key), when the fetcher
+        is not mapped, or when prefetched reads are outstanding (fetch() owns collecting those).
+        """
+        keys = list(keys)
+        if not keys:
+            return {}
+        store = self.store
+        if not self.mapped or self._closed or not store.path or self._inflight:
+            return None
+        ent = store._map(store.path)
+        if ent is None:
+            return None
+        mm, size, fd, base = ent
+        layout = store.layout
+        probe = WARM_MODE != "off"
+        every = WARM_MODE == "on"                      # BIGRIG_WARM_READ=1: ask about every key, always
+        t0 = time.perf_counter()
+        seen, stale = self._seen, t0 - RECENT_S
+        out, cold, known, nbytes, probes = {}, [], [], 0, 0
+        for k in keys:
+            if k in out:
+                continue
+            r = layout.get(k)
+            if type(r) is not Region or r.offset + r.length > size:
+                return None
+            if probe and (every or seen.get(k, stale) <= stale):
+                probes += 1
+                if pages_resident(base + r.offset, r.length):
+                    known.append(k)
+                else:
+                    cold.append((k, r))
+            out[k] = memoryview(mm)[r.offset:r.offset + r.length]
+            nbytes += r.length
+        if cold:
+            # A failed read is not an error here: the views are still right, they will just fault.
+            futures = None
+            if len(cold) > 1:
+                try:
+                    futures = [(k, self._pool.submit(store.fill, fd, r.offset, r.length)) for k, r in cold]
+                except RuntimeError:                   # the pool is shutting down: read them here
+                    futures = None
+            if futures is None:
+                for k, r in cold:
+                    try:
+                        store.fill(fd, r.offset, r.length)
+                        known.append(k)
+                    except OSError:
+                        pass
+            else:
+                for k, f in futures:
+                    try:
+                        f.result()
+                        known.append(k)
+                    except OSError:
+                        pass
+        now = time.perf_counter()
+        for k in known:
+            seen[k] = now                              # probed resident just now, or just read
+        with self._lock:
+            store.warm_probes += probes
+            store.warm_reads += len(cold)
+            self.recent_skips += len(out) - probes if probe else 0
+            self.cold += len(out)
+            self.bytes_read += nbytes
+            self.seconds += now - t0
+            self.n_fetches += 1
+        return out
+
+    def mark_resident(self, keys) -> None:
+        """Note that these keys' pages are in memory now (the caller holds live views of them),
+        so a fetch_local within RECENT_S need not ask again."""
+        now = time.perf_counter()
+        seen = self._seen
+        for k in keys:
+            seen[k] = now
+
     def warm(self, keys, max_queued: int = 64) -> int:
         """Warm these keys' pages into the page cache on a separate pool; return at once.
 
@@ -558,24 +691,27 @@ class ParallelFetcher:
                 self._warm_pool = ThreadPoolExecutor(max_workers=WARM_THREADS,
                                                      thread_name_prefix="bigrig-warm")
 
-        def job(seg):
-            read = False
+        def job(seg, key):
+            read = None
             try:
-                read = self.store.warm_region(seg.path, seg.offset, seg.length)
+                read = self.store.make_resident(seg.path, seg.offset, seg.length)
+                if read is not None and key is not None:
+                    self._seen[key] = time.perf_counter()     # fetch_local need not ask again soon
             finally:
                 with self._lock:
                     self._warm_queued -= 1
-                    self.warm_read += int(read)
+                    self.warm_read += int(bool(read))
 
         n = 0
         for k in keys:
-            for seg in self.store.segments(k):
+            segs = self.store.segments(k)
+            for seg in segs:
                 with self._lock:
                     if self._warm_queued >= max_queued:
                         return n
                     self._warm_queued += 1
                 try:
-                    self._warm_pool.submit(job, seg)
+                    self._warm_pool.submit(job, seg, k if len(segs) == 1 else None)
                 except RuntimeError:                   # closed meanwhile; a guess is optional
                     with self._lock:
                         self._warm_queued -= 1

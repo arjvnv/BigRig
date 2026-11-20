@@ -252,9 +252,10 @@ check("only a real prefill chunk that wants most of the layer takes it",
       and stream.VIEWS_MIN_TOKENS >= 4)
 _fv = _ins2.getsource(stream.StreamingSwitchGLU._forward_views)
 _pa = _ins2.getsource(stream.StreamingSwitchGLU._prefill_arrays)   # its fetch, since layer-major prefill
+_ft = _ins2.getsource(stream.StreamingSwitchGLU._fetch)            # ...on this thread or the pool (FAST_DECODE)
 check("it fetches every expert of the chunk once and never admits to the pool",
-      "self._prefill_arrays(" in _fv and "self._fetcher.fetch(" in _pa
-      and not any(w in src for src in (_fv, _pa) for w in ("admit", "ensure(")))
+      "self._prefill_arrays(" in _fv and "self._fetch(" in _pa and "self._fetcher.fetch(keys)" in _ft
+      and not any(w in src for src in (_fv, _pa, _ft) for w in ("admit", "ensure(")))
 check("rows come back in the caller's (token, k) order", "np.argsort(order, kind=\"stable\")" in _fv
       and "return y[mx.array(inv)]" in _fv)
 _cli_help = _sp3.run([_sys3.executable, "-m", "bigrig_engine.cli", "serve", "--help"], capture_output=True, text=True, cwd=ROOT).stdout
